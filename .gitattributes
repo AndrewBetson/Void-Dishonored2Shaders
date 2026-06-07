@@ -1,1 +1,2 @@
-*.decl tex linguist-language=hlsl
+renderparm/*.decl tex
+renderprog/*.decl tex linguist-language=hlsl
