@@ -1,0 +1,11 @@
+{
+	struct {
+		float3			wsBBoxMin;				// (12 bytes) BBox Min Corner
+		float3			wsBBoxAxisX;			// (12 bytes) BBox X axis
+		float3			wsBBoxAxisY;			// (12 bytes) BBox Y axis
+		float3			wsBBoxAxisZ;			// (12 bytes) BBox Z axis
+		float3			SH[8*9];				// (8*9*12 bytes) SH Coefficients for the 8 corners of the BBox
+		uint			IBLProbeIndices[8];		// (8*4 bytes) IBL probe indices for the 8 corners of the BBox
+		float			IBLLuminanceFactors[8];	// (8*4 bytes) IBL luminance factors for the 8 corners of the BBox
+	}											// Total = 976 bytes (I know the structure is large but hopefully we won't have many large dynamic objects on screen at the same time)
+}

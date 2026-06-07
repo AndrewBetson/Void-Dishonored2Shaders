@@ -1,0 +1,10 @@
+{ 
+	struct { 
+		float3	m_bounceFactorStatic;	// 12 bytes
+		float3	m_bounceFactorDynamic;	// 12 bytes
+		float3	m_bounceFactorSky;		// 12 bytes
+		float3	m_bounceFactorSun;		// 12 bytes
+//		float	m_ambientOcclusion;		// 4 bytes	<= Now included in m_bounceFactorSky
+		float3	m_ambientFactor;		// 12 bytes (bmayaux (2016-03-18) RHAA AMBIENT SHAME!!!)
+	}									// Total = 64 bytes
+}

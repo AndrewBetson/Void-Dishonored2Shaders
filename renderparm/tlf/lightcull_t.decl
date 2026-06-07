@@ -1,0 +1,10 @@
+{
+	struct {
+		float3	mViewPosition;
+		float	mRadiusCutoff;
+		float3	mSpotDir;
+		float	mScatterValue;
+		float3	mSpotParms;
+		uint	mFlags;
+	}
+}

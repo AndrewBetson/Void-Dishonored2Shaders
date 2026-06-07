@@ -1,0 +1,5 @@
+{
+	struct {
+		uint	indexTetrahedron;		// (4 bytes) Tetrahedron index
+	}									// Total = 4 bytes per-vertex (MUST NO CHANGE! EVER! THAT'S ALREADY TOO MUCH!)
+}

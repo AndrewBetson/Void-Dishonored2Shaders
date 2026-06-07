@@ -1,0 +1,9 @@
+{
+	struct {
+		float3					wsBBoxMin;				// (12 bytes) BBox Min Corner
+		float3					wsBBoxAxisX;			// (12 bytes) BBox X axis
+		float3					wsBBoxAxisY;			// (12 bytes) BBox Y axis
+		float3					wsBBoxAxisZ;			// (12 bytes) BBox Z axis
+		uint					tetrahedronIndex[8];	// (8*4 bytes) Tetrahedrons for the 8 corners of the BBox
+	}													// Total = 80 bytes
+}

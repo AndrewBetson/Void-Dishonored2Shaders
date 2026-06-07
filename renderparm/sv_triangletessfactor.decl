@@ -1,0 +1,1 @@
+{ semanticArray float3 out(hcst) sys in(d) }

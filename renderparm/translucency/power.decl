@@ -1,0 +1,1 @@
+{ uniform float 8.0 range [0.0, 100.0] }

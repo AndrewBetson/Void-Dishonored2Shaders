@@ -1,0 +1,16 @@
+{
+/*
+	struct arkParticleParametersInstanceStruct {
+		uint32				m_color;
+		halfFloat_t			m_flipbookCompletion;
+		unsigned short 		m_Seed_UVFlip; 			// seed is 14bits, UV flip will be the 2 MSB bits
+		halfFloat_t			m_size;					// size for soft contact
+		unsigned short		m_dummy;
+	};
+*/
+	struct {
+		uint		color;
+		uint		flipbook_seed_uv;
+		uint		size;
+	}
+}

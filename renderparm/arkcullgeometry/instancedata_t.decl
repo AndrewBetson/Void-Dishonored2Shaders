@@ -1,0 +1,13 @@
+{
+	struct  {
+		uint numTriangles;
+		uint packedData;
+		uint indirectArgsIndex;
+		uint indexBufferOffset;
+			 
+		uint outputIndexOffset;
+		uint vertexBufferOffset;
+		uint matrixInstanceIndex;
+		uint firstGroupId;
+	}
+}

@@ -1,0 +1,17 @@
+{
+	struct {
+		uint		Index;						// (4 bytes) The index of the probe we're updating
+		uint		LightsStart;				// (4 bytes) Index of the first light for the probe's relighting
+		uint		LightsCountPoint;			// (4 bytes) Amount of point lights for the probe's relighting
+		uint		LightsCountHalfPoint;		// (4 bytes) Amount of half-point lights for the probe's relighting
+		uint		LightsCountSpot;			// (4 bytes) Amount of spot lights for the probe's relighting
+		uint		LightsCountArea;			// (4 bytes) Amount of area lights for the probe's relighting
+		uint		EmissiveSurfacesStart;		// (4 bytes) Index of the first emissive surface for the probe
+		uint		EmissiveSurfacesCount;		// (4 bytes) Amount of emissive surfaces for the probe
+
+// bmayaux (2016-02-26) Former way of propagating indirect lighting used neighbor probes, now the samples are used for propagation instead
+// 		// Neighbor probes informations
+// 		uint4		NeighborProbeIDs;			// (16 bytes) The IDs of the 4 most significant neighbor probes
+// 		float4		SHConvolution[9];			// (144 bytes) The SH coefficients to convolve the 4 main neighbor's SH with to obtain their contribution to this probe
+	}											// Total = 32 bytes per probe
+}

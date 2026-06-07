@@ -1,0 +1,8 @@
+{ Sampler
+	MinFilter		Point
+	MagFilter		Point
+	MipFilter		Point
+	AddressU		Clamp
+	AddressV		Clamp
+	AddressW		Clamp
+}

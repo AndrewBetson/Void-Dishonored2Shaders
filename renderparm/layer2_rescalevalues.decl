@@ -1,0 +1,1 @@
+{ Uniform float2 { 0.4, 0.6 } range [{0,0}, {1,1}] }

@@ -1,0 +1,6 @@
+{
+	struct {
+		float3	SH[9];				// Order 3 RGB SH coefficients
+		float   __PADDING;			// Alignment
+	}								// Total = 112 bytes
+}

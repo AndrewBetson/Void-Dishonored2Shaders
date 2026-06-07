@@ -1,0 +1,27 @@
+{
+	struct {
+		float3	mWorldPosition;
+		float	mRadiusFalloff;
+
+		float3	mColor;
+		float	mRadiusCutoff;
+
+		float3	mSpotDir;
+		float	mDecay;				// ARKANE: bmayaux (2013-12-04) Decay interpolation between quadratic and none
+
+		float	mSpecularAttn;
+		float	mScatterValue;
+		float	mScatterScale;
+		float	mScatterOffset;
+
+		float3	mSpotParms;
+		float	mScatterTurbulence;
+
+		float3	mAreaLightX;		// bmayaux (2015-01-19) Area Light normalized X vector (m_direction is the Z vector, normal to the plane)
+		float	mOriginOffset;
+
+		uint	mShadowSetup;
+		uint	mFlags;
+		uint2	padding;			// FIXME: use it for arkTiledForwardShadowInfo_t::m_info! in this case padding in arkTiledForwardShadowInfo_t can be removed!
+	}
+}

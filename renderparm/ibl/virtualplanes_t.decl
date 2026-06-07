@@ -1,0 +1,10 @@
+{ 
+	struct {
+		// (48 bytes) The 6 virtual planes associated to the probe, packed in a special way (cf. UnPackVirtualPlane() below)
+		float4	plane01;
+		float4	plane23;
+		float4	plane45;		
+		float3	position;				// (12 bytes) The probe's position
+		float	__PADDING;				// (4 bytes) Padding to reach 128-bits alignment, as advised by D.Zhdan (NVIDIA)
+	}									// Total = 64 bytes (instead of our original 112 bytes!!)
+}

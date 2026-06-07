@@ -1,0 +1,6 @@
+{
+	struct {
+		float3	wsPosition;						// World space position
+		uint	probeWeights;					// 4 probe weights packed into 4*8bits
+	}											// Total = 16 bytes
+}

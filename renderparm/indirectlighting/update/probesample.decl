@@ -1,0 +1,18 @@
+{
+// 	struct {
+// 		float3		wsPosition;					// (12 bytes) World position of the samples
+// 		float3		wsNormal;					// (12 bytes) World normal of the sample
+// 		float3		Albedo;						// (12 bytes) Albedo of the sample's surface
+// 		float		Radius;						// (4 bytes) Radius of the sample's disc approximation (ultimately, this should be an ellipse). A radius of 0 means an invalid sample that won't be accumulated!
+// 		float		Opacity;					// (4 bytes) Sample's opacity (depending on an optional portal in front of the sample)
+// 		float		F0;							// (4 bytes) Monochromatic Fresnel coefficient (used to remove specular reflection, we're only computing diffuse reflection here)
+// 	}											// Total = 48 bytes per probe sample = 6144 bytes per probe (gasp!) (we won't update more than a few probes each frame anyway)
+//	// This could totally be packed into 3 floats for position + 2 uint16 for phi/theta for normal + (albedo+F0) packed into a uint32 + 1 float for opacity + 1 float for the radius = 28 bytes per sample = 3584 bytes per probe
+
+	struct {
+		float3		wsPosition;					// (12 bytes) World position of the samples
+		uint		wsNormal_PhiTheta;			// (4 bytes) World normal of the sample as spherical coordinates (Theta, Phi) packed on 16 bits each
+		uint		Albedo_F0;					// (4 bytes) Albedo of the sample's surface + Monochromatic Fresnel coefficient (used to remove specular reflection, we're only computing diffuse reflection here)
+		uint		RelightProbeIndex_Opacity;	// (4 bytes) LSW = sample's opacity, MSW = index of the probe used for indirect lighting of this sample (2016-02-26)
+	}											// Total = 24 bytes per probe sample = 3Kb per probe
+}

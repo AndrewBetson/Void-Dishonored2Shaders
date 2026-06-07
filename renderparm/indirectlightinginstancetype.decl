@@ -1,0 +1,7 @@
+{
+	struct {
+		uint	probeIndexIBL;		// If "tool/perVertexSH" is defined then only this is used to store the offset within the giant buffer
+		uint	tetrahedronIndex;
+		float4	barycentric;
+	}
+}

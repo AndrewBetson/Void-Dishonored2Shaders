@@ -1,0 +1,9 @@
+{ Sampler
+	MinFilter		Aniso
+	MagFilter		Aniso
+	MipFilter		Aniso
+	AddressU		Wrap
+	AddressV		Wrap
+	AddressW		Wrap
+	MaxAnisotropy   16
+}

@@ -1,0 +1,1 @@
+{ uniform float 100.0 range [ 0, 7000 ] }

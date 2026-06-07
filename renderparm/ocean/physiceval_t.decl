@@ -1,0 +1,1 @@
+{ struct { float mHeight; float3 mNormal; } }

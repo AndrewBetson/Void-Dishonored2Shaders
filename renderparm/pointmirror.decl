@@ -1,0 +1,8 @@
+{ Sampler
+	MinFilter		Point
+	MagFilter		Point
+	MipFilter		Point
+	AddressU		Mirror
+	AddressV		Mirror
+	AddressW		Mirror
+}

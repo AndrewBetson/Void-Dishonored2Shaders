@@ -1,0 +1,6 @@
+{ 
+	struct { 
+		float3	m_position;		// 12 bytes
+		float3	m_direction;	// 12 bytes
+	}							// Total = 24 bytes
+}

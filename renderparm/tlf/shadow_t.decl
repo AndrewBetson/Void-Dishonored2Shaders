@@ -1,0 +1,11 @@
+{ 
+	struct {
+		float4x4	mWorldToShadowMat;
+		float4x4	mShadowToWorldMat;
+		uint   		mInfo; //see bit layout in arkTiledForwardShadowInfo_t (Render_types.h)
+
+		// NV-DZHDAN BEGIN =======================
+		uint3       padding;
+		// NV-DZHDAN END =========================
+	} 
+}

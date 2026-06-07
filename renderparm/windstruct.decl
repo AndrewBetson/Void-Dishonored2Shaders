@@ -1,0 +1,6 @@
+{
+	struct {
+		float4	previousWind;
+		float4	wind;
+	}
+}

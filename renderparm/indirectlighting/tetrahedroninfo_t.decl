@@ -1,0 +1,7 @@
+{
+	struct {
+		float3			wsPositions[4];			// World positions of the vertices of the tetrahedron
+		float4			probeWeights[4];		// Weights of the 4 probes to interpolate
+		uint4			probeIndices;			// Indices of the 4 probes used by the tetrahedron
+	}
+}

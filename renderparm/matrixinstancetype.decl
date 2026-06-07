@@ -1,0 +1,7 @@
+{
+	struct {
+		float4	modelMatrixX;
+		float4	modelMatrixY;
+		float4	modelMatrixZ;
+	}
+}

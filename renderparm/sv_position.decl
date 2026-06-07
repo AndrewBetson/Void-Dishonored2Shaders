@@ -1,0 +1,1 @@
+{ semantic float4 in(f) sys out(g|d|v) }

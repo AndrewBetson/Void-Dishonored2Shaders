@@ -1,0 +1,9 @@
+{
+	struct {
+		float3	wsPosition;		// Probe's position
+		float	meanDistance;	// Probe's mean distance to surrounding scene
+		float	minDistance;	// Probe's minimum distance to surrounding scene
+		float	maxDistance;	// Probe's maximum distance to surrounding scene
+		float	SH[256];		// Probe's visibility coefficients
+	}
+}

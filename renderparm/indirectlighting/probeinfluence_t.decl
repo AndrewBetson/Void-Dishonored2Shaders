@@ -1,0 +1,7 @@
+{
+	struct {
+		uint	indexSHProbe;		// SH probe index
+		float	solidAngleSH;
+		float	distance2OriginSH;
+	}
+}

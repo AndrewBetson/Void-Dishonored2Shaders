@@ -1,0 +1,6 @@
+{
+	struct {
+		float3		EmissiveColor;				// (12 bytes) Color of the emissive material
+		float		SH[9];						// (36 bytes) SH for the surface
+	}											// Total = 48 bytes per emissive surface per probe = maximum 768 bytes probe (due to the fact we limit to 16 emissive surfaces per probe max)
+}

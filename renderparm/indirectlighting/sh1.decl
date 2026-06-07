@@ -1,0 +1,5 @@
+{
+	struct {
+		float	SH[9];				// Order 3 monochromatic SH coefficients
+	}								// Total = 36 bytes
+}

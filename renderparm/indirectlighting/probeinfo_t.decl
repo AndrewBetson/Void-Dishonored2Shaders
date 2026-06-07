@@ -1,0 +1,6 @@
+{ 
+	struct { 
+		uint	IBLProbeIndex;			// (4 bytes) IBL Probe Index (formerly per-vertex now per-probe, provided by the Voronoï network propagation)
+		float	IBLLuminanceFactor;		// (4 bytes) IBL Luminance factor
+	}									// Total = 8 bytes
+}

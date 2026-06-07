@@ -1,0 +1,6 @@
+{
+	struct {
+		uint4	vertexIndices;				// (16 bytes) 4 uint32 vertex indices
+		uint2	probeIndices;				// (8 bytes)  4 uint16 probe indices packed into 2 uint32
+	}										// Total = 24 bytes
+}

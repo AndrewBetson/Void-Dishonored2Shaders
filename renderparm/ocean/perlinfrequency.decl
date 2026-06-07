@@ -1,0 +1,1 @@
+{ uniform float 0.07 range [ 0.00001, 0.5 ] }

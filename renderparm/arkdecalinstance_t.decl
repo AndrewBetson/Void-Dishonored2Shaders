@@ -1,0 +1,8 @@
+{
+	struct {
+		float4 m_world2DecalX;
+		float4 m_world2DecalY;
+		float4 m_world2DecalZ;
+		float4 m_color;
+	}
+}

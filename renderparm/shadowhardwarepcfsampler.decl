@@ -1,0 +1,8 @@
+{ SamplerCmp
+	MinFilter		Linear
+	MagFilter		Linear
+	MipFilter		Point
+	AddressU		Clamp
+	AddressV		Clamp
+	ComparisonFunc	Less
+}
