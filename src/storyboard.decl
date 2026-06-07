@@ -1,0 +1,17 @@
+{ newstyle
+	parms {
+	}
+
+	hlsl_vp_main {
+		float4 position = float4( $vertex_position.xyz, 1 );
+		@sv_position.x = dot( position, $mvpMatrixX );
+		@sv_position.y = dot( position, $mvpMatrixY );
+		@sv_position.z = dot( position, $mvpMatrixZ );
+		@sv_position.w = dot( position, $mvpMatrixW );
+		
+		@legacy_texcoord = float4($vertex_texcoord.x, $vertex_texcoord.y, 0.f, 0.f);
+	}
+	hlsl_fp_main {
+		@sv_target = $textureMap.Sample( $anisotropicSampler, $legacy_texcoord.xy );
+	}
+}

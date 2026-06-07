@@ -1,0 +1,227 @@
+{
+	newstyle
+
+	options {
+		shadow/useNormalOffset 1
+		noScreenShadows 1
+		hasbumpmap 1
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <BRDF_skin>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+
+		#if ( $(tool/unlit) || $alphatest ) || (( $hasDynamicDecals || $(Wrinkles/enable) || $(translucency/hasMask) || $(translucency_hq/useFakeNormalMap) || $hasbumpmap || $hasocclusionmap || $hasglossmap ) && ( !$isShadow && !$isZPrePass && !$isMasking ) )
+			@texcoords = vout._texcoords;
+		#endif
+
+		#if !$isShadow && !$isZPrePass && !$isMasking  && !$isOutline && !$(tool/unlit)
+			@wsPosition = vout._worldPosition;
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+			#if $(Wrinkles/enable)
+				@wrinkle = GetWrinkleValue( @texcoords.xy );
+			#endif
+
+		#elif $isZPrepass && !$isAlpha && !$isZPrePassAlpha
+			VertexOutContext previousFrameVout = TransformVertex( victx, true );
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+	}
+
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if $isShadow || $isZPrePass
+			ClipZorShadowPass( pixelCtx );
+			//Motion vector
+			#if $isZPrePass && !$isAlpha && !$isZPrePassAlpha
+				float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+				psMotionVector -= $jitterRelativeToPreviousFrame;
+				psMotionVector *= 0.5f;
+				psMotionVector.y *= -1.0f;
+				@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+			#else
+				return;
+			#endif
+		#elif $isMasking
+			HQ_FetchMasks( pixelCtx );
+			HQ_FetchDiffuseAlbedo( pixelCtx );
+			@sv_target = $(rendering/masking/bendTimeFactor).x;
+		#elif $(tool/unlit)
+			HQ_FetchMasks( pixelCtx );
+			HQ_FetchDiffuseAlbedo( pixelCtx );
+			@sv_target = pixelCtx.m_diffuseAlbedo;
+		#elif $isOutline
+			#if $outlineable
+				@sv_target = pixelCtx.OutlineSeed();
+			#endif
+
+		// =======================================================================
+		// Standard Pass
+		#else
+			SurfaceContext	surf;
+			surf.Clear();
+			ComputeLightingResult	result;
+			result.Clear();
+
+			float3 tsNormal = HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+			float3 gloss = HQ_FetchGloss2( pixelCtx );
+
+			#if $(Wrinkles/enable) && !defined( RETAIL )
+				#if $(Wrinkles/debugChannels)
+					if( $alwaysOne )
+					{
+						//@sv_target = DebugWrinkles( $texcoords.xy ) * 10.0f;
+						@sv_target = lerp( float4( 1,0,0,1 ), float4( 0,1,0,1 ), DebugWrinkles( $texcoords.xy ).x );
+						return;
+					}
+				#endif
+
+				#if $(Wrinkles/debugNormals)
+					if( $alwaysOne )
+					{
+						@sv_target = float4( tsNormal * 0.5f + 0.5f, 1.0f ) * 10.0f;
+						return;
+					}
+				#endif
+			#endif
+
+			float translucencyMask = 1.0;
+			#if $(translucency/hasMask)
+				translucencyMask = $(translucency/mask).Sample( $bilinearSampler, pixelCtx.m_layerTexCoords[0] ).x;
+			#endif
+
+			// =================================================================
+			// Skin Fresnel
+			// Stolen from http://http.developer.nvidia.com/GPUGems3/gpugems3_ch14.html (14.1)
+			float	specularTint = 0.028f;
+			float	IOR = Fresnel_IORFromF0( specularTint );
+
+			HQ_FetchMasks( pixelCtx );
+			//HQ_FetchDiffuseAlbedo( pixelCtx );
+
+			// =================================================================
+			// Compute lighting
+			// =================================================================
+			// Compute diffuse albedo and IOR for specular reflection based on glossiness and metallic parameters
+			surf.metallic = HQ_FetchMetallic( pixelCtx );
+
+			//float	fresnelStrength;
+			//HQ_FetchSpecularFresnelAndIOR( specularTint, fresnelStrength, IOR, pixelCtx.m_diffuseAlbedo.xyz, pixelCtx, gloss.x, surf.metallic );
+
+			surf.emissive			= 0.0;
+			surf.translucency		= translucencyMask;
+			surf.pixelIndex			= uint2( pixelCtx.m_ssPosition.xy );
+			float2 ndcPos			= screenPosToNdc( pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, pixelCtx.m_ssPosition.z, 1.0 ) );
+			surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+
+			surf.wsPosition			= pixelCtx.m_wsPosition;
+			surf.wsView				= pixelCtx.m_wsView;
+			surf.distance			= pixelCtx.m_distance;
+			surf.wsNormal			= pixelCtx.m_wsNormal;
+			surf.wsTangent			= pixelCtx.m_wsTangent;
+			surf.wsBiTangent		= pixelCtx.m_wsBiTangent;
+			surf.wsVertexNormal		= pixelCtx.m_wsVertexNormal;
+			surf.wsVertexTangent	= pixelCtx.m_wsVertexTangent;
+			surf.wsVertexBiTangent	= pixelCtx.m_wsVertexBiTangent;
+			surf.diffuseAlbedo		= 1.0;
+			#if $(SSS/useSecondarySpecular)
+				surf.roughness		= 1.0 - gloss.x;
+				surf.userData.secondaryRoughness = 1.0 - gloss.y;
+				surf.userData.thirdRoughness = 1.0 - gloss.z;
+			#else
+				surf.roughness		= 1.0 - gloss.x;
+			#endif
+
+			#if $(fuzz/enable) && $(fuzz/hasMask)
+				surf.fuzzMask = $(fuzz/mask).Sample( $bilinearSampler, pixelCtx.m_texCoords.xy ).r;
+			#endif
+
+			surf.sheen				= 0.0;
+			surf.sheenImportance	= 0.0;
+			surf.anisotropy			= $wardRoughness.z;
+			surf.anisotropyAngle	= PI * $wardRoughness.w;
+			surf.IOR				= IOR;
+			surf.fresnelStrength	= 1.0;
+
+			// ======================================================
+			HQ_ComputeAO( pixelCtx, surf );
+
+			#if $(translucency_hq/useFakeNormalMap)
+				float3 tsFakeTranslucencyNormal = UnpackBC5NormalMap( $(translucency_hq/fakeNormalMap).Sample( $anisotropicSampler, pixelCtx.m_layerTexCoords[0] ).rg );
+				surf.userData.wsFakeTranslucencyNormal = normalize( tsFakeTranslucencyNormal.x * pixelCtx.m_wsVertexTangent + tsFakeTranslucencyNormal.y * pixelCtx.m_wsVertexBiTangent + tsFakeTranslucencyNormal.z * pixelCtx.m_wsVertexNormal );
+			#endif
+
+			effectCtx.ApplyMaterialEffect_SSS( pixelCtx, surf );
+
+			// Additional infos for indirect lighting
+			FetchIndirectLightingData( pixelCtx, surf );
+
+			result = IntegrateLighting( surf, HIGH_QUALITY );
+
+			#if !$isMainPassAlpha
+				@sv_target.xyz = RangeCompressColorToR11G11B10( result.accumSpecular + result.accumEmissive );
+				@sv_target.w = 1.0f;
+
+				#if defined( PC ) && !defined( RETAIL )
+					// Debug draw
+					DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+				#endif //defined( PC )
+				float4 result1;
+				result1.xyz = result.accumDiffuse + result.accumAmbient;
+				result1.w = 1.0f;
+
+				#if $(SSS/hasSkinFresnelLookup)
+					float pseudoFresnel = max( dot( surf.wsView, surf.wsNormal ), 0.0f );
+					float3 fresnelLUT = $(SSS/SkinFresnelLookup).Sample( $anisotropicSampler, float2( pseudoFresnel, 0.0f ) ).rgb;
+
+					result1.rgb *= fresnelLUT;
+				#endif
+
+				@sv_target1.xyz = RangeCompressColorToR11G11B10( result1.xyz );		
+				@sv_target1.w = result1.w;
+
+			#else
+				@sv_target.rgb = RangeCompressColorToR11G11B10( result.finalizedColor );
+				@sv_target.a = 1.0;
+			#endif
+
+		#endif
+	}
+}

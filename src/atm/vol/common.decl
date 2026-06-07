@@ -1,0 +1,223 @@
+{
+	newstyle
+	hlsl_prefix {
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Noise hacks (to be replaced by actual 3D noise textures in the end)
+		float	Hash( float n )
+		{
+			return frac( sin( n ) * 43758.5453123 );
+		}
+		float2	Hash2( float n )
+		{
+			float2	sc;
+			sincos( n, sc.x, sc.y );
+			return frac( sc.xy * 43758.5453123 );
+		}
+
+		float	Perlin( float3 x )
+		{
+			float3	p = floor( x );
+			float3	f = frac( x );
+
+			f = f*f*(3.0-2.0*f);
+
+			float n = p.x + p.y*57.0 + 113.0*p.z;
+
+			return	lerp(	lerp(	lerp( Hash(n+  0.0), Hash(n+  1.0), f.x ),
+									lerp( Hash(n+ 57.0), Hash(n+ 58.0), f.x ), f.y ),
+							lerp(	lerp( Hash(n+113.0), Hash(n+114.0), f.x ),
+									lerp( Hash(n+170.0), Hash(n+171.0), f.x ), f.y ), f.z );
+		}
+
+		float	Perlin( float2 x )
+		{
+			float2	p = floor(x);
+			float2	f = frac(x);
+
+			f = f*f*(3.0-2.0*f);
+
+			float	n = p.x + p.y*57.0;
+
+			return	lerp(	lerp( Hash( n +  0.0 ), Hash( n +  1.0 ), f.x ),
+							lerp( Hash( n + 57.0 ), Hash( n + 58.0 ), f.x ), f.y );
+		}
+
+		// Stolen from http://www.iquilezles.org/www/articles/morenoise/morenoise.htm
+		float3	PerlinDerivatives( float2 x )
+		{
+			float2	p = floor(x);
+			float2	f = frac(x);
+
+			float2	u = f*f*(3.0-2.0*f);
+
+			float	n = p.x + p.y*57.0;
+
+			float	a = Hash( n +  0.0 );
+			float	b = Hash( n +  1.0 );
+			float	c = Hash( n + 57.0 );
+			float	d = Hash( n + 58.0 );
+			return float3(	a + (b-a) * u.x + (c-a) * u.y + (a-b-c+d) *u.x *u.y,		// Standard bilinear
+							30.0*f*f*(f*(f-2.0)+1.0)*(float2(b-a,c-a)+(a-b-c+d)*u.yx)	// dN/dx , dN/dy
+						);
+		}
+
+		// Fractional Brownian Motion with 4 octaves
+		static const float3x3		NoiseRot3D = float3x3(	 0.00,  0.80,  0.60,	// Rotate, scale and shear
+															-0.80,  0.36, -0.48,
+															-0.60, -0.48,  0.64 );
+
+
+		float	fbm( float3 p )
+		{
+//			p += PI;
+			float f = 0.0;
+
+			f += 0.5000*Perlin( p ); p = mul( NoiseRot3D, p*2.02 );
+			f += 0.2500*Perlin( p ); p = mul( NoiseRot3D, p*2.03 );
+			f += 0.1250*Perlin( p ); p = mul( NoiseRot3D, p*2.01 );
+			f += 0.0625*Perlin( p );
+
+			return f/0.9375;	
+		}
+
+		static const float2x2		NoiseRot2D = float2x2( 1.6, -1.2, 1.2, 1.6 );	// Rotate and scale
+	
+		float	fbm( float2 p )
+		{
+			float f = 0.0;
+
+			f += 0.5000*Perlin( p ); p = mul( NoiseRot2D, p*2.02 );
+			f += 0.2500*Perlin( p ); p = mul( NoiseRot2D, p*2.03 );
+			f += 0.1250*Perlin( p ); p = mul( NoiseRot2D, p*2.01 );
+			f += 0.0625*Perlin( p );
+
+			return f/0.9375;
+		}
+
+		// Same as above but with possibly varying parameters
+		float	fbm( float3 p, float4 _NoiseParams )
+		{
+			p *= _NoiseParams.x;
+
+			float	Amplitude = _NoiseParams.z;
+			float	f = 0.0;
+			f += Perlin( p );				p = mul( NoiseRot3D, p*_NoiseParams.y );
+			f += Amplitude*Perlin( p );		p = mul( NoiseRot3D, p*_NoiseParams.y ); Amplitude *= _NoiseParams.z;
+			f += Amplitude*Perlin( p );		p = mul( NoiseRot3D, p*_NoiseParams.y ); Amplitude *= _NoiseParams.z;
+			f += Amplitude*Perlin( p );
+
+			return f * _NoiseParams.w;
+		}
+
+		// Fast analytical noise for screen-space perturbation
+		float	FastScreenNoise( float2 _XY )
+		{
+			return Hash( 1.579849 * _XY.x - 2.60165409 * _XY.y )
+				 * Hash( -1.3468489 * _XY.y + 2.31765 * _XY.x );
+		}
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// 
+`define	USE_FAST_COS	// Define this to use Taylor approximations (slightly faster than regular cos)
+`ifdef	USE_FAST_COS
+		float	FastCos( float _Angle )
+		{
+			_Angle = fmod( _Angle + PI, TWOPI ) - PI;
+			float	x2 = _Angle * _Angle;
+			return 1.0 + x2 * (-0.5 + x2 * ((1.0/24.0) + x2 * (-(1.0/720.0) + x2 * (1.0/40320.0))));
+		}
+		float2	FastCos( float2 _Angle )
+		{
+			_Angle = fmod( _Angle + PI, TWOPI ) - PI;
+			float2	x2 = _Angle * _Angle;
+			return 1.0 + x2 * (-0.5 + x2 * ((1.0/24.0) + x2 * (-(1.0/720.0) + x2 * (1.0/40320.0))));
+		}
+		float4	FastCos( float4 _Angle )
+		{
+			_Angle = fmod( _Angle + PI, TWOPI ) - PI;
+			float4	x2 = _Angle * _Angle;
+			return 1.0 + x2 * (-0.5 + x2 * ((1.0/24.0) + x2 * (-(1.0/720.0) + x2 * (1.0/40320.0))));
+		}
+`else
+		float	FastCos( float _Angle )		{ return cos( _Angle ); }
+		float2	FastCos( float2 _Angle )	{ return cos( _Angle ); }
+		float4	FastCos( float4 _Angle )	{ return cos( _Angle ); }
+`endif
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Integration of extinction with a linear interpolation between 2 extinction coefficients along a step
+		float	IntegrateExtinction( float _Sigma_t0, float _Sigma_t1, float _StepSize )
+		{
+			return exp( -0.5 * (_Sigma_t0 + _Sigma_t1) * _StepSize );
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Fog density estimate
+		float	GetNoiseDensity( float3 _Position )
+		{
+//### shader compilation problem if uncommented!			_Position += $(atm/vol/noisePosition);
+
+			float	V = fbm( _Position, $(atm/vol/noiseOctaves) );
+			return pow( saturate( $(atm/vol/noiseShaping).y * (V + $(atm/vol/noiseShaping).x) ), $(atm/vol/noiseShaping).z );
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Transmittance Function Map readback
+		// For a reminder about the DCT, see http://en.wikipedia.org/wiki/Discrete_cosine_transform#DCT-III
+		// Note that the inverse of DCT-II we used for encoding is the DCT-III that we're applying here.
+		// It's really important since the DC term must be treated carefully!
+		//
+		float	DecodeTransmittance( Texture2DArray _TFM, float2 _TFMUV, float _Z )
+		{
+			if ( _Z < 0.0 )
+				return 1.0;	// Not even in the shadow yet!
+
+const float	FULLY_OPAQUE_INTERPOLATION_INTERVAL = 0.05;	// Smooth interpolation to full opacity in this interval
+
+			float4	C1 = _TFM.SampleLevel( $linearClamp, float3( _TFMUV, 1 ), 0.0 );
+
+			// Check if we can exit early due to full opacity
+			float	MaxZ = C1.w;
+			float	FullOpacity = smoothstep( MaxZ+(0.8*FULLY_OPAQUE_INTERPOLATION_INTERVAL), MaxZ-(0.2*FULLY_OPAQUE_INTERPOLATION_INTERVAL), _Z );	// Will yield 0 after blocker distance+epsilon
+ 			if ( FullOpacity < 1e-3 )
+ 				return FullOpacity;	// We're in the fully opaque zone anyway...
+
+			// We're in the smooth attenuation zone, we need to decode transmittance...
+			float4	C0 = _TFM.SampleLevel( $linearClamp, float3( _TFMUV, 0 ), 0.0 );
+
+			// Unpack biased & scaled coeffs
+//			C0.x *= 2.0;	// I put Cos0.x = 1 instead of 0.5 so it compensates for the *2*0.5 stoopid operation here...
+			C0.yzw = 2.0 * C0.yzw - 1.0;
+			C1.xyz = 2.0 * C1.xyz - 1.0;
+
+			float	x = saturate( _Z / MaxZ );
+
+			const float4	CosTerm0 = PI * float4( 1, 2, 3, 4 );
+			const float2	CosTerm1 = PI * float2( 5, 6 );
+
+			float4	Temp0 = FastCos( CosTerm0 * x );
+			float2	Temp1 = FastCos( CosTerm1 * x );
+			float4	Cos0 = float4( 1.0, Temp0.xyz );
+			float3	Cos1 = float3( Temp0.w, Temp1 );
+
+			return FullOpacity * saturate( dot( Cos0, C0 ) + dot( Cos1, C1.xyz ) );
+		}
+
+//		// This function assumes we're standing below the cloud and thus get the full extinction
+// 		float	GetFastCloudTransmittance( float3 _WorldPosition )
+// 		{
+// 			float3	ShadowPosition = mul( float4( _WorldPosition, 1.0 ), _World2Shadow ).xyz;
+// 		//	float2	UV = float2( 0.5 * (1.0 + ShadowPosition.x), 0.5 * (1.0 - ShadowPosition.y) );
+// 			float2	UV = ShadowPosition.xy;
+// 
+// 			float4	C0 = _TexCloudTransmittance.SampleLevel( LinearClamp, float3( UV, 0 ), 0.0 );
+// return 0.5 * C0.x - C0.y + C0.z - C0.w;	// Skip smaller coefficients... No need to tap further.
+// 			float4	C1 = _TexCloudTransmittance.SampleLevel( LinearClamp, float3( UV, 1 ), 0.0 );
+// 			return C0.x - C0.y + C0.z - C0.w + C1.x - C1.y;
+// 		}
+	}
+}

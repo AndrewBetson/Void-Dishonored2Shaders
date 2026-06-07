@@ -1,0 +1,79 @@
+{
+	newstyle
+
+	parms {
+	}
+	
+	state {
+		depthWrite	0
+		depthEnable	1
+		depthfunc	NOTEQUAL
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <downsampling/common>
+		
+		static const float2 RandomRotate[16] =
+		{
+			float2(-0.388235294 , 0.921568627 ),
+			float2(-0.929411765 , 0.380392157 ),
+			float2(0.921568627	, 0.380392157 ),
+			float2(0.380392157	, -0.929411765),
+			float2(-0.003921569 , -1.0        ),
+			float2(-0.709803922 , -0.709803922),
+			float2(0.701960784	, -0.709803922),
+			float2(0.380392157	, 0.921568627 ),
+			float2(-0.929411765 , -0.388235294),
+			float2(-0.709803922 , 0.701960784 ),
+			float2(1			, -0.003921569),
+			float2(-0.003921569 , 1.0         ),
+			float2(0.921568627	, -0.388235294),
+			float2(-0.388235294 , -0.929411765),
+			float2(-1			, -0.003921569),
+			float2(0.701960784	, 0.701960784 )
+		};
+
+		float2	JitterTexCoord( int2 _position, const float2 aOffsets ) {
+			float2	RandomRotation = RandomRotate[(_position.y & 0x3U) * 4.0 + (_position.x & 0x3U)].xy;
+			return float2(	aOffsets.x * RandomRotation.x - aOffsets.y * RandomRotation.y,		// cos -sin
+							aOffsets.x * RandomRotation.y + aOffsets.y * RandomRotation.x );	// sin  cos
+		}
+	}
+
+	hlsl_vp_main {
+		//draw quad on far plane
+		@sv_position = float4( $vertex_position.xy, 0.0, 1.0 );
+		//@texcoord = $vertex_texcoord;
+	}
+	
+	hlsl_fp_main {
+		const float		Radius_Pixel =		$(DWAO/Params0).x;	// radius (in pixels)
+		const float		Radius =			$(DWAO/Params0).y;	// radius
+		const float		UserMaxDepthDiff =	$(DWAO/Params0).z;	// Max depth diff between texels to occlude
+		const float		AOMax =				$(DWAO/Params0).w;	// Max AO value
+		const float		AOBias =			$(DWAO/Params1).x;	// AO bias
+
+		const float SAMPLE_PAIR_VOLUME = (1.0 / 3.0);
+		float Z0 = ComputeLinearZ( $(SSAO/Zbuffer)[(uint2)$sv_position.xy] );
+		float MaxDepthDiff = UserMaxDepthDiff * Z0;
+
+		// Compute rotated offset
+		float2 SampleOffset = Radius_Pixel * JitterTexCoord( (int2)$sv_position.xy, float2( -0.15, 0.35 ) ) * $resolutionScale;
+
+		// Sample downsampled depth at jittered positions
+		float2 DepthDifferences;
+		DepthDifferences.x = Z0 - $(downsampling/downsampledDepthBuffer)[int2( 0.5 * ((uint2)$sv_position.xy + SampleOffset) )].z; //zmax
+		DepthDifferences.y = Z0 - $(downsampling/downsampledDepthBuffer)[int2( 0.5 * ((uint2)$sv_position.xy - SampleOffset) )].z; //zmax
+
+		float2	OcclusionContributions = saturate( ( DepthDifferences / (Radius*Z0) ) * 0.5 + 0.5 );
+		float2	DistanceModifiers = saturate( (MaxDepthDiff - DepthDifferences) / MaxDepthDiff );
+		float2	ModifiedContributions = OcclusionContributions * DistanceModifiers;
+
+		float	OcclusionAmount = ModifiedContributions.x + ModifiedContributions.y - 1.0;
+				OcclusionAmount = saturate( AOMax * (OcclusionAmount + AOBias) );
+
+		float2 CompressedDepth = pack_2byte( Z0 );
+		@sv_target = float4( 1.0 - OcclusionAmount /*ao*/, 1.0 /*shadow*/, CompressedDepth );
+	}
+}

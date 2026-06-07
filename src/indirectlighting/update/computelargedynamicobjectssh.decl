@@ -1,0 +1,122 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 32
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <vertex>
+		#include <indirectLighting/common>
+	}
+
+	hlsl_cp_main {
+		uint	ObjectIndex = $sv_dispatchThreadID.x;
+		if ( ObjectIndex >= $(indirectLighting/update/parmsUint).x )
+			return;
+
+		$(indirectLighting/update/largeDynamicObjectInputBBox_t)	ObjectBBoxInfo = $(indirectLighting/update/bufferLargeDynamicObjectsBBoxInfo)[ObjectIndex];
+
+		#if 1	// bmayaux (2016-07-05) Write directly to the output buffer, this removes the warnings and allows us to avoid unrolling the loop which in turns avoids spilling to the scratch buffer
+
+			// Copy normalized BBox axes
+			// The idea here is that the operation to perform when given a vertex position is just:
+			//	bboxVertexPos = wsVertexPosition - BBoxMin;
+			//	lsVertexPos = float3( dot( bboxVertexPos, BBoxAxisX ), dot( bboxVertexPos, BBoxAxisY ), dot( bboxVertexPos, BBoxAxisZ ) );	// Now in [0,1]
+			//
+			@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].wsBBoxMin = ObjectBBoxInfo.wsBBoxMin;
+			@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].wsBBoxAxisX = ObjectBBoxInfo.wsBBoxAxisX / dot( ObjectBBoxInfo.wsBBoxAxisX, ObjectBBoxInfo.wsBBoxAxisX );
+			@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].wsBBoxAxisY = ObjectBBoxInfo.wsBBoxAxisY / dot( ObjectBBoxInfo.wsBBoxAxisY, ObjectBBoxInfo.wsBBoxAxisY );
+			@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].wsBBoxAxisZ = ObjectBBoxInfo.wsBBoxAxisZ / dot( ObjectBBoxInfo.wsBBoxAxisZ, ObjectBBoxInfo.wsBBoxAxisZ );
+
+			// Compute SH for the 8 corners of the BBox
+			float3	SHCoeffs[SH_COEFFS_COUNT];
+			uint	IBLProbeIndex;
+			float	IBLLuminanceFactor;
+
+			[loop]
+			for ( uint cornerIndex=0; cornerIndex < 8; cornerIndex++ ) {
+				float3	wsCornerPosition = ObjectBBoxInfo.wsBBoxMin
+										 + ((cornerIndex & 1) != 0 ? ObjectBBoxInfo.wsBBoxAxisX : 0.0)
+										 + ((cornerIndex & 2) != 0 ? ObjectBBoxInfo.wsBBoxAxisY : 0.0)
+										 + ((cornerIndex & 4) != 0 ? ObjectBBoxInfo.wsBBoxAxisZ : 0.0);
+
+				// Retrieve tetrahedron info and interpolate SH based on corner's position
+				$(indirectLighting/tetrahedronInfo_t)	tetrahedron = ReadTetrahedronInfo( ObjectBBoxInfo.tetrahedronIndex[cornerIndex] );
+				InterpolateSH( wsCornerPosition, 0.0, tetrahedron, SHCoeffs, IBLProbeIndex, IBLLuminanceFactor );
+
+				@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].IBLProbeIndices[cornerIndex] = IBLProbeIndex;
+				@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].IBLLuminanceFactors[cornerIndex] = IBLLuminanceFactor;
+
+				#if defined(PC)
+					// 9 coefficients on consoles
+					[unroll]
+					for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+						@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].SH[8 * i + cornerIndex] = SHCoeffs[i];
+					}
+				#else
+					// 4 coefficients on consoles
+					[unroll]
+					for ( uint i=0; i < 4; i++ ) {
+						@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex].SH[8 * i + cornerIndex] = SHCoeffs[i];
+					}
+				#endif
+			}
+		#else
+			$(indirectLighting/largeDynamicObjectBBoxSH_t)				ObjectBBoxSH;
+
+			// Copy normalized BBox axes
+			// The idea here is that the operation to perform when given a vertex position is just:
+			//	bboxVertexPos = wsVertexPosition - BBoxMin;
+			//	lsVertexPos = float3( dot( bboxVertexPos, BBoxAxisX ), dot( bboxVertexPos, BBoxAxisY ), dot( bboxVertexPos, BBoxAxisZ ) );	// Now in [0,1]
+			//
+			ObjectBBoxSH.wsBBoxMin = ObjectBBoxInfo.wsBBoxMin;
+			ObjectBBoxSH.wsBBoxAxisX = ObjectBBoxInfo.wsBBoxAxisX / dot( ObjectBBoxInfo.wsBBoxAxisX, ObjectBBoxInfo.wsBBoxAxisX );
+			ObjectBBoxSH.wsBBoxAxisY = ObjectBBoxInfo.wsBBoxAxisY / dot( ObjectBBoxInfo.wsBBoxAxisY, ObjectBBoxInfo.wsBBoxAxisY );
+			ObjectBBoxSH.wsBBoxAxisZ = ObjectBBoxInfo.wsBBoxAxisZ / dot( ObjectBBoxInfo.wsBBoxAxisZ, ObjectBBoxInfo.wsBBoxAxisZ );
+
+			// Compute SH for the 8 corners of the BBox
+			float3	SHCoeffs[SH_COEFFS_COUNT];
+			uint	IBLProbeIndex;
+			float	IBLLuminanceFactor;
+
+			[unroll]
+			for ( uint cornerIndex=0; cornerIndex < 8; cornerIndex++ ) {
+				float3	wsCornerPosition = ObjectBBoxInfo.wsBBoxMin
+										 + ((cornerIndex & 1) != 0 ? ObjectBBoxInfo.wsBBoxAxisX : 0.0)
+										 + ((cornerIndex & 2) != 0 ? ObjectBBoxInfo.wsBBoxAxisY : 0.0)
+										 + ((cornerIndex & 4) != 0 ? ObjectBBoxInfo.wsBBoxAxisZ : 0.0);
+
+				// Retrieve tetrahedron info and interpolate SH based on corner's position
+				$(indirectLighting/tetrahedronInfo_t)	tetrahedron = ReadTetrahedronInfo( ObjectBBoxInfo.tetrahedronIndex[cornerIndex] );
+				InterpolateSH( wsCornerPosition, 0.0, tetrahedron, SHCoeffs, IBLProbeIndex, IBLLuminanceFactor );
+
+				ObjectBBoxSH.IBLProbeIndices[cornerIndex] = IBLProbeIndex;
+				ObjectBBoxSH.IBLLuminanceFactors[cornerIndex] = IBLLuminanceFactor;
+
+				[unroll]
+				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+					ObjectBBoxSH.SH[8 * i + cornerIndex] = SHCoeffs[i];
+				}
+
+//ObjectBBoxSH.SH[cornerIndex] = (1.0 / 0.28209479177387814347403972578039) * float3( (cornerIndex & 1) != 0 ? 1 : 0, (cornerIndex & 2) != 0 ? 1 : 0, (cornerIndex & 4) != 0 ? 1 : 0 );
+//ObjectBBoxSH.SH[cornerIndex] = (1.0 / 0.28209479177387814347403972578039) * 0.1 * (wsCornerPosition - ObjectBBoxInfo.wsBBoxMin);
+//ObjectBBoxSH.SH[cornerIndex] = (1.0 / 0.28209479177387814347403972578039) * barycentrics.z;
+//ObjectBBoxSH.SH[cornerIndex] = (1.0 / 0.28209479177387814347403972578039) * ((any( barycentrics.xyz < 0.0 ) || any( barycentrics.xyz > 1.0 )) ? float3( 1, 0, 0 ) : float3( 0, 0, 0 ));
+
+// float3	color = 0.0;
+// switch ( ObjectIndex ) {
+// case 0: color = float3( 1, 0, 0 ); break;
+// case 1: color = float3( 0, 1, 0 ); break;
+// case 2: color = float3( 0, 0, 1 ); break;
+// case 3: color = float3( 1, 1, 0 ); break;
+// case 4: color = float3( 1, 0, 1 ); break;
+// case 5: color = float3( 0, 1, 1 ); break;
+// }
+// ObjectBBoxSH.SH[cornerIndex] = (1.0 / 0.28209479177387814347403972578039) * color;
+			}
+
+			@(indirectLighting/bufferLargeDynamicObjectBBox)[ObjectIndex] = ObjectBBoxSH;
+		#endif
+	}
+}

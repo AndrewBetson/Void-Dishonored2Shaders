@@ -1,0 +1,156 @@
+{
+	newstyle
+
+	options {
+		alphatest				1
+		forcePixelShader		1
+		hairPass	2
+		noScreenShadows 1
+	}
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		blend		 ONE ZERO
+		alphaBlendOp ADD
+		alphaBlend   ONE ONE
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <BRDF_hair>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+
+		static float4x4 thresholdMatrix = float4x4
+		(
+		   1.0 / 17.0,  9.0 / 17.0,  3.0 / 17.0, 11.0 / 17.0,
+		  13.0 / 17.0,  5.0 / 17.0, 15.0 / 17.0,  7.0 / 17.0,
+		   4.0 / 17.0, 12.0 / 17.0,  2.0 / 17.0, 10.0 / 17.0,
+		  16.0 / 17.0,  8.0 / 17.0, 14.0 / 17.0,  6.0 / 17.0
+		);
+
+		float3 GetFresnelLUT( float3 wsView, float3 wsNormal ) {
+			#if $useFresnelLUT
+				float fresnel = max( dot( wsView, wsNormal ), 0.0f );
+				float3 fresnelLUT = $hairFresnelLUT.Sample( $anisotropicSampler, float2( fresnel, 0.5f ) ).rgb;
+				return fresnelLUT;
+			#else
+				return 1.0;
+			#endif
+		}
+
+		float3	TransformFlowMapToWorldSpace( float3 _tsDir, float3 _wsTangent, float3 _wsBiTangent, float3 _wsNormal )
+		{
+			float3 wsDir = _tsDir.x * _wsTangent + _tsDir.y * _wsBiTangent + _tsDir.z * _wsNormal;
+			float lnDir = length(wsDir) + 1e-6;
+			wsDir /= lnDir;
+			return wsDir;
+		}
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+		@wsNormal = vout.m_wsNormal;
+		@texcoords = vout._texcoords;
+
+		#if $useFlowMap || $hasBumpMap
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+
+		pixelCtx.m_layerTexCoords[0] = $texcoords.xy;
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		// =================================================================
+		// Fetch Albedo
+		// =================================================================
+		float4 albedo;
+		#if $useAlphaMap
+			albedo.rgb = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy ).rgb;
+			albedo.a = $hairAlphaMap.Sample( $anisotropicSampler, $texcoords.xy ).r;
+		#else
+			albedo = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy );
+		#endif
+
+		#if $alphatest
+			// bmayaux (2016-07-18) Here we add 0.5+jitter to the pixel position to make the Bayer matrix jitter as well, providing us with a cheap bilinear interpolation of the matrix's 4 pixels and increasing the alpha range from 16 levels to basically an infinity when TAA is enabled
+//			float mask = thresholdMatrix[uint(pixelCtx.m_ssPosition.x) % 4][ uint(pixelCtx.m_ssPosition.y) % 4];
+//			float mask = thresholdMatrix[uint(pixelCtx.m_ssPosition.x+0.5+$jitterVectors.x) % 4][ uint(pixelCtx.m_ssPosition.y+0.5+$jitterVectors.y) % 4];
+			float mask = (1.0 / 17.0) * (1.0 + B8( uint2( pixelCtx.m_ssPosition.xy + 0.5 + $jitterVectors.xy ) ) / 64.0 );
+			clip( albedo.a - mask );
+		#endif
+
+		ClipZfromDistance( pixelCtx );
+
+		// =================================================================
+		// Fetch Normal
+		// =================================================================
+		HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+
+		// =================================================================
+		// Fetch Flow angle
+		// =================================================================
+		float flowAngle = DegreesToRadians($specularFlowAngle.x);
+		#if $useFlowMap
+			float3  tsFlow = UnpackBC5NormalMap( $hairFlowMap.Sample( $anisotropicSampler, $texcoords.xy ).rg );
+			float3	wsFlow = TransformFlowMapToWorldSpace( tsFlow, pixelCtx.m_wsTangent, pixelCtx.m_wsBiTangent, pixelCtx.m_wsVertexNormal );
+			#if $hasBumpMap
+				flowAngle +=  safeAcos(dot(pixelCtx.m_wsNormal,wsFlow) );
+			#else
+				flowAngle +=  safeAcos(dot(float3(0,0,1),tsFlow) );
+			#endif
+		#endif
+
+		float3 wsView = pixelCtx.m_wsView;
+		float gloss = HQ_FetchGloss( pixelCtx );
+		float3 fresnelLUT = GetFresnelLUT( wsView, pixelCtx.m_wsNormal );
+
+		// =================================================================
+		// Compute lighting
+		float4 currentPos = float4( pixelCtx.m_ssPosition.x*$positionToViewTexture.z*2.0-1.0, 1.0-pixelCtx.m_ssPosition.y*$positionToViewTexture.w*2.0, pixelCtx.m_ssPosition.z, 1.0 );
+		float4 wsPos = mul( $inverseViewProjectionMatrix, currentPos );
+
+		SurfaceContext	surf;
+		surf.Clear();
+		surf.pixelIndex			= uint2( $sv_position.xy );
+		surf.wsPosition			= $wsPosition.xyz;
+		surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+
+		surf.wsView				= wsView;
+		surf.distance			= pixelCtx.m_distance;
+		surf.wsNormal			= pixelCtx.m_wsNormal;
+		surf.wsVertexNormal		= pixelCtx.m_wsVertexNormal;
+		surf.diffuseAlbedo		= albedo.xyz;
+		surf.roughness			= 1.0 - gloss;
+
+		effectCtx.ApplyMaterialEffect( pixelCtx, surf );
+
+		surf.anisotropyAngle	= flowAngle;
+		surf.IOR				= 1.55; // [Stamm et al. 1977]
+		surf.fresnelStrength	= $fresnelStrength.x;
+		surf.userData.fresnelLUT= fresnelLUT;
+
+
+		// compute BRDF
+		ComputeLightingResult result = IntegrateLighting( surf, HIGH_QUALITY );
+
+		@sv_target.xyz = result.accumDiffuse;
+		@sv_target.a = 1.0;
+	}
+}

@@ -1,0 +1,27 @@
+{
+	newstyle
+	options {
+	}
+	state {
+		depthWrite 0		// No Z write
+ 		depthfunc	ALWAYS	// No Z read
+		depthEnable	0
+		cull none
+	}
+	hlsl_prefix {
+	}
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		#ifdef ORBIS
+			#pragma PSSL_target_output_format(default FMT_32_ABGR)
+		#endif
+		
+		float rawZ = $(downsamplingPS/depthBuffer).SampleLevel( $pointClamp, $texcoord, 0.0f ).x;
+		float linearZ = ComputeLinearZ( rawZ );
+	
+		@sv_target = linearZ;
+	}
+}

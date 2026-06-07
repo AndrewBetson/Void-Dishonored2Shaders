@@ -1,0 +1,205 @@
+{
+	newstyle
+	hlsl_prefix {
+#ifndef INDIRECT_LIGHTING_VERTEX_INCLUDED
+#define INDIRECT_LIGHTING_VERTEX_INCLUDED
+
+		#include <indirectLighting/common>
+
+		///////////////////////////////////////////////////////////////////////////////////////////////
+		// Writes all the necessary informations for the pixel shader to use indirect lighting
+		#if $useMultiInstancing || $(tool/usePerVertexSH)
+
+			// In multi-instancing mode, we have a single tetrahedron and IBL probe index for every vertex.
+			// IBL probe indices need to be interpolated using the vertex' barycentric coordinates
+			//
+			void	WriteIndirectLightingVertexOutput(	VertexOutContext _Context,
+														out float3 _Irradiance0, out float3 _Irradiance1, out float3 _Irradiance2, out float3 _Irradiance3, 
+														out float _IBLLuminanceFactor,
+														out uint _IBLCubeMapIndex ) {
+
+				// SH
+				float3	SH[SH_COEFFS_COUNT];
+				uint	IBLProbeIndex;
+				InterpolateSH( _Context._worldPosition, _Context.m_wsNormal, _Context._tetrahedron, SH, IBLProbeIndex, _IBLLuminanceFactor );
+
+				// IBL Cube Map
+				_IBLCubeMapIndex = $(IBL/probeID2CubeMapArrayIndex)[ IBLProbeIndex ];
+
+				// Pack 4 principal irradiance values to be unpacked in pixel shader
+				PackSHPrincipalDirections( SH, _Context.m_wsTangent.xyz, _Context.m_wsBiTangent, _Context.m_wsNormal, _Irradiance0, _Irradiance1, _Irradiance2, _Irradiance3 );
+
+
+
+
+// DEBUG INFLUENCES
+// if ( $(indirectLighting/globalParms1).x != ~0U || $(indirectLighting/globalParms1).y != ~0U || ($(indirectLighting/globalParms1).z & 16) != 0 ) {
+// 
+// 	// Debug probe influences
+// 	uint	DebugProbeIndex0 = $(indirectLighting/globalParms1).x;
+// 	uint	DebugProbeIndex1 = $(indirectLighting/globalParms1).y;
+// 	bool	showBinaryInfluence = ($(indirectLighting/globalParms1).z & 4) != 0;
+// 	bool	showDistance = ($(indirectLighting/globalParms1).z & 8) != 0;
+// 
+// 	float3	Color0 = DebugProbeIndex1 != ~0U ? float3( 1, 0, 0 ) : 1.0;
+// 	float3	Color1 = DebugProbeIndex0 != ~0U ? float3( 0, 0.5, 1 ) : 1.0;
+// 
+// 	$(indirectLighting/probeInfluence_t)	influence = $(indirectLighting/bufferDebugPerInstanceVertexProbeInfluences)[_Context._vertexInstanceOffset];
+// //	float	Value = $(indirectLighting/globalParms0).x * (showDistance ? influence.distance2OriginSH : influence.solidAngleSH);
+// 	float	Value = showDistance ?	($(indirectLighting/globalParms0).x * abs(influence.distance2OriginSH))
+// 								 :	(showBinaryInfluence ? (influence.solidAngleSH != 0 ? 1 : 0) : $(indirectLighting/globalParms0).x * influence.solidAngleSH);
+// 
+// 	_Irradiance0  = (influence.indexSHProbe == DebugProbeIndex0 ? Value : 0.0) * Color0;
+// 	_Irradiance0 += (influence.indexSHProbe == DebugProbeIndex1 ? Value : 0.0) * Color1;
+// 
+// 	// Debug default tetrahedron vertices
+// 	bool	showDefaultTetrahedrons = ($(indirectLighting/globalParms1).z & 16) != 0;
+// 	_Irradiance0 += showDefaultTetrahedrons && influence.distance2OriginSH < 0.0 ? float3( 1, 0, 0 ) : 0.0;
+// 
+// // Show tetrahedron
+// //_Irradiance0 = $(indirectLighting/globalParms0).x * _tetrahedronIndex;
+// // Show tetrahedron probe index
+// //_Irradiance0 = $(indirectLighting/globalParms0).x * _Context._tetrahedron.probeIndices.x;
+// }
+
+
+
+			}
+
+		#else	// !$useMultiInstancing && !$(tool/usePerVertexSH)
+
+			// "Standard" per-object interpolation
+			// Those are the dynamic, non-world objects that are either:
+			//	• Small objects, for which we pass a single tetrahedron with barycentric coordinates, an IBL probe index (although we're not using it anymore as each tetrahedron interpolates an IBL probe index)
+			//	• Large objects, for which we pass the index of the BBox SH interpolation structure. Each vertex's IL data are then interpolated within it's object's BBox...
+			//
+			#if $(indirectLighting/dynamicUseBBoxSHInterpolation) == 0
+
+				// In standard, small-object mode, we have a single tetrahedron and IBL probe index for the entire surface
+				// The 4 SH probe coefficients are weighted using barycentric coordinates given by the Delaunay tetrahedralization of the probes network
+				//
+				// The SH & cube map indices are given per object either through the "indirectLighting/dynamicTetrahedronIndex" render parms or through
+				//	an array of indirect lighting data when rendering instanced objects
+				//
+				void	WriteIndirectLightingVertexOutput( VertexOutContext _Context,
+														   out float3 _Irradiance0, out float3 _Irradiance1, out float3 _Irradiance2, out float3 _Irradiance3, 
+														   out float _IBLLuminanceFactor,
+														   out uint _IBLCubeMapIndex ) {
+
+
+					// SH
+					float3	SH[SH_COEFFS_COUNT];
+					uint	IBLProbeIndex;	// Here we're also given an IBL probe index that we could remap and use if we don't want to pass an IBL cube map index manually by render parm, someday...
+					InterpolateSH( _Context._tetrahedronBarycentricCoordinates, _Context._tetrahedron, SH, IBLProbeIndex, _IBLLuminanceFactor );
+
+					// IBL Cube Map
+					#if 0
+						_IBLCubeMapIndex = _Context._probeIndexIBL;								// Directly use the remapped index given as parameter
+					#else
+						_IBLCubeMapIndex = $(IBL/probeID2CubeMapArrayIndex)[ IBLProbeIndex ];	// Or remap the one computed by the interpolation
+					#endif
+
+					// Pack 4 principal irradiance values to be unpacked in pixel shader
+					PackSHPrincipalDirections( SH, _Context.m_wsTangent.xyz, _Context.m_wsBiTangent, _Context.m_wsNormal, _Irradiance0, _Irradiance1, _Irradiance2, _Irradiance3 );
+				}
+
+			#else	// if $(indirectLighting/dynamicUseBBoxSHInterpolation) != 0
+
+				// bmayaux (2016-03-28) Interpolates the IL info for a given vertex position within the object's world-space BBox
+				//	_wsPosition, the vertex's world-space position
+				//	_BBoxStructureIndex, index of the GPU-computed BBox SH information
+				//	_SH[9], the resulting interpolated SH to use for the vertex
+				//	_IBLProbeIndex, the resulting interpolated IBL probe index (not cube map index: needs remapping!) to use for the vertex
+				//	_IBLLuminanceFactor, the resulting interpolated IBL luminance factor to use for the vertex
+				//
+				void	InterpolateBBoxSH( float3 _wsPosition, uint _BBoxStructureIndex, out float3 _SH[SH_COEFFS_COUNT], out uint _IBLProbeIndex, out float _IBLLuminanceFactor ) {
+					$(indirectLighting/largeDynamicObjectBBoxSH_t)	BBoxSH = $(indirectLighting/bufferLargeDynamicObjectBBox)[_BBoxStructureIndex];
+
+					float3	bboxPosition = _wsPosition - BBoxSH.wsBBoxMin;
+					float3	lsPosition = saturate( float3( dot( bboxPosition, BBoxSH.wsBBoxAxisX ), dot( bboxPosition, BBoxSH.wsBBoxAxisY ), dot( bboxPosition, BBoxSH.wsBBoxAxisZ ) ) );
+
+					// Don't interpolate IBL index but use the closest one instead
+					uint3	lsPositionInt = uint3( round( lsPosition ) );
+					_IBLProbeIndex = BBoxSH.IBLProbeIndices[lsPositionInt.x + 2 * lsPositionInt.y + 4 * lsPositionInt.z];
+
+					// Simple interpolation of luminance factor
+					float4	IBLLuminanceFactorZ0 = float4( BBoxSH.IBLLuminanceFactors[0], BBoxSH.IBLLuminanceFactors[1], BBoxSH.IBLLuminanceFactors[2], BBoxSH.IBLLuminanceFactors[3] );
+					float4	IBLLuminanceFactorZ1 = float4( BBoxSH.IBLLuminanceFactors[4], BBoxSH.IBLLuminanceFactors[5], BBoxSH.IBLLuminanceFactors[6], BBoxSH.IBLLuminanceFactors[7] );
+					float4	IBLLuminanceFactorZ = lerp( IBLLuminanceFactorZ0, IBLLuminanceFactorZ1, lsPosition.z );
+					float2	IBLLuminanceFactorY = lerp( IBLLuminanceFactorZ.xy, IBLLuminanceFactorZ.zw, lsPosition.y );
+					_IBLLuminanceFactor = max( 0.0001, lerp( IBLLuminanceFactorY.x, IBLLuminanceFactorY.y, lsPosition.x ) );
+
+					// Heavier interpolation of SH factors
+					#if defined(PC)
+						[loop]
+						for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+							uint	offset = 8 * i;
+							float3	SH00 = lerp( BBoxSH.SH[offset+0], BBoxSH.SH[offset+4], lsPosition.z );
+							float3	SH01 = lerp( BBoxSH.SH[offset+1], BBoxSH.SH[offset+5], lsPosition.z );
+							float3	SH10 = lerp( BBoxSH.SH[offset+2], BBoxSH.SH[offset+6], lsPosition.z );
+							float3	SH11 = lerp( BBoxSH.SH[offset+3], BBoxSH.SH[offset+7], lsPosition.z );
+
+							float3	SH0 = lerp( SH00, SH10, lsPosition.y );
+							float3	SH1 = lerp( SH01, SH11, lsPosition.y );
+
+							_SH[i] = lerp( SH0, SH1, lsPosition.x );
+
+//_SH[i] = 0.0;
+						}
+					#else
+						[loop]
+						for ( uint i=0; i < 4; i++ ) {
+							uint	offset = 8 * i;
+							float3	SH00 = lerp( BBoxSH.SH[offset+0], BBoxSH.SH[offset+4], lsPosition.z );
+							float3	SH01 = lerp( BBoxSH.SH[offset+1], BBoxSH.SH[offset+5], lsPosition.z );
+							float3	SH10 = lerp( BBoxSH.SH[offset+2], BBoxSH.SH[offset+6], lsPosition.z );
+							float3	SH11 = lerp( BBoxSH.SH[offset+3], BBoxSH.SH[offset+7], lsPosition.z );
+
+							float3	SH0 = lerp( SH00, SH10, lsPosition.y );
+							float3	SH1 = lerp( SH01, SH11, lsPosition.y );
+
+							_SH[i] = lerp( SH0, SH1, lsPosition.x );
+
+//_SH[i] = 0.0;
+						}
+					#endif
+
+// float3	color = 0.0;
+// switch ( _BBoxStructureIndex ) {
+// case 0: color = float3( 1, 0, 0 ); break;
+// case 1: color = float3( 0, 1, 0 ); break;
+// case 2: color = float3( 0, 0, 1 ); break;
+// case 3: color = float3( 1, 1, 0 ); break;
+// case 4: color = float3( 1, 0, 1 ); break;
+// case 5: color = float3( 0, 1, 1 ); break;
+// }
+//_SH[0] = (1.0 / 0.28209479177387814347403972578039) * color;	// Shows a nice color corresponding to the BBox structure index we're using for the object
+//_SH[0] = (1.0 / 0.28209479177387814347403972578039) * ((any( lsPosition < 0.0 ) || any( lsPosition > 1.0 )) ? float3( 1, 0, 1 ) : float3( 0, 0, 0 ));	// Make sure all vertices are within the bbox
+//_SH[0] = lsPosition;	// Shows the [0,1] local vertex position within the BBox
+				}
+
+				// In standard, large-object mode, we're given a single index into the bufferLargeDynamicObjectBBox through the "IBL probe index" parameter stored in the vertex context
+				// The BBox SH structure is then used to interpolate SH coefficients, IBL probe index and IBL luminance factors depending on the vertex's position within the BBox
+				void	WriteIndirectLightingVertexOutput( VertexOutContext _Context,
+														   out float3 _Irradiance0, out float3 _Irradiance1, out float3 _Irradiance2, out float3 _Irradiance3, 
+														   out float _IBLLuminanceFactor,
+														   out uint _IBLCubeMapIndex ) {
+
+					// SH + IBL Cube Map
+					float3	SH[SH_COEFFS_COUNT];
+					uint	IBLProbeIndex;
+					InterpolateBBoxSH( _Context._worldPosition, _Context._probeIndexIBL, SH, IBLProbeIndex, _IBLLuminanceFactor );
+
+					// Remap IBL probe index
+					_IBLCubeMapIndex = $(IBL/probeID2CubeMapArrayIndex)[ IBLProbeIndex ];
+
+					// Pack 4 principal irradiance values to be unpacked in pixel shader
+					PackSHPrincipalDirections( SH, _Context.m_wsTangent.xyz, _Context.m_wsBiTangent, _Context.m_wsNormal, _Irradiance0, _Irradiance1, _Irradiance2, _Irradiance3 );
+				}
+			#endif	// if $(indirectLighting/dynamicUseBBoxSHInterpolation) != 0
+
+		#endif	// !$useMultiInstancing && !$(tool/usePerVertexSH)
+
+#endif	// #ifndef INDIRECT_LIGHTING_VERTEX_INCLUDED
+	}
+}

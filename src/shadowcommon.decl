@@ -1,0 +1,168 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <atm/common>
+		#include <intersection>
+
+//		#define	SHADOW_INVERSE_TRANSFORM_REQUIRED	1				// bmayaux (2015-12-05) Define this to make the ComputeParallelShadow also return the Shadow=>World transform
+		#define QUALITY ($shadowFilteringQuality - 1)
+		#define SHADOW_SLICE_INDEX( info ) ((info) & 0x0000001F)	//These macros needs to be kept in sync with arkTiledForwardShadowInfo_t
+
+		float GetFastCloudShadowing( float3 _wsPosition ) {
+			const float	WorldBounds = $(env/atm/sky/cloudAltitude);
+			float3	CenterKm = float3( 0, 0, -WorldBounds );
+			float	RadiusKm = WorldBounds + 2.0;
+			float3	OriginKm = 0.001 * _wsPosition;
+			float3	Dir = $(atm/sky/SunDirection).xyz;
+
+			float	minT, maxT;
+			IntersectRaySphere( OriginKm, Dir, CenterKm, RadiusKm, minT, maxT);
+			float3	HitPosKm = maxT > 0.0f ? OriginKm + Dir * maxT : OriginKm + Dir * minT;
+			float2	UV = HitPosKm.xy;
+
+			//Rotate
+			float angle = $worldTime.x * $(env/atm/sky/cloudRotation);
+			float sinA, cosA;
+			sincos( angle, sinA, cosA );
+			float2x2 matRotZ = float2x2( cosA, -sinA, sinA,  cosA );
+			float2 rotUV = mul( matRotZ, UV );
+
+			//Speed
+			rotUV += $worldTime.xx * float2($(env/atm/sky/cloudSpeedX), $(env/atm/sky/cloudSpeedY));
+			//Tile
+			rotUV *= float2($(env/atm/sky/cloudTilingX), $(env/atm/sky/cloudTilingY));
+			//Fetch
+	// 			float density = $(env/atm/sky/cloudShadow).Sample( $bilinearSampler, rotUV, 0.0 ).x;		// bmayaux (2015-04-13) I'm using this code in a CS and Sample() is not supported
+			float density = $(env/atm/sky/cloudShadow).SampleLevel( $bilinearSampler, rotUV, 0.0 ).x;	// ... so I took the liberty to replace by a SampleLevel(), I think it shouldn't change much?
+
+			//Density
+			density *= $(env/atm/sky/cloudDensity);
+			float Extinction = exp( -density );
+
+			return saturate(Extinction);
+		}
+
+		float4 ComputePositionLightSpace(float3 wsPosition, float4x4 mWorldToShadowMat, bool _isDirectionalLight) {
+			if( _isDirectionalLight ) {
+				return float4( mul( (float3x4) mWorldToShadowMat, float4( wsPosition, 1.0 ) ), 1.0 );
+			}
+			else {
+				return mul( float4( wsPosition, 1.0 ), mWorldToShadowMat );
+			}
+		}
+
+		void ComputeNormalOffset(const float3 wsNormal, const float3 lightDir, out float cosLightAngle, out float NormalOffsetScale) {
+			NormalOffsetScale = 1.0;
+			cosLightAngle = 0.0;
+			#if $(shadow/useSlopeScale)
+				cosLightAngle = dot(normalize(lightDir), wsNormal);
+				NormalOffsetScale = saturate(1 - cosLightAngle);
+			#endif
+		}
+
+		float4 ComputeUvNormalOffset(const float4x4 mWorldToShadowMat, const float3 wsPosition, const float4 Plp, const bool _isDirectionalLight) {
+			if( _isDirectionalLight ) {
+				float3 lsPosition = mul( (float3x4)mWorldToShadowMat, float4(wsPosition,1.0) );
+				return float4( Plp.xy, lsPosition.z, 1.0 );
+			}
+			else {
+				float4 lsPosition = mul( float4(wsPosition,1.0), mWorldToShadowMat);
+				lsPosition.xy = Plp.xy;
+				return lsPosition;
+			}
+		}
+		
+		float4 ComputeShadowOffset( const float4x4 mWorldToShadowMat, const float3 wsPosition, const float3 wsNormal, const float3 lightDir, const bool _isDirectionalLight ) {
+			float4 Plp;
+
+			#if !$(shadow/useNormalOffset)
+				Plp = ComputePositionLightSpace( wsPosition, mWorldToShadowMat, _isDirectionalLight );
+			#else
+				float cosLightAngle;
+				float NormalOffsetScale;
+				ComputeNormalOffset(wsNormal,lightDir,cosLightAngle,NormalOffsetScale);
+				float3 ShadowOffset = wsNormal * $(shadow/normalOffset) * NormalOffsetScale;
+
+				float3 shadowPw = wsPosition + ShadowOffset;
+				if( _isDirectionalLight ) {
+					Plp.xyz = mul( (float3x4)mWorldToShadowMat, float4(shadowPw, 1.0));
+					Plp.w = 1.0;
+				}
+				else {
+					Plp = mul( float4(shadowPw, 1.0), mWorldToShadowMat);
+				}
+
+				#if $(shadow/uvNormalOffset)
+					Plp = ComputeUvNormalOffset(mWorldToShadowMat, wsPosition, Plp);
+				#endif
+			#endif
+
+			float zBias = $(shadow/bias);
+			#if $(shadow/useSlopeScaleBias)
+			   float slope = 0.0;
+			   #if $(shadow/slopeScaleIsPostProjection)
+					float3 SurfaceVector = lightDir;
+					SurfaceVector -= wsNormal * dot(wsNormal, SurfaceVector);
+					SurfaceVector = normalize(SurfaceVector);
+
+					float4 SlopeOffsetPw = float4(wsPosition + SurfaceVector, 1.0);
+					float4 SlopeOffsetPlp;
+					if( _isDirectionalLight ) {
+						SlopeOffsetPlp.xyz = mul( (float3x4)mWorldToShadowMat, SlopeOffsetPw);
+						SlopeOffsetPlp.w = 1.0;
+					} else {
+						SlopeOffsetPlp = mul(SlopeOffsetPw, mWorldToShadowMat);
+					}
+					float4 delta = SlopeOffsetPlp/SlopeOffsetPlp.w - Plp/Plp.w;
+					slope = clamp(max(abs(delta.z)/(abs(delta.x)+0.0000000001f), abs(delta.z)/(abs(delta.y)+0.0000000001f)), 0, 10);
+			   #elif $(shadow/useSlopeScale)
+					#if !$(shadow/useNormalOffset)
+						float cosLightAngle = dot(normalize(lightDir), wsNormal);
+					#endif
+				   float sinLightAngle = sqrt(1.0 - cosLightAngle*cosLightAngle);
+				   slope = sinLightAngle / max(cosLightAngle,0.00001);
+			   #endif
+
+				// factor in bias here to save pixel shader work
+				zBias += slope * $(shadow/slopeScaleBias);
+			#endif
+
+			Plp.z -= zBias;
+			Plp.xyz /= Plp.w;
+			return Plp;
+		}
+
+		float4 ComputeShadowOffset( $(tlf/shadow_t) _shadowMapInfo, const float3 _wsPosition, const float3 _wsNormal, float3 _lightDir) {
+			return ComputeShadowOffset( _shadowMapInfo.mWorldToShadowMat, _wsPosition, _wsNormal, _lightDir, false /*isDirectional*/ );
+		}
+
+		uint OmniShadowMapSliceOffset( float3 _wsLightDir /*no need to be normalized*/ ) {
+			//find the correct cube face
+			uint cubeFace = 0;
+			float3 absDir = abs( _wsLightDir );
+			
+			if( absDir.x > absDir.y ) {
+				if( absDir.x > absDir.z ) {
+					cubeFace = ( _wsLightDir.x > 0.0f ) ? 5 : 4; //X (idStudio Z)
+				} 
+				else {
+					cubeFace = ( _wsLightDir.z > 0.0f ) ? 3 : 2; //Z (idStudio Y)
+				}
+			} 
+			else {
+				if( absDir.y > absDir.z ) {
+					cubeFace = ( _wsLightDir.y > 0.0f ) ? 1 : 0; //Y (idStudio X)
+				}
+				else {
+					cubeFace = ( _wsLightDir.z > 0.0f ) ? 3 : 2; //Z (idStudio Y)
+				}
+			}
+			
+			return cubeFace;
+		}
+		
+		uint SpotShadowMapSliceOffset( float3 _wsToLight, float3 _wsSpotLeft/*, float3 _wsSpotForward*/ ) {
+			return dot( _wsToLight, _wsSpotLeft ) > 0 ? 0 : 1; 
+		}
+	}
+}

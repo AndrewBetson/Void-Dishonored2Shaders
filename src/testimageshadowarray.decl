@@ -1,0 +1,30 @@
+{
+	newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+
+	hlsl_prefix {
+		#include <testImage/common>
+	}
+
+	hlsl_vp_main {
+		@sv_position.x = dot( float4($vertex_position.xyz,1), $mvpMatrixX ) * $testImageFlip.x;
+		@sv_position.y = dot( float4($vertex_position.xyz,1), $mvpMatrixY ) * $testImageFlip.y;
+		@sv_position.z = dot( float4($vertex_position.xyz,1), $mvpMatrixZ );
+		@sv_position.w = dot( float4($vertex_position.xyz,1), $mvpMatrixW );
+
+		@(legacy_texcoord) = $(vertex_texcoord).xyxy;
+	}
+	hlsl_fp_main {
+		float shadow = $shadowMapAtlas.SampleLevel( $defaultSamp, float3( $(legacy_texcoord).xy, $testImageLODAndSlice.y ), $testImageLODAndSlice.x ).x; //ARKANE: jvirga (2013-12-13)
+		@sv_target = TransformShadow( $sv_position.xy, shadow );
+		@sv_target.w = $testImageAlpha.x;
+	}
+}

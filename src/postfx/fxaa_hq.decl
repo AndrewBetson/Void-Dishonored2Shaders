@@ -1,0 +1,65 @@
+{
+	newstyle
+	state {
+		blend		ONE ZERO
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_prefix {
+		// hard_coded HQ quality
+		#define FXAA_PC 1
+		#define FXAA_HLSL_5 1
+		#define FXAA_QUALITY__PRESET 39
+		#define FXAA_GREEN_AS_LUMA 1
+
+		#inlinefile <includes/Fxaa3_11.inc>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		float2 pixelCenteredUV = 0.5f.xx * float2(1.f,-1.f) * $vertex_position.xy + 0.5f.xx;
+		@texcoord = pixelCenteredUV;
+	}
+
+	hlsl_fp_main {
+		FxaaFloat2 fxaaQualityRcpFrame = $positionToViewTexture.zw;
+
+		// ignored, only used on console quality - compute this in uniforms if console version needed !
+		FxaaFloat4 fxaaConsoleRcpFrameOpt = float4( -0.5f / $positionToViewTexture.z, -0.5f /  $positionToViewTexture.w, 0.5f / $positionToViewTexture.z, 0.5f /  $positionToViewTexture.w );
+		FxaaFloat4 fxaaConsoleRcpFrameOpt2 = float4( -2.f / $positionToViewTexture.z, -2.f /  $positionToViewTexture.w, 2.f / $positionToViewTexture.z, 2.f /  $positionToViewTexture.w );
+		FxaaFloat4 fxaaConsole360RcpFrameOpt2 = float4( 8.f / $positionToViewTexture.z, 8.f /  $positionToViewTexture.w, -4.f / $positionToViewTexture.z, -4.f /  $positionToViewTexture.w );
+
+		// hard_coded HQ quality - cf includes/Fxaa3_11.inc for info on values
+		FxaaFloat fxaaQualitySubpix = 0.75f;
+		FxaaFloat fxaaQualityEdgeThreshold = 0.063f;
+		FxaaFloat fxaaQualityEdgeThresholdMin = 0.f;
+		FxaaFloat fxaaConsoleEdgeSharpness = 4.f;
+		FxaaFloat fxaaConsoleEdgeThreshold = 0.125f;
+		FxaaFloat fxaaConsoleEdgeThresholdMin = 0.f;
+		FxaaFloat4 fxaaConsole360ConstDir = float4(1.0, -1.0, 0.25, -0.25);
+
+		FxaaFloat2 pos = $texcoord.xy;
+		FxaaFloat4 fxaaConsolePosPos = pos.xyxy + fxaaConsoleRcpFrameOpt;
+
+		//texture & sampler
+		FxaaTex tex;
+		tex.tex = $viewColorMap;
+		tex.smpl = $bilinearClamp;
+
+		// PC version ignore this
+		FxaaTex fxaaConsole360TexExpBiasNegOne;
+		FxaaTex fxaaConsole360TexExpBiasNegTwo;
+		fxaaConsole360TexExpBiasNegOne.tex = tex.tex;
+		fxaaConsole360TexExpBiasNegOne.smpl = $bilinearClamp;
+		fxaaConsole360TexExpBiasNegTwo.tex = tex.tex;
+		fxaaConsole360TexExpBiasNegTwo.smpl = $bilinearClamp;
+
+		FxaaFloat4 res = FxaaPixelShader( pos, fxaaConsolePosPos, tex, fxaaConsole360TexExpBiasNegOne,fxaaConsole360TexExpBiasNegTwo, fxaaQualityRcpFrame, fxaaConsoleRcpFrameOpt, fxaaConsoleRcpFrameOpt2,
+			fxaaConsole360RcpFrameOpt2, fxaaQualitySubpix, fxaaQualityEdgeThreshold, fxaaQualityEdgeThresholdMin, fxaaConsoleEdgeSharpness, fxaaConsoleEdgeThreshold, fxaaConsoleEdgeThresholdMin, fxaaConsole360ConstDir );
+
+		@sv_target = float4( res.rgb, 1 );
+	}
+}

@@ -1,0 +1,79 @@
+{
+	newstyle
+
+	state {
+		depthEnable		0
+		depthWrite		0
+		depthfunc		ALWAYS
+		cull			NONE
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			ONE		ONE
+		alphaBlend		ONE		ONE
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <helper>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+		const uint tapCount = 8; //AVERAGE_QUALITY
+		const float decay = $(godRaysMask/Decay);
+		const float density = saturate( $(godRaysMask/Density) );
+		const float weight = $(godRaysMask/Weight);
+		float2 lightPositionOnScreen = float2( $(godRaysMask/Transform2).x, $(godRaysMask/Transform2).y ) * 0.5 + 0.5;
+		lightPositionOnScreen.y = 1.0 - lightPositionOnScreen.y;
+		lightPositionOnScreen *= $resolutionScale.xy;
+
+		float2 screenTexCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+		float2 tc = screenTexCoords;
+		float illuminationDecay = 1.0;
+
+		float2 deltaTexCoord = (tc - lightPositionOnScreen);
+		float3 color = $(atm/distanceFog/TexSourceImage).SampleLevel( $linearClamp, tc, 0.0 ).rgb;
+
+		//Interleaved Offset
+		float distToCenter = length(deltaTexCoord) + $positionToViewTexture.z * 0.5;
+		float2 stepSize = distToCenter/float(tapCount) * density;
+		const uint interleavedSize = 8;
+		const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+		uint2 interleavedPos = uint2($sv_position.xy) % interleavedSize;
+		#if $(atm/worldFog/useTemporal)
+//			float2 rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+			float2 rayOffset = (float)B8( uint2( interleavedPos + 0.5 + $jitterVectors.xy ) ) * stepSize * interleavedSquareRcp;
+		#else
+			float2 rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+		#endif
+
+		tc += rayOffset * (deltaTexCoord/distToCenter);
+		deltaTexCoord *= density / float(tapCount);
+
+		[unroll]
+		for(uint i=0; i < tapCount ; i++) {
+			tc -= deltaTexCoord;
+			float3 texel = $(atm/distanceFog/TexSourceImage).SampleLevel( $linearClamp, tc, 0.0 ).rgb;
+			color += texel * illuminationDecay * weight;
+			illuminationDecay *= decay;
+		}
+
+		#if $(atm/worldFogTurbulence/useTurbulenceOption)
+			float dynamicCanvasValue = $dynamicCanvas.SampleLevel( $bilinearSampler, screenTexCoords.xy, 0.0 ).x;
+			float range = $(atm/worldFogTurbulence/EndDistance).x - $(atm/worldFogTurbulence/StartDistance).x;
+			float Zlinear = $(atm/distanceFog/TexDepthHalf).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).x;
+			//float Zlinear = SampleLevelDownsampledDepthBufferLinear( screenTexCoords.xy, 0.0 ).x;	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+			// substract interior volume contribution
+			Zlinear -=  $(atm/worldDistanceFog/interiorTexture).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).x;
+			float dyncanFactor = saturate( (Zlinear - $(atm/worldFogTurbulence/StartDistance).x) / (range) );
+
+			float3 noisyColor = lerp(color.rgb, $(atm/worldFogTurbulence/Color).rgb, dynamicCanvasValue);
+			color = lerp(color.rgb, noisyColor.rgb, dyncanFactor);
+		#endif
+		
+		@sv_target = float4( color.rgb, 0.0 );
+	}
+}

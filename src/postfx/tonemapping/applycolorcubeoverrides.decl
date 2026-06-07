@@ -1,0 +1,33 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 32
+		NUMTHREADY 32
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <colorimetry>
+	}
+	hlsl_cp_main
+	{
+		uint3	TexelIndex = uint3( $sv_groupThreadID.xy, $sv_groupID.z );
+		float3	UVW = (0.5 + TexelIndex) * INV_COLOR_CUBE_SIZE;
+
+		// Sample current cube
+		float4	V0 = $(toneMapping/blendColorCube/sourceColorCube).SampleLevel( $pointClamp, UVW, 0.0 );
+
+		// Sample overrides
+		float4	V1 = $(toneMapping/blendColorCube/blendWeights).x * $(toneMapping/overrideColorCube/colorCube0).SampleLevel( $pointClamp, UVW, 0.0 );
+		if ( $(toneMapping/blendColorCube/blendWeights).y > 1e-6 )
+			V1 += $(toneMapping/blendColorCube/blendWeights).y * $(toneMapping/overrideColorCube/colorCube1).SampleLevel( $pointClamp, UVW, 0.0 );
+		if ( $(toneMapping/blendColorCube/blendWeights).z > 1e-6 )
+			V1 += $(toneMapping/blendColorCube/blendWeights).z * $(toneMapping/overrideColorCube/colorCube2).SampleLevel( $pointClamp, UVW, 0.0 );
+		if ( $(toneMapping/blendColorCube/blendWeights).w > 1e-6 )
+			V1 += $(toneMapping/blendColorCube/blendWeights).w * $(toneMapping/overrideColorCube/colorCube3).SampleLevel( $pointClamp, UVW, 0.0 );
+
+		// Lerp
+		float	t = dot( $(toneMapping/blendColorCube/blendWeights), 1.0f.xxxx );
+
+		@(toneMapping/finalColorCube)[TexelIndex] = lerp( V0, V1, t );
+	}
+}

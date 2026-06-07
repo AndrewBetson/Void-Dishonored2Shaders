@@ -1,0 +1,92 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+		//See http://www.paulinternet.nl/?page=bicubic
+		float CubicInterpolation( float _p0, float _p1, float _p2, float _p3, float _x )
+		{
+			return _p1 + 0.5f * _x*(_p2 - _p0 + _x*(2.0f*_p0 - 5.0f*_p1 + 4.0f*_p2 - _p3 + _x*(3.0f*(_p1 - _p2) + _p3 - _p0)));
+		}
+/*
+		//Brute force bicubic, see GPU Gems for a more optimal version
+		float BiCubicInterpolation( Texture2D<float> _tex, float2 _uv )
+		{
+			float2 texSize;
+			_tex.GetDimensions( texSize.x, texSize.y );
+				
+			float2 f = frac( _uv * texSize );
+
+			float y0 = CubicInterpolation(	_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2(-1,-1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 0,-1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 1,-1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 2,-1) ), f.x );
+                                                              
+			float y1 = CubicInterpolation(	_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2(-1,0) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 0,0) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 1,0) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 2,0) ), f.x );
+                                                              
+			float y2 = CubicInterpolation(	_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2(-1,1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 0,1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 1,1) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 2,1) ), f.x );
+                                                              
+			float y3 = CubicInterpolation(	_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2(-1,2) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 0,2) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 1,2) ),
+											_tex.SampleLevel( $pointSampler, _uv, 0.0f, int2( 2,2) ), f.x );
+
+			return CubicInterpolation( y0, y1, y2, y3, f.y );
+		}
+*/
+
+		//http://vec3.ca/bicubic-filtering-in-fewer-taps/
+		float4 BiCubicInterpolation( Texture2D<float4> _tex, float2 _uv )
+		{
+			float2 texSize;
+			float2 sampleWeight[3];
+			float2 samplePos[3];
+
+			_tex.GetDimensions( texSize.x, texSize.y );
+					 
+			_uv *= texSize;
+
+			float2 tc = floor( _uv - 0.5f ) + 0.5f;
+			float2 f = _uv - tc;
+			float2 f2 = f * f;
+			float2 f3 = f2 * f;
+
+			float2 w0 = f2 - 0.5f * (f3 + f);
+			float2 w1 = 1.5f * f3 - 2.5f * f2 + 1.0f;
+			float2 w3 = 0.5f * (f3 - f2);
+			float2 w2 = 1.0f - w0 - w1 - w3;
+			
+			sampleWeight[0] = w0;
+			sampleWeight[1] = w1 + w2;
+			sampleWeight[2] = w3;
+
+			samplePos[0] = tc - 1.0f;
+			samplePos[1] = tc + w2 / sampleWeight[1];
+			samplePos[2] = tc + 2.0f;
+		 
+			float2 rcpTexSize = 1.0f / texSize;
+		 
+			samplePos[0] *= rcpTexSize;
+			samplePos[1] *= rcpTexSize;
+			samplePos[2] *= rcpTexSize;
+			
+			float4 color;
+			color  = _tex.SampleLevel( $bilinearSampler, float2( samplePos[0].x, samplePos[0].y ), 0.0f ) * sampleWeight[0].x * sampleWeight[0].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[1].x, samplePos[0].y ), 0.0f ) * sampleWeight[1].x * sampleWeight[0].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[2].x, samplePos[0].y ), 0.0f ) * sampleWeight[2].x * sampleWeight[0].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[0].x, samplePos[1].y ), 0.0f ) * sampleWeight[0].x * sampleWeight[1].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[1].x, samplePos[1].y ), 0.0f ) * sampleWeight[1].x * sampleWeight[1].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[2].x, samplePos[1].y ), 0.0f ) * sampleWeight[2].x * sampleWeight[1].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[0].x, samplePos[2].y ), 0.0f ) * sampleWeight[0].x * sampleWeight[2].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[1].x, samplePos[2].y ), 0.0f ) * sampleWeight[1].x * sampleWeight[2].y;
+			color += _tex.SampleLevel( $bilinearSampler, float2( samplePos[2].x, samplePos[2].y ), 0.0f ) * sampleWeight[2].x * sampleWeight[2].y;
+			
+			return color;
+		}
+	}
+}

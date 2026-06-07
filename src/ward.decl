@@ -1,0 +1,46 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef WARD_INCLUDED
+		#define WARD_INCLUDED
+		struct WardContext
+		{
+			float	invRoughness_2;				// Original squared & inversed normalized isotropic roughness
+		
+			// Computes the Ward normal distribution
+			//	_wsNormal, surface normal
+			//	_wsToLight, world space light vector
+			//	_wsView, world space view vector
+			//	
+			float	ComputeWardTerm( float3 _wsNormal, float3 _wsToLight, float3 _wsView )
+			{
+				float3	Half = _wsToLight + _wsView; 
+//				Half = normalize(Half); // not normalized on purpose, HdotH would be 1 if normalized, nonsense
+			
+				float	HdotN = dot( Half, _wsNormal );
+						HdotN = max( 1e-4, HdotN );
+				float	invHdotN_2 = 1.0 / square( HdotN );
+				float	invHdotN_4 = square( invHdotN_2 );
+			
+				float	HdotH = dot( Half, Half );
+				const float exponent = invRoughness_2 * ( 1 - invHdotN_2 * HdotH );
+			
+ 				return INVPI * invRoughness_2 * exp( exponent ) * HdotH * invHdotN_4;
+			}
+		};
+
+		void	CreateWardContext( out WardContext wardContext, float _Roughness )
+		{
+			// Tweak roughness so the user feels it's a linear parameter
+			float	Roughness = _Roughness * _Roughness;	// Roughness squared seems to give a nice linear feel...
+															// People at Disney seem to agree with me! (cf ?5.4 http://blog.selfshadow.com/publications/s2012-shading-course/burley/s2012_pbs_disney_brdf_notes_v2.pdf)
+
+			// Only use isotropic roughness
+			Roughness = max( 0.01, Roughness );
+			float	invRoughness = 1.0 / (1e-5 + Roughness);
+			wardContext.invRoughness_2 = square( invRoughness );
+		}
+
+		#endif // WARD_INCLUDED
+	}
+}

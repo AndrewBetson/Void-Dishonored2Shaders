@@ -1,0 +1,26 @@
+{
+	newstyle
+
+	state {
+		blend		ONE	ONE
+		depthWrite	0
+		depthEnable	1
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position.xy = $vertex_position.xx * $(godRaysMask/Transform1).xy + $vertex_position.yy * $(godRaysMask/Transform1).zw + $(godRaysMask/Transform2).xy;
+		@sv_position.z  = 0.0;
+		@sv_position.w  = 1.0;
+		@texcoords = float4( $vertex_texcoord.xy, 0.f, 0.f );
+	}
+
+	hlsl_fp_main {
+		float4 color = $(atm/worldFog/SunTexture).SampleLevel( $linearClamp, $texcoords.xy, 0.0 ) * $(atm/worldFog/SunSpriteColor);
+		@sv_target = float4( RangeCompressColorToR11G11B10( color.rgb ), color.a );
+	}
+}

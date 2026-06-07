@@ -1,0 +1,17 @@
+{
+	newstyle
+
+	options {
+		numthreadx 8
+		numthready 8
+		numthreadz 1
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_cp_main {
+		int2	position = int2( $sv_dispatchThreadID.xy );
+		@( clearBuffer/clearTarget_R )[ position ] = @( clearBuffer/clearValue ).x;
+	}
+}

@@ -1,0 +1,108 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+		blendOp			ADD
+		blend			ONE		ONE
+		alphaBlend		ONE		ONE
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+		#include <helper>
+
+		float3 FetchCaustic( float3 _wsPos, float _causticTime ) {
+			float3 caustics;
+			float2 causticsUV = ( _wsPos.xy + _wsPos.z * $(water/wsRefractedLightDir).xy ) * $(water/CausticsTiling);
+			#if $(water/EnableGodRaysChromaticAberrationsOption)
+				caustics.r = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV - $(water/CausticsChromaticAberration), _causticTime ), 0.0f ).x;
+				caustics.g = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV,                                        _causticTime ), 0.0f ).x;
+				caustics.b = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV + $(water/CausticsChromaticAberration), _causticTime ), 0.0f ).x;
+			#else
+				caustics = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV, _causticTime ), 0.0f ).xxx;
+			#endif
+			return caustics * $(water/GodRaysIntensity);
+		}
+
+		float3 ComputeGodRays( uint2 _pixelCoords, float2 _texcoords, float _causticTime, float3 _extinctionCoeff, const uint _quality ) {
+			int tapCount = 8;
+			switch ( _quality ) {
+				case HIGH_QUALITY: tapCount = 16; break;
+				case AVERAGE_QUALITY: tapCount = 8; break;
+				case LOW_QUALITY: tapCount = 3; break;
+			}
+
+			//Fetch Depth
+			float depth = $(atm/distanceFog/TexDepth).SampleLevel( $linearClamp, _texcoords.xy, 0.0 ).x;
+			float depthClamped = saturate(depth + 0.001); //avoid weird artefact when depth is on far.
+
+			//Rebuild world space position
+			
+			float4 ndcPos = float4( screenPosToNdc(_pixelCoords), depthClamped, 1.0 );
+			float4 wsPos = mul( $inverseViewProjectionMatrix, ndcPos );
+			wsPos.xyz /= wsPos.w;
+
+			//Compute camera position
+			float3 rayDir = wsPos.xyz - $wsCamPos;
+			float d = length(rayDir);
+			rayDir /= d;
+			float distMax = min( dot($parallelLightSliceFars,1.0), d );
+			float	stepSize = distMax/tapCount;
+			float3	rayStep = rayDir * stepSize;
+
+			//Interleaved Offset
+			const uint interleavedSize = 8;
+			const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+			uint2 interleavedPos = _pixelCoords % interleavedSize;
+			#if $(atm/worldFog/useTemporal)
+//				float rayOffset = (float)B8( uint2( interleavedPos + rand24b( interleavedPos + $viewRandom.xy ) ) ) * stepSize * interleavedSquareRcp;
+				float rayOffset = (float)B8( uint2( interleavedPos + 0.5 + $jitterVectors.xy ) ) * stepSize * interleavedSquareRcp;
+			#else
+				float rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+			#endif
+
+			float3 perIterationExtinction = 1.0 - exp( - _extinctionCoeff * stepSize );
+
+			//Raymarch
+			float3 godRays = 0.0;
+			float4 wsRayPos = float4($wsCamPos.xyz + rayDir * rayOffset, 1.0);
+			for( int i = 0; i < tapCount; ++i ) {
+				float verticalDepth = max( $(water/WaterLevel) - wsRayPos.z, 0.0f );
+				float3 caustic = FetchCaustic( wsRayPos.xyz, _causticTime );
+				float3 verticalExtinction = exp( - _extinctionCoeff * verticalDepth );
+				
+				float shadowTerm = 1.0;
+				#if $(water/EnableGodRaysShadowingOption)
+					shadowTerm = $(atm/distanceFog/TexShadow).SampleLevel( $linearClamp, _texcoords, 00.0 ).x;
+				#endif
+
+				godRays += perIterationExtinction * verticalExtinction * caustic * shadowTerm;
+
+				wsRayPos.xyz += rayStep;
+			}
+
+			return godRays;
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0f );
+	}
+
+	hlsl_fp_main {
+		float2 texCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float causticTime = fmod( $localTime.x * $(water/CausticsSpeed), 32.0f );
+		float3 extinctionCoeff = ( 1.0f - $(water/WaterColor) ) * $(water/Extinction);
+
+		float3 color = ComputeGodRays( (uint2)$sv_position.xy, texCoords, causticTime, extinctionCoeff, AVERAGE_QUALITY );
+		
+		@sv_target.rgb = color;
+		@sv_target.a = 0.00;
+	}
+}

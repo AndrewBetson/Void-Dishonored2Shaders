@@ -1,0 +1,104 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+		blend ONE ZERO
+		blendOp ADD
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <PostFX/Debug/DrawText>
+		
+		#define g_uMaxNumColor 15
+		static const float3 kRadarColors[g_uMaxNumColor+1] = 
+		{
+			{0,0,0},			 // black			0
+			{0,0.9255,0.9255},   // cyan			1
+			{0,0.62745,0.9647},  // light blue		2
+			{0,0,0.9647},        // blue			3
+			{0,1,0},             // bright green	4
+			{0,0.7843,0},        // green			5
+			{0,0.5647,0},        // dark green		6
+			{1,1,0},             // yellow			7
+			{0.90588,0.75294,0}, // yellow-orange	8
+			{1,0.5647,0},        // orange			9
+			{1,0,0},             // bright red		10
+			{0.8392,0,0},        // red				11
+			{0.75294,0,0},       // dark red		12
+			{1,0,1},             // magenta			13
+			{0.6,0.3333,0.7882}, // purple			14
+			{0.847,0.745,0.921}, // light-purple  	15
+								 // white			>15
+		};
+		
+		#define ES_TYPE_COMPILATION				(1 << 5)	// Compilation error
+		#define ES_TYPE_SHADER_STAGES_MISMATCH	(1 << 6)	// Semantics mismatch between stages
+		#define ES_TYPE_SHADER_BINDING			(1 << 7)	// Runtime program binding failed
+		#define ES_TYPE_INPUT_LAYOUT_MISMATCH	(1 << 8)	// Vertex Buffer format not compatible with Vertex Shader input layout		
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		#if defined( RETAIL )
+			float2 pixelCoords = $sv_position.xy;
+			float2 vTextLength = 0.0;
+			float2 printPos = 0.0;
+			float col = 0.0;
+			
+			vTextLength = float2(STRWIDTH(11.0), STRHEIGHT(1.5) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y - 2;
+			col += get_char(ch_D,printPos,pixelCoords);
+			col += get_char(ch_e,printPos,pixelCoords);
+			col += get_char(ch_b,printPos,pixelCoords);
+			col += get_char(ch_u,printPos,pixelCoords);
+			col += get_char(ch_g,printPos,pixelCoords);
+			col += get_char(ch_spc,printPos,pixelCoords);
+			col += get_char(ch_O,printPos,pixelCoords);
+			col += get_char(ch_n,printPos,pixelCoords);
+			col += get_char(ch_l,printPos,pixelCoords);
+			col += get_char(ch_y,printPos,pixelCoords);
+			col += get_char(ch_spc,printPos,pixelCoords);
+
+			@sv_target = float4( col, 0.0, 0.0, 1.0 );
+		#else
+			float2 texCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture );
+			float accum = $(OIT/Accumulation).SampleLevel( $pointClamp, texCoords, 0.0f ).r;
+
+			if ( accum <= 0.0) {
+				discard;
+			}
+
+			//Get Autoexposure
+			$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+			float amount = 1.0/Adaptation.EngineLuminanceFactor;
+
+			//Get color 
+			float3 col = 0.0;
+			uint nbColor = min( accum, g_uMaxNumColor );
+			float3 color = kRadarColors[nbColor];
+			
+			col += color;
+
+			//Draw Digits
+			float2 pixelCoords = $sv_position.xy;
+			float2 vPixelsPerGridSquare = 16;
+			float2 printPos = floor(pixelCoords/vPixelsPerGridSquare) * vPixelsPerGridSquare;
+			printPos.x += accum < 10 ? STRWIDTH(1.0) * 0.5 : 1;
+			printPos.y += vPixelsPerGridSquare.y - (STRHEIGHT(1.0)-vPixelsPerGridSquare.y*0.5-1);
+			int zeros = accum < 10 ? 1 : 2;
+			col *= 1.0 - print_integer(accum, zeros, printPos, pixelCoords);
+
+			//Output
+			@sv_target = float4( col * amount, 1.0 );
+		#endif
+	}
+}

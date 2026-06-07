@@ -1,0 +1,44 @@
+{
+	newstyle
+	hlsl_prefix {
+		float4	Blur( int2 _position, int2 _dPos, float _depthThreshold ) {
+			float4	Sample0 = $(SSAO/AODepthBuffer)[_position];
+
+			int2	positionN = max( 0, _position - _dPos );
+			_position = min( $(DWAO/bufferSize).xy-1, _position + _dPos );
+			float4	SampleP1 = $(SSAO/AODepthBuffer)[_position];
+			float4	SampleN1 = $(SSAO/AODepthBuffer)[positionN];
+			_position = min( $(DWAO/bufferSize).xy-1, _position + _dPos );
+			positionN = max( 0, positionN - _dPos );
+			float4	SampleP2 = $(SSAO/AODepthBuffer)[_position];
+			float4	SampleN2 = $(SSAO/AODepthBuffer)[positionN];
+
+			float	CenterValue = Sample0.x;
+			float	CenterShadow = Sample0.y;
+			float	CenterDepth = unpack_2byte(Sample0.zw);
+			float4	Depths = float4( unpack_2byte(SampleN2.zw), unpack_2byte(SampleN1.zw), unpack_2byte(SampleP1.zw), unpack_2byte(SampleP2.zw) );
+			float4	Values = float4( SampleN2.x, SampleN1.x, SampleP1.x, SampleP2.x );
+			float4	Shadow = float4( SampleN2.y, SampleN1.y, SampleP1.y, SampleP2.y );
+
+			float4	DepthDiff = abs( CenterDepth - Depths );
+			float	ScaledDepthThreshold = _depthThreshold * CenterDepth;
+
+			float4	RejectedSamples = DepthDiff > ScaledDepthThreshold;
+			float4	BlurredValues  = lerp( Values, CenterValue, RejectedSamples );
+			float4	BlurredShadows = lerp( Shadow, CenterShadow, RejectedSamples );
+
+			// Apply normalized gaussian weighting
+			// Weights are hardcoded using idMath::NormalDistribution() with a variance of 4 + renormalizing
+			const float3	SAMPLE_WEIGHTS = float3( 0.251379132, 0.221841291, 0.152469158 );
+
+			float BlurredValue = dot( BlurredValues, SAMPLE_WEIGHTS.zyyz );
+			BlurredValue += CenterValue * SAMPLE_WEIGHTS.x;
+
+			float BlurredShadow = dot( BlurredShadows, SAMPLE_WEIGHTS.zyyz );
+			BlurredShadow += CenterShadow * SAMPLE_WEIGHTS.x;
+
+			float2 CompressedDepth = pack_2byte( CenterDepth + 0.0 );
+			return float4( BlurredValue, BlurredShadow, CompressedDepth );
+		}
+	}
+}

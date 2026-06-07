@@ -1,0 +1,104 @@
+{
+	newstyle
+	hlsl_prefix {
+	
+
+		//Crysis like vegetation
+		////////////////////////
+
+		float4 SmoothCurve( float4 x )
+		{
+			return x * x *( 3.0 - 2.0 * x );   
+		}   
+
+		float4 TriangleWave( float4 x ) 
+		{   
+			return abs( frac( x + 0.5 ) * 2.0 - 1.0 );   
+		}
+		   
+		float4 SmoothTriangleWave( float4 x )
+		{   
+			return SmoothCurve( TriangleWave( x ) );   
+		} 
+
+
+		float3 ApplyWindOnTrunk( 	float3 _pos,
+									float _Time,
+									float3 _WindDir,
+									float _WindStrength,
+									float _WindFrequency,
+									float _WindHeightFalloff )
+		{
+			float windEffect = _pos.y * _WindHeightFalloff;
+			windEffect *= cos( _Time * _WindFrequency ) * _WindStrength;
+			
+			return _pos + _WindDir * windEffect;
+		}
+		
+		//_vtxColor.x branch stiffness
+		//_vtxColor.y branch phase
+		//_vtxColor.z leaf stiffness
+
+		void AnimateVegetation( in out	float3	_vtxPos, 
+								in		float3	_vtxNormal, 
+								in		float3	_vtxColor, 
+								in		float3	_objPos,
+
+								in		float _Time,
+								in		float3 _WindDir,
+								in		float _DetailPhase,
+								in		float _LeafAnimFreq,
+								in		float _MainBendingAmplitude,
+								in		float _MainBendingVar,
+								in		float _MainBendingFreq,
+								in		float _BranchAnimAmplitude,
+								in		float _LeafAnimAmplitude )
+		{
+			const float4 frequencies = float4( 1.975f, 0.793f, 0.375f, 0.193f );
+
+			//Branch & detail bending
+				
+			//TODO per object phase stored in vertex (or InstanceID)... _objPos fuck up our batching :(
+
+			// Phases (object, vertex, branch) 
+			float objPhase = dot( _objPos, 1 );
+			float branchPhase = objPhase + _vtxColor.g;
+			float vtxPhase = dot( _vtxPos, _DetailPhase + branchPhase );   
+
+			// x is used for edges; y is used for branches   
+			float2 vWavesIn = _Time + float2( vtxPhase, branchPhase );   
+			
+			float4 vWaves = ( frac( vWavesIn.xxyy * frequencies ) * 2 - 1 ) * _LeafAnimFreq;   
+			vWaves = SmoothTriangleWave( vWaves );   
+			
+			float2 vWavesSum = vWaves.xz + vWaves.yw;
+			vWavesSum.x -= 1.0f;
+
+			// Edge (xz) and branch bending (y)
+			
+			float2 edgeBending = _vtxNormal.xy * (_vtxColor.b * _LeafAnimAmplitude);
+			   
+			_vtxPos += vWavesSum.xyx * float3( edgeBending.x, _vtxColor.r * _BranchAnimAmplitude, edgeBending.y ); 
+
+			//Main bending - Wind variation is done on the CPU.
+			
+			float mainBending = _MainBendingAmplitude;
+			mainBending += sin( _Time * _MainBendingFreq ) * _MainBendingVar; 
+
+			float fBF = _vtxPos.z * mainBending;   
+
+			// Smooth bending factor and increase its nearby height limit.   
+			fBF += 1.0f;
+			fBF *= fBF;   
+			fBF = fBF * fBF - fBF;   
+
+			//Displace and restrict the vertex to spherical movement
+
+			float s = length( _vtxPos );
+			
+			_vtxPos.xy += _WindDir.xy * fBF; //TODO apply in world space
+		 
+			_vtxPos = normalize( _vtxPos ) * s;
+		}
+	}
+}

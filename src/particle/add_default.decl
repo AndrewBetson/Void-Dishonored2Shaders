@@ -1,0 +1,279 @@
+{
+	newstyle
+	options {
+		isParticle	1
+		forcePixelShader 1
+	}
+
+	parms {
+		stageSort sortTrans
+	}
+
+	state {
+		blend SRC_ALPHA ONE
+	}
+
+	hlsl_prefix {
+		#include <particles>
+		#include <particles_instancing>
+		#include <indirectLighting/common>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+
+		#if $(fx/opt/use_mesh)
+			@texcoords.xyzw = vout._texcoords;	// Use the first set of texcoord in the case where the shader is applied on a mesh.
+			@legacy_color = 1.0;				// There are no vertex color for skinned meshes.
+		#else
+			@texcoords.xyzw = GetParticleTextureCoordinates( victx, $vertex_texcoord4 );	// Particle specific texcoord
+			@legacy_color = GetParticleColor( victx, $vertex_color );
+		#endif
+
+		// Soft contact
+		#if ($(fx/opt/use_softcontact) >= SOFT_CONTACT_CUBIC) && (!$isShadow && !$isZPrePass)
+			#if $useDirectInstancing
+				@particleCenterSize = float4( GetTranslation( vout ), GetParticleRadius( victx ) );
+			#else
+				@particleCenterSize = $vertex_texcoord5;
+			#endif
+		#endif
+
+		#if $isAlpha && !$isShadow && !$isZPrePass && !$(tool/unlit) && !$isMasking && !$isMainPassAlpha
+			@particleFogColor = ComputeFogPerVertex( vout._projPosition, vout._worldPosition );
+		#endif
+
+		#if !$isShadow && !$isZPrePass
+			#if !$isMasking && !$(tool/unlit) && !$buildingEnvironmentProbe && $(fx/opt/use_lighting) > 0
+				float3 particleCenter;
+				#if $(fx/opt/use_sprite_lighting) && !$useDirectInstancing
+					particleCenter = $vertex_texcoord5.xyz;
+				#else
+					particleCenter = vout._worldPosition;
+				#endif
+				
+				//Compute TBN
+				float4	wsTangent;
+				float3	wsBitangent, wsNormal;
+				#if $(fx/opt/use_sprite_lighting) && !$useDirectInstancing
+					wsNormal = normalize( $wsCamPos - particleCenter );
+					wsTangent = float4( normalize( cross( float3( 0, 1, 0 ), wsNormal ) ), 1.0 );
+					wsBitangent = cross( wsNormal, wsTangent.xyz );
+				#else
+					wsNormal = vout.m_wsNormal;
+					wsTangent = vout.m_wsTangent;
+					wsBitangent = vout.m_wsBiTangent;
+					#if $twoSidedLighting
+						float3 wsCamForwardDir = -float3( $inverseViewMatrix[0].z, $inverseViewMatrix[1].z, $inverseViewMatrix[2].z );
+						bool isFrontFace = dot( wsCamForwardDir, wsNormal ) > 0.f;
+						wsNormal *= GetFrontFacingFactor( isFrontFace );
+					#endif
+				#endif
+
+				#if $(fx/opt/use_lighting) >= 2
+					//Vertex Lighting
+					//-------------
+					//Compute fake normal for lighting
+					#if $(fx/opt/use_sprite_lighting) && !$useDirectInstancing
+						float3 direction = normalize( $wsCamPos - particleCenter );
+						float3 normal = ( vout._worldPosition - particleCenter );
+					#else
+						float3 direction = normalize( $wsCamPos - vout._worldPosition );
+						float3 normal = wsNormal;
+					#endif
+					float3 dir0 = normalize(normal + direction);
+					normal = normalize(normal);
+
+					//Compute indirect lighting
+					float3 irradiance = 0.0;
+					float3	SH[SH_COEFFS_COUNT];
+					uint	outIblProbeIndex;
+					float	outIblLuminanceFactor;
+					InterpolateSH( vout._worldPosition, dir0, vout._tetrahedron, SH, outIblProbeIndex, outIblLuminanceFactor );
+					irradiance = EvaluateSHIrradiance( dir0, SH );
+					@particleVertexIndirect =  float4( irradiance, 1.0);
+					@wsNormal = wsNormal;
+					@IBLLuminanceFactor = outIblLuminanceFactor;
+					#if defined(PC) && ($useMultiInstancing || $(tool/usePerVertexSH))
+						@vertex_iblbarycentric = float2(1,0);
+						@vertex_iblprobeindex = outIblProbeIndex;
+					#else
+						@instance_IBLProbeIndex = outIblProbeIndex;
+					#endif
+
+					//Compute direct lighting
+					#if $(fx/opt/use_lighting) >= 3
+						float3x3 basisColor = ComputeLighting( vout, direction, normal, wsTangent.xyz, wsBitangent, wsNormal );
+						@particleColorX = basisColor[0];
+						@particleColorY = basisColor[1];
+						@particleColorZ = basisColor[2];
+						@vsNormal = normal;
+						@wsTangent = wsTangent.xyz;
+						@IBLLuminanceFactor *= sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+					#endif
+				#elif $(fx/opt/use_lighting) == 1
+					//Pixel Lighting
+					//-------------
+					#if defined(PC)
+						float3	tempIrradiance0, tempIrradiance1, tempIrradiance2, tempIrradiance3;
+						#if ($useMultiInstancing || $(tool/usePerVertexSH))
+							uint	cubeMapIndex;
+							WriteIndirectLightingVertexOutput( vout, tempIrradiance0, tempIrradiance1, tempIrradiance2, tempIrradiance3, @IBLLuminanceFactor, cubeMapIndex );
+							@vertex_iblprobeindex = vout._vertexBarycentricCoordinates * cubeMapIndex;
+							@vertex_iblbarycentric = vout._vertexBarycentricCoordinates.xy;	// bmayaux (2016-07-22) Only write XY, Z will be reconstructed by the pixel as 1-X-Y
+						#else
+							WriteIndirectLightingVertexOutput( vout, tempIrradiance0, tempIrradiance1, tempIrradiance2, tempIrradiance3, @IBLLuminanceFactor, @instance_IBLProbeIndex );
+						#endif
+						PackIrradianceYCgCo( tempIrradiance0, tempIrradiance1, tempIrradiance2, tempIrradiance3, @vertex_SH_Y, @vertex_SH_CgCo, @vertex_SH_CgCo1 );
+					#else	// Consoles
+						WriteIndirectLightingVertexOutput( vout, @vertex_SH, @vertex_SH1, @vertex_SH2, @vertex_SH3, @IBLLuminanceFactor, @instance_IBLProbeIndex );
+					#endif
+					@IBLLuminanceFactor *= sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+
+					// Outputs
+					@wsNormal = wsNormal;
+					@wsTangent = wsTangent.xyz;
+				#endif
+			#else
+				#if $(fx/opt/fresnel) || $(fx/opt/use_macroUV)
+					@wsNormal = vout.m_wsNormal;
+				#endif
+				#if $(fx/opt/fresnel/useNormalMap)
+					@wsTangent = vout.m_wsTangent.xyz;
+					@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+				#endif
+			#endif
+		#elif $(fx/opt/use_macroUV)
+			@wsNormal = vout.m_wsNormal;
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$(tool/unlit) && !$buildingEnvironmentProbe && $(fx/opt/use_lighting) > 0 );
+
+		float3 uv = $texcoords.xyz;
+		float4 diffuseAlbedo = 1.0;
+
+		float4 disto1result, disto2result;
+		uv = Distortion($texcoords, disto1result, disto2result);
+		uv = ComputeMacroUV(uv, pixelCtx.m_wsPosition, pixelCtx.m_wsNormal);
+
+		#if $(fx/opt/radial_ramp)
+			diffuseAlbedo = RadialRamp($texcoords.xy, uv.xy);
+		#else
+			#if $(fx/opt/no_alpha_lookup_modulate)
+				diffuseAlbedo = TextureColor($texcoords, uv, 1.0);
+			#else
+				diffuseAlbedo = TextureColor($texcoords, uv, $legacy_color.w);
+				#if ( $(fx/opt/opacity_scroll_mask))
+					float2 scroll_mask = PanAndReadDistUV ( $texcoords, $(fx/opacity_scroll_mask), $(opacity_Scroll_Mask_RotationSpeed), $(opacity_Scroll_Mask_PanningSpeed), $(opacity_Scroll_Mask_Tilling) );
+					diffuseAlbedo.a *= scroll_mask.x;
+				#endif
+			#endif
+		#endif
+
+		diffuseAlbedo = AdjustColor( $legacy_color, diffuseAlbedo );
+
+		// Soft particles.
+		#if ($(fx/opt/use_softcontact) != SOFT_CONTACT_NONE) && (!$isShadow && !$isZPrePass)
+			diffuseAlbedo.a *= SoftContact(pixelCtx, $particleCenterSize);
+		#endif
+
+		// View dependent fade out
+		#if $(fx/opt/view_dependent_fade)
+			diffuseAlbedo.a *= ViewDependentFade( pixelCtx.m_ssPosition.w );
+		#endif
+
+		// Normal mapping
+		#if !$(tool/unlit) && $(fx/opt/use_lighting)
+			HQ_FetchAndComputeNormalAndTBN(pixelCtx);
+		#endif
+
+		// Fresnel opacity
+		#if $(fx/opt/fresnel) && (!$isShadow && !$isZPrePass)
+			diffuseAlbedo.a *= FresnelOpacity(pixelCtx);
+		#endif
+
+		#if $(rendering/darkVisionLayer) == 4 && $(rendering/darkVisionPulsar) == 1
+			float distToWaveCenter = length($(rendering/darkVisionWaveCenter) - pixelCtx.m_wsPosition.xyz);
+
+			float innerRadius = $(rendering/darkVisionRevealWaveRadius).x;
+			float outerRadius = $(rendering/darkVisionRevealWaveRadius).y;
+
+			float depthPower = (1.0-smoothstep( innerRadius, outerRadius, distToWaveCenter ));
+			depthPower *= $(rendering/darkVisionRevealWavePower).x;
+			diffuseAlbedo.a *= depthPower;
+		#endif
+
+		float clipPlaneDot = dot( $(fx/ClipPlane).xyz, pixelCtx.m_wsPosition ) + $(fx/ClipPlane).w;
+		clip( sign( clipPlaneDot ) );
+		diffuseAlbedo.a *= smoothstep( 0.0, $(fx/ClipPlaneFadeDistance).x, clipPlaneDot );
+
+		pixelCtx.m_diffuseAlbedo = diffuseAlbedo;
+		pixelCtx.m_texCoords = $texcoords;
+
+		#if $isShadow || $isZPrePass
+			ClipColor( diffuseAlbedo );
+			return;
+		#else
+			#if $isMasking || $(tool/unlit)
+				ClipAlpha(diffuseAlbedo.a);
+				@sv_target = diffuseAlbedo.a * $(rendering/masking/bendTimeFactor).x;
+			#else
+				float3 finalColor = diffuseAlbedo.rgb;
+				float3 colorScattering = 0.0;
+				// Lighting
+				#if !$buildingEnvironmentProbe && $(fx/opt/use_lighting) > 0
+					ClipAlpha(diffuseAlbedo.a);
+					#if $(fx/opt/use_lighting) >= 2
+						//Vertex Lighting
+						//-------------
+						//Compute HL2 basis
+						float3 wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ;
+						ComputeHL2Basis( wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, pixelCtx.m_wsVertexTangent, pixelCtx.m_wsVertexBiTangent, pixelCtx.m_wsVertexNormal );
+						//Add indirect lighting
+						diffuseAlbedo.rgb *= INVPI;
+						finalColor = diffuseAlbedo.rgb * $particleVertexIndirect.rgb;
+						//Compute IBL
+						finalColor += ComputeIBL( pixelCtx );
+						// Add direct lighting
+						#if $(fx/opt/use_lighting) >= 3
+							float3 n = lerp( pixelCtx.m_wsNormal, $vsNormal, 0.5 );
+							finalColor += diffuseAlbedo.rgb * EvaluateLighting( n, wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, $particleColorX, $particleColorY, $particleColorZ ) + 0.0;
+						#endif
+					#else
+						//Pixel Lighting
+						//-------------
+						Lighting( pixelCtx, finalColor, colorScattering );
+					#endif
+				#else
+					finalColor.rgb *= ComputeAutoExposure();
+				#endif
+
+				//Blend with fog
+				//finalColor = ComputeFogWithLightScattering(finalColor, colorScattering, pixelCtx );			//fog per pixel
+				finalColor = lerp(finalColor, ComputeFogFromVertex(finalColor, colorScattering, $particleFogColor, pixelCtx ), $particleFogScatterPower.x);	//fog per vertex
+
+				#if $isAlpha && !$isMainPassAlpha && $(rendering/darkVisionLayer) == 0
+					writePixel( finalColor, diffuseAlbedo.rgb, diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					#if $(rendering/darkVisionLayer) != 0
+						$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+						@sv_target = float4(finalColor / Adaptation.EngineLuminanceFactor, diffuseAlbedo.a);
+					#else
+						@sv_target = float4(finalColor, diffuseAlbedo.a);
+					#endif
+				#endif
+			#endif
+		#endif
+	}
+}

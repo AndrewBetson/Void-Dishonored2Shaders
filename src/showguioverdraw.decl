@@ -1,0 +1,25 @@
+{
+	newstyle
+
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		cull none
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthfunc ALWAYS
+		depthWrite 0
+		depthEnable	0
+		alphaWrite 0
+	}
+
+	hlsl_vp_main {
+		@sv_position.x = dot( float4($vertex_position.xyz,1), $mvpMatrixX );
+		@sv_position.y = dot( float4($vertex_position.xyz,1), $mvpMatrixY );
+		@sv_position.z = dot( float4($vertex_position.xyz,1), $mvpMatrixZ );
+		@sv_position.w = dot( float4($vertex_position.xyz,1), $mvpMatrixW );
+	}
+	hlsl_fp_main {
+		@sv_target = float4( 1.0, 0.0, 0.0, 0.2 );
+	}
+}

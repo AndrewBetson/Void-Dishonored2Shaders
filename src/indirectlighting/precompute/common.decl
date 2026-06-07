@@ -1,0 +1,214 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <sphericalHarmonics>
+
+
+	#ifndef __PSSL__
+		#pragma warning( disable: 3557 3551 )
+		static const uint	SH_COEFFS_ENVIRONMENT_COUNT = 256;	// Must match the value declared in arkEnvProbe.h!
+
+		static const float	BACK_FACES_PENALTY = 0.5;			// Back faces must have less weight
+
+		static const float	FACTORIAL[] = {	1.0,
+											1.0,
+											2.0,
+											6.0,
+											24.0,
+											120.0,
+											720.0,
+											5040.0,
+											40320.0,
+											362880.0,
+											3628800.0,
+											39916800.0,
+											479001600.0,
+											6227020800.0,
+											87178291200.0,
+											1307674368000.0,
+											20922789888000.0,
+											355687428096000.0,
+											6402373705728000.0,
+											1.21645100408832e+17,
+											2.43290200817664e+18,
+											5.109094217170944e+19,
+											1.12400072777760768e+21,
+											2.58520167388849766e+22,
+											6.20448401733239439e+23,
+											1.55112100433309860e+25,
+											4.03291461126605636e+26,
+											1.08888694504183522e+28,
+											3.04888344611713861e+29,
+											8.84176199373970195e+30,
+											2.65252859812191059e+32,
+											8.22283865417792282e+33,
+											2.63130836933693530e+35
+										};
+
+		float	Factorial( int _Value ) {
+			return	FACTORIAL[_Value];
+		}
+
+		// Renormalisation constant for SH functions
+		//           .------------------------
+		// K(l,m) =  |   (2*l+1)*(l-|m|)!
+		//           | --------------------
+		//          \|    4*PI * (l+|m|)!
+		//
+		float	K( int l, int m )
+		{
+			return	sqrt( ((2.0 * l + 1.0 ) * Factorial( l - abs(m) )) / (4.0 * PI * Factorial( l + abs(m) )) );
+		}
+
+		// Calculates an Associated Legendre Polynomial P(l,m,x) using stable recurrence relations
+		// From Numerical Recipes in C
+		//
+		float	P( int l, int m, float x )
+		{
+			float	pmm = 1.0;
+			if ( m > 0 )
+			{	// pmm = (-1) ^ m * Factorial( 2 * m - 1 ) * ( (1 - x) * (1 + x) ) ^ (m/2);
+				float	somx2 = sqrt( (1.0-x) * (1.0+x) );
+				float	fact = 1.0;
+				[loop]
+				[fastopt]
+				for ( int i=1; i <= m; i++ )
+				{
+					pmm *= -fact * somx2;
+					fact += 2;
+				}
+			}
+			if ( l == m )
+				return	pmm;
+
+			float	pmmp1 = x * (2.0 * m + 1.0) * pmm;
+			if ( l == m+1 )
+				return	pmmp1;
+
+			float	pll = 0.0;
+			[loop]
+			[fastopt]
+			for ( int ll=m+2; ll <= l; ++ll )
+			{
+				pll = ( (2.0*ll-1.0) * x * pmmp1 - (ll+m-1.0) * pmm ) / (ll-m);
+				pmm = pmmp1;
+				pmmp1 = pll;
+			}
+
+			return	pll;
+		}
+
+		// Returns a spot sample of a Spherical Harmonic basis function
+		//		l is the band, range [0..N]
+		//		m in the range [-l..l]
+		//		theta in the range [0..PI]
+		//		phi in the range [0..2*PI]
+		//
+		float	GetSHCoeff( int l, int m, float _Phi, float _CosTheta )
+		{
+			if ( m == 0 )
+				return K( l, m ) * P( l, m, _CosTheta );
+			else if ( m > 0 )
+				return sqrt( 2.0f ) * cos( m * _Phi ) * K( l, m ) *  P( l, m, _CosTheta );
+			else
+				return sqrt( 2.0f ) * sin( -m * _Phi ) * K( l, -m ) * P( l, -m, _CosTheta );
+		}
+
+		// Evaluates the probe's SH in the specified direction to retrieve the encoded scene distance
+		float	EstimateEnvironmentDistance( $(indirectLighting/precompute/probeInfos_t) _probe, float3 _direction )
+		{
+			float	Phi = atan2( _direction.x, _direction.y );
+			float	CosTheta = _direction.z;
+
+			float	distance = 0.0;
+			[loop]
+			[fastopt]
+			for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+//for ( uint i=0; i < 100; i++ ) {
+				int	l = int( floor( sqrt( i ) ) );
+				int	m = int(i) - l*(l+1);
+				distance += GetSHCoeff( l, m, Phi, CosTheta ) * _probe.SH[i];
+			}
+
+			return clamp( distance, _probe.minDistance, _probe.maxDistance );
+		}
+
+		// Computes the visibility weight of a point in a given direction at a given distance from the probe
+		// The scene's distance is estimated using the SH-encoded depth buffer and the point is given an exponential
+		//	weight as it gets further away from the scene's limit distance.
+		// Inversely, it gets a better weight as it gets closer to the probe.
+		float	ComputePointVisibilityWeight( $(indirectLighting/precompute/probeInfos_t) _probe, float3 _direction, float _distance2Probe )
+		{
+			// Sample scene distance as seen from the probe
+			float		sceneDistance = EstimateEnvironmentDistance( _probe, _direction );
+
+			// Compute inverse visibility weight (smallest is best!)
+			const float	MULTIPLIER_AT_PROBE = 10.0;												// The weight multiplier when the position is twice further than the scene distance
+			const float	K = 2.3025850929940456840179914546844;									// = -ln( 1.0 / MULTIPLIER_AT_PROBE );
+			float		visibilityWeight = exp( K * (_distance2Probe / sceneDistance - 1.0) );	// Will yield 1/MULTIPLIER_AT_PROBE if position is right on the probe (can't happen since we clamped to probe.minDistance)
+																								// Will reach 1 if position is exactly at the estimated scene distance
+																								// Will reach MULTIPLIER_AT_PROBE if position is exactly 2x the estimated scene distance
+																								// Then increase exponentially if position is further than the scene distance
+
+			return visibilityWeight > 1e-3 ? 1.0 / visibilityWeight : MULTIPLIER_AT_PROBE;
+		}
+
+		float3	TransformPosition( float3 _localPosition )
+		{
+			float4	localPosition = float4( _localPosition, 1 );
+			return float3(	dot( localPosition, $(indirectLighting/precompute/instance2WorldX_position) ),
+							dot( localPosition, $(indirectLighting/precompute/instance2WorldY_position) ),
+							dot( localPosition, $(indirectLighting/precompute/instance2WorldZ_position) )
+						);
+		}
+
+		float3	TransformNormal( float3 _localNormal )
+		{
+			return float3(	dot( _localNormal, $(indirectLighting/precompute/instance2WorldX_normal).xyz ),
+							dot( _localNormal, $(indirectLighting/precompute/instance2WorldY_normal).xyz ),
+							dot( _localNormal, $(indirectLighting/precompute/instance2WorldZ_normal).xyz )
+						);
+		}
+
+		// ================ CUBE MAP FACE TRANSFORMS ================
+		static const float3x3	FACE2WORLD[6] = {
+			float3x3(   1,  0,  0,
+						0,  0,  1,
+						0,  1,  0 ),
+
+			float3x3(	-1,  0,  0,
+						 0,  0, -1,
+						 0,  1,  0 ),
+
+			float3x3(	 0,  1,  0,
+						-1,  0,  0,
+						 0,  0, -1 ),
+
+			float3x3(	 0, -1,  0,
+						-1,  0,  0,
+						 0,  0,  1 ),
+
+			float3x3(	 0,  0,  1,
+						-1,  0,  0,
+						 0,  1,  0 ),
+
+			float3x3(	 0,  0, -1,
+						 1,  0,  0,
+						 0,  1,  0 )
+			};
+
+		// This awful mess is a copy of the idRenderMatrix::CreateViewMatrix() function
+		float3x3	GetCubeFaceTransform( uint _CubeFaceIndex )
+		{
+			float3x3	Source = FACE2WORLD[_CubeFaceIndex];
+			float3x3	World2Face = float3x3(
+				float3( -Source[1][0], -Source[1][1], -Source[1][2] ),
+				float3(  Source[2][0],  Source[2][1],  Source[2][2] ),
+				float3( -Source[0][0], -Source[0][1], -Source[0][2] )
+				);
+			return World2Face;
+		}
+
+	#endif	//#ifndef __PSSL__
+	}
+}

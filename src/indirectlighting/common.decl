@@ -1,0 +1,411 @@
+{
+	newstyle
+	hlsl_prefix {
+#ifndef INDIRECT_LIGHTING_INCLUDED
+#define INDIRECT_LIGHTING_INCLUDED
+
+		#include <sphericalHarmonics>
+		#include <colorimetry>
+
+		// bmayaux (2016-08-25) In order to use less interpolants from VS to PS on PC, we're now packing 4 float3 irradiance values into a single luminance and 8 (Co,Cg) couples stored into 2 float4 interpolants
+		// We could use this on consoles as well by packing (Cg,Co) as uint8 that would fit into a single uint2 interpolant + luminance
+		void	PackIrradianceYCgCo( float3 _irradiance0, float3 _irradiance1, float3 _irradiance2, float3 _irradiance3, out float _luminance, out float4 _CgCo0, out float4 _CgCo1 ) {
+			float3	YCoCg0 = RGB2YCoCg( _irradiance0 );
+			float3	YCoCg1 = RGB2YCoCg( _irradiance1 );
+			float3	YCoCg2 = RGB2YCoCg( _irradiance2 );
+			float3	YCoCg3 = RGB2YCoCg( _irradiance3 );
+
+			// Rescale (Co, Cg) by the Y/(Ymax*Ymax) ratio
+			// The Ymax² denominator is there to guarantee (Co,Cg) couples will always be in the [1,+1] interval (so they can easily be packed in a single byte if needed later)
+			// Of course, (Co,Cg) couples need to be multiplied by Ymax first on the unpacking side...
+			_luminance = max( max( max( YCoCg0.x, YCoCg1.x ), YCoCg2.x ), YCoCg3.x );
+			float	factor = 1.0 / max( 1e-4, _luminance*_luminance );
+			_CgCo0.xy = YCoCg0.yz * (factor * YCoCg0.x);
+			_CgCo0.zw = YCoCg1.yz * (factor * YCoCg1.x);
+			_CgCo1.xy = YCoCg2.yz * (factor * YCoCg2.x);
+			_CgCo1.zw = YCoCg3.yz * (factor * YCoCg3.x);
+		}
+
+		void	UnpackIrradianceYCgCo( float _luminance, float4 _CgCo0, float4 _CgCo1, out float3 _irradiance0, out float3 _irradiance1, out float3 _irradiance2, out float3 _irradiance3 ) {
+			// Expand (Co,Cg) from [-1,+1] range back to original [-Y,+Y] range (as explained in packing above)
+			_CgCo0 *= _luminance;
+			_CgCo1 *= _luminance;
+
+			// Proper unpacking
+			_irradiance0 = YCoCg2RGB( _luminance, _CgCo0.xy );
+			_irradiance1 = YCoCg2RGB( _luminance, _CgCo0.zw );
+			_irradiance2 = YCoCg2RGB( _luminance, _CgCo1.xy );
+			_irradiance3 = YCoCg2RGB( _luminance, _CgCo1.zw );
+		}
+
+		#if defined(PC)
+// 			// bmayaux (2016-09-28) Packing/Unpacking of SH3 structure into RGBE structure
+// 			static const int	SH_RGBE_EXPONENT_BIAS = 22;	// This bias allows to encode from 2^-22 to 2^9 which is largely enough to cover our needs
+// 															// I measured a maximum of 0.7% relative error on SH coefficients from the "Edge of the World" map where the largest luminance was ~60
+// 
+// 			uint	PackSH2RGBE( in float3 _SH ) {
+// 				// We need to extract 3 sign bits, one for each component
+// 				float3	signs = step( 0.0, _SH ) * 2.0 - 1.0;
+// 				_SH = abs( _SH );
+// 
+// 				float	maxRGB = max( max( _SH.x, _SH.y ), _SH.z );
+// 				float	sharedExponent = ceil( log2( maxRGB ) );
+// 						sharedExponent = clamp( sharedExponent + SH_RGBE_EXPONENT_BIAS, 0, 31 ) - SH_RGBE_EXPONENT_BIAS;
+// 
+// 				float	recPower = exp2( -sharedExponent );	// To avoid a division below, we negate the exponent sign here
+// 				float3	reducedRGB = saturate( _SH * recPower );
+// 
+// 				// Pack into a uint
+// 				uint3	RGB = uint3( 255.0 * reducedRGB );
+// 				uint	exponent = uint(SH_RGBE_EXPONENT_BIAS + sharedExponent)	// 5 bits exponent from -22 to +9
+// 								 | (signs.x < 0.0 ? 128U : 0U)					// + 3 sign bits, one for each component
+// 								 | (signs.y < 0.0 ?  64U : 0U)
+// 								 | (signs.z < 0.0 ?  32U : 0U);
+// 
+// 				return (exponent << 24U) | (RGB.x << 16U) | (RGB.y << 8U) | RGB.z;
+// 			}
+// 			float3	UnpackRGBE2SH( in uint _RGBE ) {
+// 				uint	exponent = _RGBE >> 24U;
+// 				float3	RGB = float3( (_RGBE >> 16U) & 0xFFU, (_RGBE >>  8U) & 0xFFU, _RGBE & 0xFFU ) / 255.0;
+// 
+// 				float3	signs = float3( (exponent & 128U) != 0 ? -1.0 : 1.0, (exponent & 64U) != 0 ? -1.0 : 1.0, (exponent & 32U) != 0 ? -1.0 : 1.0 );
+// 				float	power = exp2( int(exponent & 31U) - SH_RGBE_EXPONENT_BIAS );
+// 				return signs * power * RGB;
+// 			}
+// 
+// 			void	PackSH2RGBE( in $(indirectLighting/SH3) _SH, out $(indirectLighting/SH3_RGBE) _RGBE ) {
+// 				_RGBE.SH0 = _SH.SH[0];	// Ambient term is unpacked
+// 				[unroll]
+// 				for ( uint i=0; i < 8; i++ ) {
+// 					_RGBE.SH_RGBE[i] = PackSH2RGBE( _SH.SH[1U+i] );
+// 				}
+// 				_RGBE.__PADDING = 0;	// Don't care but the compiler whines about that :(
+// 			}
+// 
+// 			void	UnpackRGBE2SH( in $(indirectLighting/SH3_RGBE) _RGBE, out $(indirectLighting/SH3) _SH ) {
+// 				_SH.SH[0] = _RGBE.SH0;	// Ambient term is unpacked
+// 				_SH.__PADDING = 0.0;	// Don't care but the compiler whines about that :(
+// 				[unroll]
+// 				for ( uint i=0; i < 8; i++ ) {
+// 					_SH.SH[1U+i] = UnpackRGBE2SH( _RGBE.SH_RGBE[i] );
+// 				}
+// 			}
+// 
+// 			$(indirectLighting/SH3)	LoadProbeSH( uint _probeID ) {
+// 				$(indirectLighting/SH3_RGBE)	Probe_RGBE = $(indirectLighting/bufferProbesSH_RGBE)[_probeID];
+// 				$(indirectLighting/SH3)			Probe;
+// 				UnpackRGBE2SH( Probe_RGBE, Probe );
+// 				return Probe;
+// 			}
+
+			$(indirectLighting/SH3)	LoadProbeSH( uint _probeID ) {
+				return $(indirectLighting/bufferProbesSH_RGBE)[_probeID];
+			}
+
+		#else
+			$(indirectLighting/SH3)	LoadProbeSH( uint _probeID ) {
+				$(indirectLighting/SH3_Order2)	Probe_Order2 = $(indirectLighting/bufferProbesSH_Order2)[_probeID];
+				$(indirectLighting/SH3)			Probe;
+				Probe.SH[0] = Probe_Order2.SH[0];
+				Probe.SH[1] = Probe_Order2.SH[1];
+				Probe.SH[2] = Probe_Order2.SH[2];
+				Probe.SH[3] = Probe_Order2.SH[3];
+				// The compiler should whine about non-initialized coefficients (4 through 8) ONLY IF we attempt to use them...
+				return Probe;
+			}
+
+		#endif
+
+
+		// Reads the information about the 4 probes browsed by the tetrahedron
+		$(indirectLighting/tetrahedronInfo_t)	ReadTetrahedronInfo( uint _tetrahedronIndex ) {
+
+			// Retrieve the tetrahedron vertices
+			$(indirectLighting/tetrahedron_t)		tetrahderon = $(indirectLighting/bufferTetrahedrons)[_tetrahedronIndex];
+			$(indirectLighting/tetrahedronVertex_t)	vertices[4];
+			vertices[0] = $(indirectLighting/bufferTetrahedronVertices)[tetrahderon.vertexIndices.x];
+			vertices[1] = $(indirectLighting/bufferTetrahedronVertices)[tetrahderon.vertexIndices.y];
+			vertices[2] = $(indirectLighting/bufferTetrahedronVertices)[tetrahderon.vertexIndices.z];
+			vertices[3] = $(indirectLighting/bufferTetrahedronVertices)[tetrahderon.vertexIndices.w];
+
+			// Fill up the result structure
+			$(indirectLighting/tetrahedronInfo_t)	Result;
+
+			Result.wsPositions[0] = vertices[0].wsPosition;
+			Result.wsPositions[1] = vertices[1].wsPosition;
+			Result.wsPositions[2] = vertices[2].wsPosition;
+			Result.wsPositions[3] = vertices[3].wsPosition;
+
+			Result.probeIndices.x = tetrahderon.probeIndices.x & 0xFFFF;
+			Result.probeIndices.y = tetrahderon.probeIndices.x >> 16;
+			Result.probeIndices.z = tetrahderon.probeIndices.y & 0xFFFF;
+			Result.probeIndices.w = tetrahderon.probeIndices.y >> 16;
+
+			Result.probeWeights[0]  = (1.0 / 255.0) * float4(	((vertices[0].probeWeights      ) & 0xFF),
+																((vertices[0].probeWeights >>  8) & 0xFF),
+																((vertices[0].probeWeights >> 16) & 0xFF),
+																((vertices[0].probeWeights >> 24) & 0xFF) );
+			Result.probeWeights[1]  = (1.0 / 255.0) * float4(	((vertices[1].probeWeights      ) & 0xFF),
+																((vertices[1].probeWeights >>  8) & 0xFF),
+																((vertices[1].probeWeights >> 16) & 0xFF),
+																((vertices[1].probeWeights >> 24) & 0xFF) );
+			Result.probeWeights[2]  = (1.0 / 255.0) * float4(	((vertices[2].probeWeights      ) & 0xFF),
+																((vertices[2].probeWeights >>  8) & 0xFF),
+																((vertices[2].probeWeights >> 16) & 0xFF),
+																((vertices[2].probeWeights >> 24) & 0xFF) );
+			Result.probeWeights[3]  = (1.0 / 255.0) * float4(	((vertices[3].probeWeights      ) & 0xFF),
+																((vertices[3].probeWeights >>  8) & 0xFF),
+																((vertices[3].probeWeights >> 16) & 0xFF),
+																((vertices[3].probeWeights >> 24) & 0xFF) );
+
+			return Result;
+		}
+
+		// Interpolates the SH coefficients/IBL probe index for a position within a tetrahedron made of 4 probes
+		void	InterpolateSH( float4 _barycentrics, $(indirectLighting/tetrahedronInfo_t) _tetrahedronInfos, out float3 _SH[SH_COEFFS_COUNT], out uint _IBLProbeIndex, out float _IBLLuminanceFactor ) {
+			// Barycentrics actually interpolate weights here
+			float4		Weights = _barycentrics.x * _tetrahedronInfos.probeWeights[0]
+								+ _barycentrics.y * _tetrahedronInfos.probeWeights[1]
+								+ _barycentrics.z * _tetrahedronInfos.probeWeights[2]
+								+ _barycentrics.w * _tetrahedronInfos.probeWeights[3];
+
+			// Read each probe's IBL probe index & luminance factor
+			$(indirectLighting/probeInfo_t)	probeInfo[4];
+			probeInfo[0] = $(indirectLighting/bufferProbeInfo)[_tetrahedronInfos.probeIndices.x];
+			probeInfo[1] = $(indirectLighting/bufferProbeInfo)[_tetrahedronInfos.probeIndices.y];
+			probeInfo[2] = $(indirectLighting/bufferProbeInfo)[_tetrahedronInfos.probeIndices.z];
+			probeInfo[3] = $(indirectLighting/bufferProbeInfo)[_tetrahedronInfos.probeIndices.w];
+
+			// Determine the IBL to use depending on the strongest weight
+			float2	BestWeight =							float2( Weights.x, probeInfo[0].IBLProbeIndex );
+					BestWeight = Weights.y > BestWeight.x ? float2( Weights.y, probeInfo[1].IBLProbeIndex ) : BestWeight;
+					BestWeight = Weights.z > BestWeight.x ? float2( Weights.z, probeInfo[2].IBLProbeIndex ) : BestWeight;
+					BestWeight = Weights.w > BestWeight.x ? float2( Weights.w, probeInfo[3].IBLProbeIndex ) : BestWeight;
+			_IBLProbeIndex = uint( BestWeight.y );
+
+			// Compute weighted IBL luminance factor
+			float4		IBLLuminanceFactors;
+			IBLLuminanceFactors.x = probeInfo[0].IBLLuminanceFactor;
+			IBLLuminanceFactors.y = probeInfo[1].IBLLuminanceFactor;
+			IBLLuminanceFactors.z = probeInfo[2].IBLLuminanceFactor;
+			IBLLuminanceFactors.w = probeInfo[3].IBLLuminanceFactor;
+
+			_IBLLuminanceFactor = max( 0.0001, dot( Weights, IBLLuminanceFactors ) );
+
+			// Only then can we do a weighted sum of the coefficients
+			$(indirectLighting/SH3)	Coeffs[4];
+			Coeffs[0] = LoadProbeSH( _tetrahedronInfos.probeIndices.x );
+			Coeffs[1] = LoadProbeSH( _tetrahedronInfos.probeIndices.y );
+			Coeffs[2] = LoadProbeSH( _tetrahedronInfos.probeIndices.z );
+			Coeffs[3] = LoadProbeSH( _tetrahedronInfos.probeIndices.w );
+
+			#if defined(PC)	// 9 coefficients on PC
+				[unroll]
+				for ( uint i=0; i < 9; i++ ) {
+					_SH[i] = Weights.x * Coeffs[0].SH[i] + Weights.y * Coeffs[1].SH[i] + Weights.z * Coeffs[2].SH[i] + Weights.w * Coeffs[3].SH[i];
+				}
+			#else			// Only 4 on consoles
+				[unroll]
+				for ( uint i=0; i < 4; i++ ) {
+					_SH[i] = Weights.x * Coeffs[0].SH[i] + Weights.y * Coeffs[1].SH[i] + Weights.z * Coeffs[2].SH[i] + Weights.w * Coeffs[3].SH[i];
+				}
+			#endif
+		}
+
+		float	DotCross( float3 _V0, float3 _V1, float3 _V2 ) {
+			return dot( _V0, cross( _V1, _V2 ) );
+		}
+		float4	ComputeTetrahedronBarycentrics( float3 _wsPosition, float3 _P[4] ) {
+			float3	D = _wsPosition - _P[3];
+			float3	V3_0 = _P[0] - _P[3];
+			float3	V3_1 = _P[1] - _P[3];
+			float3	V3_2 = _P[2] - _P[3];
+			float	det = DotCross( V3_0, V3_1, V3_2 );
+			float	rcpDeterminant = abs( det ) > 0.0 ? 1.0 / det : 0.0;
+
+			float	barycentric0 = rcpDeterminant * DotCross( D, V3_1, V3_2 );
+			float	barycentric1 = rcpDeterminant * DotCross( D, V3_2, V3_0 );
+			float	barycentric2 = rcpDeterminant * DotCross( D, V3_0, V3_1 );
+			float	barycentric3 = 1.0 - barycentric0 - barycentric1 - barycentric2;
+
+			return float4( barycentric0, barycentric1, barycentric2, barycentric3 );
+		}
+		void	InterpolateSH( float3 _wsPosition, float3 _wsNormal, $(indirectLighting/tetrahedronInfo_t) _tetrahedronInfos, out float3 _SH[SH_COEFFS_COUNT], out uint _IBLProbeIndex, out float _IBLLuminanceFactor ) {
+			// Determine the barycentric coordinates based on the position
+			float4	barycentrics = ComputeTetrahedronBarycentrics( _wsPosition, _tetrahedronInfos.wsPositions );
+//					barycentrics = saturate( barycentrics );
+
+			//@TODO: Scale barycentrics with normal??
+
+			InterpolateSH( barycentrics, _tetrahedronInfos, _SH, _IBLProbeIndex, _IBLLuminanceFactor );
+		}
+
+
+		///////////////////////////////////////////////////////////////////////////////////////////////
+		// Packing/Unpacking of SH coefficients into 4 irradiances values evaluated along 4 principal directions
+		// We only pass 4 values to the pixel to avoid using 9 float3 interpolants (or 7 float4 interpolants)
+		//
+
+		// Evaluates the irradiance along 4 principal directions, in the manner of Bunnel (slide 25 in http://cgg.mff.cuni.cz/~jaroslav/gicourse2010/giai2010-05-michael_bunnell-slides.pdf)
+		// My contribution to the original idea of packing indirect lighting along 3 principal directions is:
+		//	> use a 4th, most important direction along the normal (ideally, we should use the bent normal)
+		//	> use AO as a measure of cone aperture to blend the estimate direction toward the normal
+		//		=> We can see AO as a reduction of FOV and when the FOV narrows down to 0, irradiance can only come from the normal direction anyway
+		//	> Also artificially increase the weight of irradiance along the normal direction when AO tends toward 0
+		//
+		void	PackSHPrincipalDirections( float3 _SH[9], float3 _Tangent, float3 _BiTangent, float3 _Normal, out float3 _Irradiance0, out float3 _Irradiance1, out float3 _Irradiance2, out float3 _Irradiance3 ) {
+
+			// Reflection vectors in tangent space are constant
+			// (45° from normal and 180°, -60°, and 60° around normal vector)
+			const float3	r0 = float3( 0.7071, 0, 0.7071 );
+			const float3	r1 = float3( -0.35355, -0.61237, 0.7071 );
+			const float3	r2 = float3( -0.35355, 0.61237, 0.7071 );
+
+			float3	Dir0 = r0.x * _Tangent /*+ r0.y * _BiTangent*/ + r0.z * _Normal;
+			float3	Dir1 = r1.x * _Tangent + r1.y * _BiTangent + r1.z * _Normal;
+			float3	Dir2 = r2.x * _Tangent + r2.y * _BiTangent + r2.z * _Normal;
+			#if $twoSidedLighting
+				float3	Dir3 = -_Normal;	// Opposite normal
+			#else
+				float3	Dir3 = _Normal;		// Plain normal
+			#endif
+
+			_Irradiance0 = EvaluateSHIrradiance( Dir0, _SH );
+			_Irradiance1 = EvaluateSHIrradiance( Dir1, _SH );
+			_Irradiance2 = EvaluateSHIrradiance( Dir2, _SH );
+			_Irradiance3 = EvaluateSHIrradiance( Dir3, _SH );
+		}
+
+		#if !$twoSidedLighting
+
+			// Uses 3 principal directions to encode the irradiance, the 4th direction is the radiance coming in normal direction
+			float3	UnPackSHPrincipalDirections( float3 _Direction, float3 _Tangent, float3 _BiTangent, float3 _Normal, float3 _Irradiance[4], float _AO ) {
+
+// bmayaux (2015-05-01) This line seems to yield problems with double-sided surfaces because the pixel and geometric normals are in opposite directions (I think)
+// • I first swapped the geometric normal's direction in the pixel.inc so we always read it correctly
+// • Then I restored the lerp but used a "safe normalization" to avoid divide by 0
+//				_Direction = normalize( Slerp( _Normal, _Direction, _AO ) );	// Blend more and more toward normal when AO decreases
+
+				_Direction = lerp( _Normal, _Direction, _AO );	// Blend more and more toward normal when AO decreases
+				float	dirLength = length(_Direction);
+				_Direction *= dirLength > 1e-6 ? 1.0 / dirLength : 1.0;
+
+
+// bmayaux (2016-06-24) We're finally getting rid of these debug variables
+// 				#if defined(PC) && !defined( RETAIL )
+// 				// bmayaux (2015-12-03) Simplified, we're not using the 4th component anymore
+// //				#if 1
+// 				if ( $DEBUG_ILFactor.x >= 0.5 ) {
+// 
+// 					// Reflection vectors in tangent space are constant
+// 					// (45° from normal and 180°, -60°, and 60° around normal vector)
+// 					const float3	r0 = float3( 0.7071, 0, 0.7071 );
+// 					const float3	r1 = float3( -0.35355, -0.61237, 0.7071 );
+// 					const float3	r2 = float3( -0.35355, 0.61237, 0.7071 );
+// 
+// 					float3	tsDirection = float3( dot( _Direction, _Tangent ), dot( _Direction, _BiTangent ), dot( _Direction, _Normal ) );
+// 
+// //					float4	D = saturate( float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z ) );	// Saturate is wrong!
+// 					float4	D = (2.0*$DEBUG_ILFactor.x-1.0) * float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z );	// Use debug value as a coefficient so we can adjust the gain
+// 
+// 							D.w *= 1e-6;	// To avoid _Irradiance[3] being stripped by the compiler so we don't have interpolator mismatches
+// 
+// 					float3	Irradiance = D.x * _Irradiance[0] + D.y * _Irradiance[1] + D.z * _Irradiance[2] + D.w * _Irradiance[3];
+// 					return _AO * Irradiance;
+// 
+// 				} else {
+// 
+// 					// Reflection vectors in tangent space are constant
+// 					// (45° from normal and 180°, -60°, and 60° around normal vector)
+// 					const float3	r0 = float3( 0.7071, 0, 0.7071 );
+// 					const float3	r1 = float3( -0.35355, -0.61237, 0.7071 );
+// 					const float3	r2 = float3( -0.35355, 0.61237, 0.7071 );
+// 
+// 					float3	tsDirection = float3( dot( _Direction, _Tangent ), dot( _Direction, _BiTangent ), dot( _Direction, _Normal ) );
+// 
+// //					float4	D = float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z );
+// 					float4	D = $DEBUG_ILFactor.x < 0.25	? float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z )
+// 															: saturate( float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z ) );
+// 
+//  							D.w *= lerp( 4.0, 1.0, _AO );	// Artificially increase weight of normal direction based on AO
+// 
+// 					// Normalize weights
+// 					float	SumWeights = D.x + D.y + D.z + D.w;
+// 					D *= 1.0 / max( 1.0, SumWeights );
+// 
+// 					float3	Irradiance = D.x * _Irradiance[0] + D.y * _Irradiance[1] + D.z * _Irradiance[2] + D.w * _Irradiance[3];
+// 					return _AO * Irradiance;
+// 
+// 				} //#endif
+// 
+// 				#else // #if defined(PC) && !defined( RETAIL )
+
+					// Reflection vectors in tangent space are constant
+					// (45° from normal and 180°, -60°, and 60° around normal vector)
+					const float3	r0 = float3( 0.7071, 0, 0.7071 );
+					const float3	r1 = float3( -0.35355, -0.61237, 0.7071 );
+					const float3	r2 = float3( -0.35355, 0.61237, 0.7071 );
+
+					float3	tsDirection = float3( dot( _Direction, _Tangent ), dot( _Direction, _BiTangent ), dot( _Direction, _Normal ) );
+
+					float4	D = float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ), tsDirection.z );	// Use debug value as a coefficient so we can adjust the gain
+
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+							D *= 0.5;
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+							// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+
+							D.w *= 1e-6;	// To avoid _Irradiance[3] being stripped by the compiler so we don't have interpolator mismatches
+
+					float3	Irradiance = D.x * _Irradiance[0] + D.y * _Irradiance[1] + D.z * _Irradiance[2] + D.w * _Irradiance[3];
+					return _AO * Irradiance;
+
+// 				#endif // #if defined(PC) && !defined( RETAIL )
+			}
+
+		#else	// #if $twoSidedLighting
+
+			// Same as above except it uses the 4th irradiance component to encode irradiance coming from the direction opposite to the surface's normal direction
+			float3	UnPackSHPrincipalDirections( float3 _Direction, float3 _Tangent, float3 _BiTangent, float3 _Normal, float3 _Irradiance[4], float _AO ) {
+
+				// Reflection vectors in tangent space are constant
+				// (45° from normal and 180°, -60°, and 60° around normal vector)
+				const float3	r0 = float3( 0.7071, 0, 0.7071 );
+				const float3	r1 = float3( -0.35355, -0.61237, 0.7071 );
+				const float3	r2 = float3( -0.35355, 0.61237, 0.7071 );
+
+				float3	tsDirection = float3( dot( _Direction, _Tangent ), dot( _Direction, _BiTangent ), dot( _Direction, _Normal ) );
+
+				float4	D = saturate(	float4( dot( tsDirection, r0 ), dot( tsDirection, r1 ), dot( tsDirection, r2 ),
+												-tsDirection.z )	// 4th component along -Normal to account for backlighting
+												);
+
+// bmayaux (2016-06-24) We're finally getting rid of these debug variables
+// 				#if defined(PC) && !defined( RETAIL )
+// 					D *= $DEBUG_ILFactor.x >= 0.5 ? saturate( 2.0*$DEBUG_ILFactor.x-1.0 ) : 0.5;
+// 				#else
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+					D *= 0.5;
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+					// (2015-12-06) HARDCODED TO MATCH CURRENT LIGHTING SETTINGS
+// 				#endif
+
+// 				// Normalize weights
+// 				float	SumWeights = D.x + D.y + D.z + D.w;
+// 				D *= 1.0 / max( 1.0, SumWeights );
+
+				float3	Irradiance = D.x * _Irradiance[0] + D.y * _Irradiance[1] + D.z * _Irradiance[2] + D.w * _Irradiance[3];
+				return _AO * Irradiance;
+			}
+
+		#endif
+
+#endif	// #ifndef INDIRECT_LIGHTING_INCLUDED
+	}
+}

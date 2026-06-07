@@ -1,0 +1,137 @@
+{
+	newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+	
+	hlsl_prefix {
+
+		#include <vertex>
+		#include <colorimetry>
+		#include <PostFX/Luminance/common>
+		#if defined( PC ) || defined( DURANGO )
+			#pragma warning( disable : 3577 ) //WARNING X3577 : "value cannot be NaN"
+		#endif
+
+		// Applies filtering of the color then the following formula: Color' = _Mult * pow( _Brightness + AutoExpose( FilterRGBA( Color ) ), _Power )
+		float4	TransformColor( float2 _SV_Position, float4 _Color ) {
+			if ( ($testImageIntParms0.y & 4) ) {
+				bool checkNaN = any(isnan(_Color));
+				bool checkInfinite = any(isinf(_Color));
+				bool checkHighValue = any(abs(_Color) > 1e10);
+				bool checkInvalide = any(_Color*0.0 != 0.0);
+				if ( checkNaN || checkInfinite || checkHighValue || checkInvalide ) {
+					uint2	XY = uint2( floor( 0.25 * _SV_Position.xy + $time.xx ) );
+					bool	Color = ((XY.x & 1) ^ (XY.y & 1));
+					return Color ? float4( 1000, 0, 1000, 1 ) : float4( 1000, 1000, 1000, 1 );	// NaN or infinite!
+				}
+			}
+
+			// Apply filtering
+			uint	Channels = $testImageIntParms0.x;
+			if ( Channels == 0x1 )		_Color = _Color.x;	// Only display red...
+			else if ( Channels == 0x2 )	_Color = _Color.y;	// Only display green...
+			else if ( Channels == 0x4 )	_Color = _Color.z;	// Only display blue...
+			else if ( Channels == 0x8 )	_Color = _Color.w;	// Only display alpha...
+			else {	// Combination of bits
+				float4	ChannelMask = (float4) uint4( (Channels & 1), (Channels & 2) >> 1, (Channels & 4) >> 2, (Channels & 8) >> 3 );
+				_Color *= ChannelMask;
+			}
+
+			// Isolate pixel values above specified threshold
+			if ( $testImageParms1.x > 1e-6 && any( _Color > $testImageParms1.x ) ) {
+				uint2	XY = uint2( floor( 0.25 * _SV_Position.xy + $time.xx ) );
+				bool	Color = ((XY.x & 1) ^ (XY.y & 1));
+				return Color ? float4( 1000, 0, 1000, 1 ) : float4( 1000, 1000, 1000, 1 );	// Above specified value!
+			}
+
+			// Apply auto-exposure
+			if ( ($testImageIntParms0.y & 1) ) {
+				$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();
+				_Color *= Adaptation.EngineLuminanceFactor;
+			}
+
+			// Apply brightness, contrast and gamma
+			_Color += $testImageParms0.x;
+			if ( abs($testImageParms0.w) > 1e-3 ) {
+				_Color = $testImageParms0.w > 0.0 ? _Color / $testImageParms0.w : -$testImageParms0.w / _Color;
+			}
+			if ( $testImageParms0.z != 1.0 )
+				_Color = pow( max( 0.0, _Color ), $testImageParms0.z );
+
+			return $testImageParms0.y * _Color;
+		}
+
+		// Applies filtering of the color then the following formula: Color' = Brightness + Factor * pow( AutoExpose( Color ), Power )
+		float4	TransformColorAsUint( float2 _SV_Position, uint4 _Color ) {
+			// Apply filtering
+			uint	Channels = $testImageIntParms0.x;
+			if ( Channels == 0x1 )		_Color = _Color.x;	// Only display red...
+			else if ( Channels == 0x2 )	_Color = _Color.y;	// Only display green...
+			else if ( Channels == 0x4 )	_Color = _Color.z;	// Only display blue...
+			else if ( Channels == 0x8 )	_Color = _Color.w;	// Only display alpha...
+			else {	// Combination of bits
+				uint4	ChannelMask = uint4( (Channels & 1), (Channels & 2) >> 1, (Channels & 4) >> 2, (Channels & 8) >> 3 );
+				_Color *= ChannelMask;
+			}
+
+// Useless in uint mode
+// 			// Apply auto-exposure
+// 			if ( ($testImageIntParms0.y & 1) )
+// 			{
+// 				$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();
+// 				_Color *= Adaptation.EngineLuminanceFactor;
+// 			}
+ 
+			// Isolate pixel values of given value
+			if ( $testImageParms1.x >= 0.0 && any( _Color == uint($testImageParms1.x) ) ) {
+				uint2	XY = uint2( floor( 0.25 * _SV_Position.xy + $time.xx ) );
+				bool	Color = ((XY.x & 1) ^ (XY.y & 1));
+				return Color ? float4( 1000, 0, 1000, 1 ) : float4( 1000, 1000, 1000, 1 );	// Equals specified value!
+			}
+
+			// Apply brightness, contrast and gamma
+			float4	color = float4( _Color );
+			color += $testImageParms0.x;
+			if ( $testImageParms0.z != 1.0 )
+				color = (uint) pow( max( 0.0, color ), $testImageParms0.z );
+
+			return $testImageParms0.y * color;
+		}
+
+		// Applies filtering of a shadow depth map then the following formula: Color' = _Mult * pow( _Brightness + AutoExpose( FilterRGBA( Color ) ), _Power )
+		float4	TransformShadow( float2 _SV_Position, float _Shadow ) {
+
+			if ( ($testImageIntParms0.y & 4) ) {
+				if ( isnan(_Shadow) || isinf(_Shadow) || abs(_Shadow) > 1e10 || _Shadow*0.0 != 0.0 ) {
+					uint2	XY = uint2( floor( 0.25 * _SV_Position.xy + $time.xx ) );
+					bool	Color = ((XY.x & 1) ^ (XY.y & 1));
+					return Color ? float4( 1000, 0, 1000, 1 ) : float4( 1000, 1000, 1000, 1 );	// NaN or infinite!
+				}
+			}
+
+			// Isolate pixel values above specified threshold
+			if ( $testImageParms1.x > 1e-6 && _Shadow > $testImageParms1.x ) {
+				uint2	XY = uint2( floor( 0.25 * _SV_Position.xy + $time.xx ) );
+				bool	Color = ((XY.x & 1) ^ (XY.y & 1));
+				return Color ? float4( 1000, 0, 1000, 1 ) : float4( 1000, 1000, 1000, 1 );	// Above specified value!
+			}
+
+			// Apply brightness, contrast and gamma
+			_Shadow += $testImageParms0.x;	// Bias
+			if ( abs($testImageParms0.w) > 1e-3 ) {
+				_Shadow = $testImageParms0.w > 0.0 ? _Shadow / $testImageParms0.w : -$testImageParms0.w / _Shadow;
+			}
+			if ( $testImageParms0.z != 1.0 )
+				_Shadow = pow( max( 0.0, _Shadow ), $testImageParms0.z );
+
+			return $testImageParms0.y * _Shadow;
+		}
+	}
+}

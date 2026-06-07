@@ -1,0 +1,67 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 1
+		NUMTHREADY 512	// NOTE: This exceeds the advised amount of threads but I don't want to split this shader into multiple passes again
+						// 512 vertical threads ensures a maximum vertical image size of 2048 so we're pretty safe on that side for now...
+		NUMTHREADZ 1
+	}
+	
+	hlsl_prefix {
+
+		groupshared uint	Rows[NUMTHREADY];	// Here we're going to read many rows from the multi-rows histogram
+	}
+
+	hlsl_cp_main {
+
+		uint2	Dimensions;
+		$(PostFX/Luminance/texHistogram_READ).GetDimensions( Dimensions.x, Dimensions.y );
+
+		// Initialize source histogram rows
+		uint	RowIndex = NUMTHREADY * $sv_groupID.y + $sv_groupThreadID.y;
+		Rows[$sv_groupThreadID.y] = RowIndex < Dimensions.y ? $(PostFX/Luminance/texHistogram_READ)[uint2( $sv_groupID.x, RowIndex )] : 0;
+		GroupMemoryBarrierWithGroupSync();
+
+
+		// Add the 64 last rows to their corresponding 64 first rows
+		if ( $sv_groupThreadID.y < 64 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+64];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Add the 32 last rows to their corresponding 32 first rows
+		if ( $sv_groupThreadID.y < 32 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+32];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Add the 16 last rows to their corresponding 16 first rows
+		if ( $sv_groupThreadID.y < 16 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+16];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Add the 8 last rows to their corresponding 8 first rows
+		if ( $sv_groupThreadID.y < 8 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+8];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Add the 4 last rows to their corresponding 4 first rows
+		if ( $sv_groupThreadID.y < 4 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+4];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Add the 2 last rows to their corresponding 2 first rows
+		if ( $sv_groupThreadID.y < 2 ) {
+			Rows[$sv_groupThreadID.y] += Rows[$sv_groupThreadID.y+2];
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Write the sum of the 2 remaining rows
+		if ( $sv_groupThreadID.y == 0 ) {
+			@(PostFX/Luminance/texHistogram)[uint2( $sv_groupID.x, 0 )] = Rows[0] + Rows[1];
+		}
+	}
+}

@@ -1,0 +1,37 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+		blendOp		ADD
+		blend		ONE ONE
+
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		uint2	stencilSize;
+		$(waterStencil).GetDimensions( stencilSize.x, stencilSize.y );
+		uint2 scale = stencilSize / $waterStencilTargetSize.xy;
+		uint2 pixelPos = uint2($sv_position.xy) * scale;
+		uint value = $(waterStencil)[pixelPos];
+
+		float extinctionCoeff = ( 1.0 - $(water/WaterColor).g ) * $(water/Extinction);
+		float verticalDepth = max( $(water/WaterLevel) - $wsCamPos.z, 0.0f );
+		float verticalExtinction = exp( - extinctionCoeff * verticalDepth * verticalDepth );
+		
+		@sv_target = (value & 0x40) ? 0.1 * verticalExtinction : 0.0;
+	}
+}

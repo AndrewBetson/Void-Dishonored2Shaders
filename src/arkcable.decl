@@ -1,0 +1,307 @@
+{
+	newstyle
+
+	options {
+		needsSplineInfo	1
+		needsWind 1
+	}
+	
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <BRDF_ward>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+		#include <fogHelpers>
+		#if $useParallaxMapping
+			#include <parallaxSelfShadow>
+		#endif
+		#include <particles_instancing>
+		
+		#if DURANGO 
+			#if $alphaTest
+				#define __XBOX_FORCE_PS_ZORDER_RE_Z 1
+			#endif
+		#endif
+
+		float3 RotatePoint( const float3 pointToRotate, const float3 center, const float3 axis, const float angle ) {
+			float3x3 mtx;
+			float s, c;
+			sincos( angle, s, c );
+
+			float x = axis.x * s;
+			float y = axis.y * s;
+			float z = axis.z * s;
+
+			float x2 = x + x;
+			float y2 = y + y;
+			float z2 = z + z;
+
+			float xx = x * x2;
+			float xy = x * y2;
+			float xz = x * z2;
+
+			float yy = y * y2;
+			float yz = y * z2;
+			float zz = z * z2;
+
+			float wx = c * x2;
+			float wy = c * y2;
+			float wz = c * z2;
+
+			mtx[ 0 ][ 0 ] = 1.0f - ( yy + zz );
+			mtx[ 0 ][ 1 ] = xy - wz;
+			mtx[ 0 ][ 2 ] = xz + wy;
+
+			mtx[ 1 ][ 0 ] = xy + wz;
+			mtx[ 1 ][ 1 ] = 1.0f - ( xx + zz );
+			mtx[ 1 ][ 2 ] = yz - wx;
+
+			mtx[ 2 ][ 0 ] = xz - wy;
+			mtx[ 2 ][ 1 ] = yz + wx;
+			mtx[ 2 ][ 2 ] = 1.0f - ( xx + yy );
+
+			return mul( (pointToRotate - center), mtx) + center;
+		}
+
+		
+		
+		float3 AnimateCable( const float3 position, const float4 wind, const float time, const float3 splinePos, const float3 splineDir, const float vtxTexCoordY, const float2 vtxTexCoord1, const float4 vtxColor ) {
+			const float MAX_WIND = 20;
+			const float MAX_ANGLE = PI / 4;
+			const float MAX_NOISE_ANGLE = PI / 80;
+			const float MAX_DISTANCE_TO_ROT_CENTER = 10;
+
+			float splineOriginToRotCenter = vtxTexCoord1.x;
+			float splineLocationToRotCenter = vtxTexCoord1.y / MAX_DISTANCE_TO_ROT_CENTER;
+			float windFactor = vtxColor.x;
+			float windNoiseAmplitude = vtxColor.y;
+			float windNoiseFrequency = vtxColor.z * 10;
+			float windNoiseScrollingSpeed = vtxColor.w * 20 - 10;
+			float3 rotationCenter = splinePos + splineDir * splineOriginToRotCenter;
+
+			float3 rotationAxis = cross( float3(0,0,1), wind.xyz );
+			float windPower = wind.w/MAX_WIND;
+
+			float angle = MAX_ANGLE * windPower * splineLocationToRotCenter * windFactor;
+
+			// add some noise along the spline
+			angle -= MAX_NOISE_ANGLE * windPower * (0.5*sin( ( windPower * time * windNoiseScrollingSpeed ) + vtxTexCoordY * windNoiseFrequency )+0.5) * windNoiseAmplitude;
+
+			return RotatePoint( position, rotationCenter, rotationAxis, angle );
+		}
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+		
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		#if $needsSplineInfo && $needsWind
+			float4 wind = float4(1, 0, 0, 0.01);
+
+			#if $useMultiInstancing 
+				uint instanceWindID = $windBufferOffset;	// + victx._instanceID;	// spline geometry is world space so single instanced
+				$windStruct windInfo = $windBuffer[ instanceWindID ];			// This remaps the visible instance ID to the index in the global array of all instances (visible or not)
+				wind = windInfo.wind;
+
+				// in case of spline everything is worldspace, so localposition is a world position
+				$splineinfo_t spInfo = $splineInfos[$splineId];
+
+				float3 splinePos = spInfo.m_position;
+				float3 splineDir = spInfo.m_direction;
+			#else
+				float3 splinePos = $splineAxisPosition.xyz;
+				float3 splineDir = $splineAxisDirection.xyz;
+			#endif
+
+			victx._localPosition = AnimateCable( $vertex_position, wind, $localTime.x, splinePos, splineDir, $vertex_texcoord.y, $vertex_texcoord1, $vertex_color );
+		#endif
+
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+			
+		#if ( $alphaTest  || ( !$isShadow && !$isZPrePass ) ) 
+			@texcoords = vout._texcoords;
+		#endif
+
+		#if (!$(tool/unlit)) && ( !$isShadow && !$isZPrePass && !$isMasking && !$isOutline )
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		#if $isZPrePass && !$isShadow
+			#if !$isAlpha
+				float3 worldPos = $vertex_position; //cable are all world space
+				#if $needsSplineInfo && $needsWind
+					float4 previousWind = float4( 1, 0, 0, 0.01 );
+					#if $useMultiInstancing 
+						previousWind = windInfo.previousWind;
+					#endif
+					worldPos = AnimateCable( $vertex_position, previousWind, $localTime.x-$localTime.y, splinePos, splineDir, $vertex_texcoord.y, $vertex_texcoord1, $vertex_color );
+				#endif
+				@psPosition = vout._projPosition;
+				@psPreviousPosition = mul( $previousViewProjectionMatrix, float4( worldPos, 1.0 ) );
+			#elif $(Alpha/EnableRefraction)
+				#if $hasBumpMap
+					@texcoords = vout._texcoords;
+					@wsTangent = vout.m_wsTangent.xyz;
+					@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+				#endif
+				@wsNormal = vout.m_wsNormal;
+				@wsPosition = vout._worldPosition;
+			#endif
+		#elif !$isShadow && !$isMasking && !$isOutline && !$(tool/unlit)
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+		
+		#if !$isShadow && !$isZPrePass && !$isOutline
+			#if $useParticleColorInstancing
+				@legacy_color = GetParticleColor( victx, $vertex_color );
+			#elif $isMasking
+				#if $VtxColorMultiply || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) )
+					@legacy_color = $vertex_color;
+				#endif
+			#elif ( $VtxColorMultiply || (!$(tool/unlit) && $(translucency/enable) && $translucencyUseVertexColor) || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) ) )
+				@legacy_color = $vertex_color;
+			#endif
+		#endif
+	}
+	
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if $isShadow
+			ClipZorShadowPass( pixelCtx );
+			return;
+		#elif $isZPrePass
+			ClipZorShadowPass( pixelCtx );
+			#if !$isZPrePassAlpha
+				#if $isAlpha
+					#if $(Alpha/EnableRefraction)
+						HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+						@sv_target = float4( 0.0, ComputeGlassDistortion( pixelCtx.m_wsView, pixelCtx.m_wsNormal, pixelCtx.m_wsVertexNormal, $sv_position.z, pixelCtx.m_isFrontFace ), 0.0, 0.0 );
+					#endif
+				#else
+					//Motion vector
+					float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+					psMotionVector -= $jitterRelativeToPreviousFrame;
+					psMotionVector *= 0.5f;
+					psMotionVector.y *= -1.0f;
+					@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+				#endif
+			#endif
+			return;
+		#elif $isOutline
+			#if $outlineable
+				@sv_target = pixelCtx.OutlineSeed();
+			#endif
+		// =======================================================================
+		// Standard Pass
+		#else
+			#if $isMasking
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+				@sv_target = pixelCtx.m_diffuseAlbedo.w * $(rendering/masking/bendTimeFactor).x;
+
+			#elif $(tool/unlit)
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+
+				#if $isAlpha
+					writePixel( pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target = pixelCtx.m_diffuseAlbedo;
+				#endif
+
+				////for now this debug draw cause problems, this should be done in a postprocess
+				//if ( $(tool/unlit/shadowAtlasResDebug) ) { // WARN: this is a runtime parm and not an option ! so keep this in tool-only path to not impact game performances !
+				//	ComputeLightingResult	Result;
+				//	Result.Clear();
+				//
+				//
+				//	SurfaceContext	surf;
+				//	surf = ComputeLightingParams( pixelCtx );
+				//
+				//	LightLoopContext	loopContext = CreateLightLoopContext( surf.wsPosition, float3( 1.f, 1.f, 1.f), surf.pixelIndex );
+				//	while ( loopContext.FetchNextLightData( surf ) ) {
+				//		if ( loopContext.m_castsShadow ) {
+				//			@sv_target.rgb *= loopContext.m_color;
+				//		}
+				//
+				//		if ( loopContext.m_lightsCount > 32 ) {
+				//			break;
+				//		}
+				//	}
+				//}
+
+			#else 
+
+				SurfaceContext	surf;
+				surf.Clear();
+				ComputeLightingResult	result;
+				result.Clear();
+				
+				// High quality				
+				HQ_DoParallaxMapping( pixelCtx );
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );					
+				HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+				HQ_ComputeLightingParams( pixelCtx, surf );
+				effectCtx.ApplyMaterialEffect( pixelCtx, surf );
+				HQ_FetchMetallicSpecularFresnelAndIOR( pixelCtx, surf );
+
+				result = IntegrateLighting( surf, HIGH_QUALITY );
+
+				// Compute Glass transmittance
+				ComputeGlassTransmittance( surf, pixelCtx, result );
+				
+				// Compute fog
+				result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+				#if $isAlpha
+					writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+					@sv_target.w = pixelCtx.m_diffuseAlbedo.a;
+				#endif
+
+				// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+				#if defined( PC ) && !defined( RETAIL )
+
+					// Debug draw
+					DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+					// Write MRT info for probe rendering
+					#inlinefile <includes/resultOverrideIL.inc>
+					WRITE_IL_MRT( pixelCtx, surf, result )
+
+				#endif //defined( PC )
+			#endif
+		#endif
+	}
+}

@@ -1,0 +1,313 @@
+{
+	newstyle
+	hlsl_prefix {
+
+		#include <atm/common>
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Tables Access
+		//
+
+		// 4D table resolution
+		static const float	RESOLUTION_COS_THETA_SUN = 32;										// Resolution for the Sun/Zenith angle
+		static const float	RESOLUTION_COS_GAMMA = 8;											// Resolution for the Sun/View angle)
+		static const float	RESOLUTION_U = RESOLUTION_COS_THETA_SUN * RESOLUTION_COS_GAMMA;		// U Size (Sun/Zenith + Sun/View packed along a single dimension)
+		static const float	RESOLUTION_COS_THETA = 128;											// V size (View/Zenith angle)
+		static const float	RESOLUTION_ALTITUDE = 32;											// W Size (Altitude)
+
+		static const float	MODULO_U = 1.0 / RESOLUTION_COS_GAMMA;								// Modulo to access each of the 8 slices of Sun/View angle
+
+		static const float	NORMALIZED_SIZE_U1 = 1.0 - 1.0 / RESOLUTION_COS_THETA_SUN;
+		static const float	NORMALIZED_SIZE_U2 = 1.0 - 1.0 / RESOLUTION_COS_GAMMA;
+		static const float	NORMALIZED_SIZE_V = 1.0 - 1.0 / RESOLUTION_COS_THETA;
+		static const float	NORMALIZED_SIZE_W = 1.0 - 1.0 / RESOLUTION_ALTITUDE;
+
+		// Gets the atmosphere transmittance at specified altitude in the specified view angle
+		float3	GetTransmittance( float _AltitudeKm, float _CosTheta, bool _RejectGround=false )
+		{
+			float	RadiusKm = GROUND_RADIUS_KM + _AltitudeKm;
+
+#if 0
+			if ( _RejectGround )
+			{	// Easy reject if hitting the ground
+				if ( _CosTheta < -sqrt( max( 0.0, 1.0 - GROUND_RADIUS_KM * GROUND_RADIUS_KM / (RadiusKm * RadiusKm) ) ) )
+					return 0.0;
+			}
+#endif
+
+//			float	NormalizedAltitude = sqrt( _AltitudeKm * (1.0 / ATMOSPHERE_THICKNESS_KM) );
+			float	NormalizedAltitude = sqrt( saturate( (_AltitudeKm-0.001) / (ATMOSPHERE_THICKNESS_KM-2.0-0.001) ) );
+
+//			float	NormalizedCosTheta = (_CosTheta + 0.15) / (1.0 + 0.15);				// Linear
+//			float	NormalizedCosTheta = sqrt( (_CosTheta + 0.15) / (1.0 + 0.15) );		// Quadratic
+			float	NormalizedCosTheta = atan( (_CosTheta + 0.15) / (1.0 + 0.15) * tan(1.5) ) / 1.5;
+
+			float2	UV = float2( NormalizedCosTheta, NormalizedAltitude );
+
+			return $(atm/sky/precompute/texTransmittance).SampleLevel( $linearClamp, UV, 0.0 ).xyz;
+		}
+
+		// Gets the atmosphere transmittance at specified altitude in the specified view angle
+		// It also accounts for earth shadowing, returning 0 if the point is inside the Earth shadow...
+		float3	GetTransmittanceWithShadow( float _AltitudeKm, float _CosTheta )
+		{
+			float	RadiusKm = GROUND_RADIUS_KM + _AltitudeKm;
+			float	CosThetaGround = -sqrt( 1.0 - (GROUND_RADIUS_KM*GROUND_RADIUS_KM / (RadiusKm*RadiusKm)) );
+			return _CosTheta < CosThetaGround ? 0.0 : GetTransmittance( _AltitudeKm, _CosTheta );
+		}
+
+		// Gets the atmosphere transmittance at specified altitude in the specified view angle and along the specified distance
+		// We assume the segment is not intersecting ground
+		float3	GetTransmittance( float _AltitudeKm, float _CosTheta, float _DistanceKm )
+		{
+			// P0 = [0, _RadiusKm]
+			// V  = [SinTheta, CosTheta]
+			//
+			float	RadiusKm = GROUND_RADIUS_KM + _AltitudeKm;
+			float	RadiusKm2 = sqrt( RadiusKm*RadiusKm + _DistanceKm*_DistanceKm + 2.0 * RadiusKm * _CosTheta * _DistanceKm );	// sqrt[ (P0 + d.V)² ]
+			float	CosTheta2 = (RadiusKm * _CosTheta + _DistanceKm) / RadiusKm2;												// dot( P0 + d.V, V ) / RadiusKm2
+			float	AltitudeKm2 = RadiusKm2 - GROUND_RADIUS_KM;
+ 
+			return _CosTheta > 0.0	? GetTransmittance( _AltitudeKm , _CosTheta  ) / (GetTransmittance(  AltitudeKm2,   CosTheta2 ) + 1e-6)
+									: GetTransmittance(  AltitudeKm2, -CosTheta2 ) / (GetTransmittance( _AltitudeKm , -_CosTheta  ) + 1e-6);
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// These lines are the Devil! It's THEM that introduce the dirty yellow colors, because of the clamping!
+// ON TOP OF THAT I INVERTED COSTHETA2 AND COSTHETA!!! FFS! TRIPLE FUCK! I'M SO INNATTENTIVE IT'S SCARY!
+// 			return _CosTheta > 0.0	? GetTransmittance( AltitudeKm2, CosTheta2 ) / max( 0.001, GetTransmittance( _AltitudeKm, _CosTheta ) )
+// 									: GetTransmittance( _AltitudeKm, -_CosTheta ) / max( 0.001, GetTransmittance( AltitudeKm2, -CosTheta2 ) );
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+		}
+
+		// Gets the perceived sky irradiance in the direction of the normal at the specified altitude
+		float3	GetIrradiance( float3 _Normal, float _AltitudeKm=0.0 )
+		{
+const float	MAX_ANGLE = 110.0 * PI / 180.0;
+const float	COS_THETA_MAX = cos(MAX_ANGLE);
+const float	SIN_THETA_MAX = sin(MAX_ANGLE);
+const float	XY_MAX = SIN_THETA_MAX / (1.0 + COS_THETA_MAX);		// 1.73 for 120°
+
+			float	den = 1.0 / (XY_MAX * (1.0 + _Normal.z));
+			float3	UVW = float3( _Normal.xy * den, _AltitudeKm * (1.0 / MAX_CAMERA_ALTITUDE_KM) );
+
+			return $(atm/sky/SunIntensity).xyz * $(atm/sky/texIrradiance).SampleLevel( $linearClamp, UVW, 0.0 ).xyz;
+		}
+
+		// Samples the scattering table from 4 parameters
+		float4	Sample4DScatteringTable( Texture3D _TexScattering, float _AltitudeKm, float _CosThetaView, float _CosThetaSun, float _CosGamma )
+		{
+			_AltitudeKm = max( 0.001, _AltitudeKm );
+
+			const float	H = sqrt( ATMOSPHERE_RADIUS_KM * ATMOSPHERE_RADIUS_KM - GROUND_RADIUS_KM * GROUND_RADIUS_KM );
+
+			float	r = GROUND_RADIUS_KM + _AltitudeKm;
+			float	h = sqrt( r * r - GROUND_RADIUS_KM * GROUND_RADIUS_KM );
+
+//			float	uAltitude = 0.5 / RESOLUTION_ALTITUDE + (h / H) * (1.0 - 1.0 / RESOLUTION_ALTITUDE);
+			float	uAltitude = lerp( 0.5 / RESOLUTION_ALTITUDE, 1.0 - 0.5 / RESOLUTION_ALTITUDE, h / H );
+
+			float	r_cosTheta = r * _CosThetaView;
+			float	Delta = r_cosTheta * r_cosTheta + GROUND_RADIUS_KM * GROUND_RADIUS_KM - r * r;
+
+#if 1
+			// This code is "optimized" below
+			float	uCosThetaView = 0.0;
+			if ( _CosThetaView <= 0.0 && Delta >= 0.0 )	// Hitting the ground
+			{
+				// uCosThetaView = d / d_h = (-r*cos(theta) - sqrt(r²*cos²(theta) - [r²-Rg²])) / sqrt( r² - Rg² )
+				//
+				float	GroundHitDistanceKm = -r_cosTheta - sqrt( Delta );
+				float	HorizonHitDistanceKm = h;
+				uCosThetaView = GroundHitDistanceKm / HorizonHitDistanceKm;						// That's our V coordinate. It equals 1 when we're about to stop hitting the ground (horizon hit) and Delta is becoming negative
+//				uCosThetaView = lerp( 0.5 - 0.5 / RESOLUTION_COS_THETA, 0.0, uCosThetaView );	// This results in mapping to 0.5-€ when viewing straight down, and to 0 when reaching the horizon
+				uCosThetaView = lerp( 0.5 - 0.5 / RESOLUTION_COS_THETA, 0.5 / RESOLUTION_COS_THETA, uCosThetaView );	// This results in mapping to 0.5-€ when viewing straight down, and to 0 when reaching the horizon
+			}
+			else										// Hitting the atmosphere
+			{
+				// uCosThetaView = d / d_H = (-r*cos(theta) + sqrt( r²*cos²(theta) - [r²-Rt²] )) / (sqrt( r² - Rg² ) + sqrt( Rt² - Rg² ))
+				//
+				Delta = r_cosTheta * r_cosTheta + ATMOSPHERE_RADIUS_KM * ATMOSPHERE_RADIUS_KM - r * r;
+				float	AtmosphereHitDistanceKm = -r_cosTheta + sqrt( Delta );
+				float	HorizonHitDistanceKm = h + H;
+				uCosThetaView = AtmosphereHitDistanceKm / HorizonHitDistanceKm;					// That's our V coordinate. It equals 1 when we're about to start hitting the ground (horizon hit) and Delta is becoming positive
+//				uCosThetaView = lerp( 0.5 + 0.5 / RESOLUTION_COS_THETA, 1.0, uCosThetaView );	// This results in mapping to 0.5+€ when viewing straight up, and to 1 when reaching the horizon
+				uCosThetaView = lerp( 0.5 + 0.5 / RESOLUTION_COS_THETA, 1.0 - 0.5 / RESOLUTION_COS_THETA, uCosThetaView );	// This results in mapping to 0.5+€ when viewing straight down, and to 1 when reaching the horizon
+			}
+#else
+			// Note that this code produces a warning about floating point precision because of the sqrt( H*H + delta )...
+// 			//TODO: REWRITE!
+// 			float4	cst = (rmu < 0.0 && delta > 0.0) ? float4( 1.0, 0.0, 0.0, 0.5 * NORMALIZED_SIZE_V ) : float4( -1.0, H * H, H, 1.0 - 0.5 * NORMALIZED_SIZE_V );
+// 			float	uCosThetaView = cst.w + (rmu * cst.x + sqrt( delta + cst.y )) / (rho + cst.z) * (0.5 - 1.0 / RESOLUTION_COS_THETA);
+#endif
+
+			// paper formula
+			//float	uCosThetaSun = 0.5 / RESOLUTION_COS_THETA_SUN + max((1.0 - exp(-3.0 * _CosThetaSun - 0.6)) / (1.0 - exp(-3.6)), 0.0) * NORMALIZED_SIZE_U1;
+			// better formula
+			float	uCosThetaSun = 0.5 / RESOLUTION_COS_THETA_SUN + (atan( max( _CosThetaSun, -0.1975 ) * tan( 1.26 * 1.1 ) ) / 1.1 + (1.0 - 0.26)) * 0.5 * NORMALIZED_SIZE_U1;
+
+			float	t = 0.5 * (_CosGamma + 1.0) * (RESOLUTION_COS_GAMMA - 1.0);
+			float	uGamma = floor( t );
+			t = t - uGamma;
+
+//return float4( uCosThetaView, uCosThetaSun, uGamma, uAltitude );
+
+//@@@### Faster, but is it as accurate?
+//return _TexScattering.SampleLevel( $linearClamp, float3( uCosThetaSun / RESOLUTION_COS_GAMMA, uCosThetaView, uAltitude ), 0.0 );
+
+
+			float4	V0 = _TexScattering.SampleLevel( $linearClamp, float3( (uGamma + uCosThetaSun) / RESOLUTION_COS_GAMMA, uCosThetaView, uAltitude ), 0.0 );
+			float4	V1 = _TexScattering.SampleLevel( $linearClamp, float3( (uGamma + uCosThetaSun + 1.0) / RESOLUTION_COS_GAMMA, uCosThetaView, uAltitude ), 0.0 );
+			return lerp( V0, V1, t );
+		}
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Actual Sky Rendering
+		//	_PositionKm, the view position (in kilometers)
+		//	_View, the normalized view direction
+		//	_Sun, the normalized direction pointing toward the Sun
+		//	_DistanceKm, an (optional) distance to the ground (in kilometers). If not provided then the ray is assumed to look at the sky
+		//	_GroundReflectance, an (optional) reflectance (in [0,1]) for the ground at the end of the ray
+		// returns the color of the sky for a unit Sun intensity.
+		// You need to multiply this by your Sun's intensity to get the actual value.
+		//
+		void	ComputeSkyExtinctionScattering( float3 _PositionWorldKm, float3 _View, float3 _Sun, float _DistanceKm, float4 _CloudScatteringExtinction, bool _GroundBlocking, out float3 _Scattering, out float3 _Extinction )
+		{
+const float	ALTITUDE_OFFSET_KM = 1.0;	// Offset by 1km to avoid the nasty horizon line
+
+			float3	EarthCenter = float3( 0, 0, -GROUND_RADIUS_KM );
+			float3	x = _PositionWorldKm - EarthCenter;
+			float	RadiusKm = length( x );
+			float	AltitudeKm = RadiusKm - GROUND_RADIUS_KM + ALTITUDE_OFFSET_KM;
+
+			x /= RadiusKm;
+			float	CosThetaView = dot( x, _View );
+			float	CosThetaSun = dot( x, _Sun );
+			float	CosGamma = dot( _View, _Sun );
+
+			// Compute transmittance at specified distance
+			_Extinction = GetTransmittance( AltitudeKm, CosThetaView, _DistanceKm );
+
+ 			// Compute scattering
+ 			float4	Scattering = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm, CosThetaView, CosThetaSun, CosGamma );
+
+			// Subtract scattering perceived at blocker position
+			if ( _GroundBlocking )
+ 			{
+				// Compute intersection data
+				float3	HitPositionWorldKm = _PositionWorldKm + _DistanceKm * _View;
+				float3	x2 = HitPositionWorldKm - EarthCenter;
+				float	RadiusKm2 = length( x2 );
+				float	AltitudeKm2 = RadiusKm2 - GROUND_RADIUS_KM + ALTITUDE_OFFSET_KM;
+
+				x2 /= RadiusKm2;
+				float	CosThetaView2 = dot( x2, _View );
+				float	CosThetaSun2 = dot( x2, _Sun );
+
+
+//				if ( RadiusKm2 > GROUND_RADIUS_KM )
+				{	// Computes S[L]-T(x,x0)S[L] at x0
+
+					float4	Scattering2 = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm2, CosThetaView2, CosThetaSun2, CosGamma );
+
+//#define	HORIZON_EPSILON	0.004
+#define	HORIZON_EPSILON	0.08	// Define this to enable horizon smooth interpolation of values
+#define	HORIZON_BIAS	-0.01
+#ifdef HORIZON_EPSILON
+					// Avoids imprecision problems near horizon by interpolating between two points above and below horizon
+					float	CosThetaViewHorizon = HORIZON_BIAS - sqrt( 1.0 - (GROUND_RADIUS_KM*GROUND_RADIUS_KM) / (RadiusKm2*RadiusKm2) );
+					if ( abs( CosThetaView - CosThetaViewHorizon ) < HORIZON_EPSILON )
+					{
+						float	a = ((CosThetaView - CosThetaViewHorizon) + HORIZON_EPSILON) / (2.0 * HORIZON_EPSILON);	// 0 for below the horizon, 1 for above
+
+						CosThetaView = CosThetaViewHorizon - HORIZON_EPSILON;
+						RadiusKm2 = sqrt( RadiusKm * RadiusKm + _DistanceKm * _DistanceKm + 2.0 * RadiusKm * _DistanceKm * CosThetaView );
+						AltitudeKm2 = RadiusKm2 - GROUND_RADIUS_KM + ALTITUDE_OFFSET_KM;
+						CosThetaView2 = (RadiusKm * CosThetaView + _DistanceKm) / RadiusKm2;
+						float4	Scattering0 = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm, CosThetaView, CosThetaSun, CosGamma );
+						float4	Scattering1 = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm2, CosThetaView2, CosThetaSun2, CosGamma );
+						float4	ScatteringBelow = max( 0.0, Scattering0 - _Extinction.xyzx * Scattering1 );
+
+						CosThetaView = CosThetaViewHorizon + HORIZON_EPSILON;
+						RadiusKm2 = sqrt( RadiusKm * RadiusKm + _DistanceKm * _DistanceKm + 2.0 * RadiusKm * _DistanceKm * CosThetaView );
+						AltitudeKm2 = RadiusKm2 - GROUND_RADIUS_KM + ALTITUDE_OFFSET_KM;
+						CosThetaView2 = (RadiusKm * CosThetaView + _DistanceKm) / RadiusKm2;
+						Scattering0 = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm, CosThetaView, CosThetaSun, CosGamma );
+						Scattering1 = Sample4DScatteringTable( $(atm/sky/precompute/texScattering), AltitudeKm2, CosThetaView2, CosThetaSun2, CosGamma );
+						float4	ScatteringAbove = max( 0.0, Scattering0 - _Extinction.xyzx * Scattering1 );
+
+						float4	ScatteringHorizon = lerp( ScatteringBelow, ScatteringAbove, a );
+						float4	ScatteringWithoutHorizonPatch = max( 0.0, Scattering - _Extinction.xyzx * Scattering2 );
+
+						Scattering = lerp( ScatteringHorizon, ScatteringWithoutHorizonPatch, abs( 2.0 * a - 1.0 ) );
+					}
+					else
+					{
+						Scattering = max( 0.0, Scattering - _Extinction.xyzx * Scattering2 );
+					}
+#else
+					// Direct sampling, without horizon bug masking
+					Scattering = max( 0.0, Scattering - _Extinction.xyzx * Scattering2 );
+#endif
+				}
+			}
+
+			// Avoids imprecision problems in Mie scattering when sun is below horizon
+			Scattering.w *= smoothstep( 0.0, 0.02, CosThetaSun );
+
+			_Scattering = $(atm/sky/SunIntensity).xyz * (PhaseFunctionRayleigh( CosGamma ) * Scattering.xyz + PhaseFunctionMie( CosGamma, $(env/atm/sky/FogAnisotropy) ) * GetMieFromRayleighAndMieRed( Scattering ));
+
+#if 1
+			// Ugly patch for small distances < 100m
+			if ( _GroundBlocking )
+			{
+				const float	ATMOSPHERE_START_DISTANCE_KM = 0.08;	// Start accounting for atmospheric scattering above 80m
+				const float	ATMOSPHERE_FULL_DISTANCE_KM = 0.1;		// Full atmospheric scattering above 100m
+
+				float	Patch = smoothstep( ATMOSPHERE_START_DISTANCE_KM, ATMOSPHERE_FULL_DISTANCE_KM, _DistanceKm );
+				_Extinction = lerp( float3( 1.0, 1.0, 1.0 ), _Extinction, Patch );	// Extinction is forced to 1 if < start distance
+				_Scattering *= Patch;							// Scattering is forced to 0 if < start distance
+			}
+#endif
+		}
+
+		////////////////////////////////////////////////////////////
+		// Sky reflection
+		// The sky env map is based on the paraboloïd env map algorithm that maps a paraboloïdal sheet:
+		//	P(x,y) = ( x, y, f(x, y) )  for x² + y² <= 1 (i.e. inside the unit circle)
+		//
+		// with:
+		//	f(x,y) = 0.5 * (1 - x² - y²)
+		//
+		// Each (x,y) on the paraboloïd will map to a specific normal N:
+		//	N(x,y) = (x,y,1)
+		//
+		// The interesting fact with a paraboloïd is that rays from the entire hemisphere all get reflected in a beam of parallel rays.
+		// So, when computing the paraboloïdal reflection map, we simply choose a unit vector V = (0,0,1)
+		//	pointing toward the paraboloïd, we compute the normal at position (x,y) of interest then
+		//	we find the reflected direction in which to sample the environment:
+		//		R = -V + 2.dot( V, N' ).N'   (where N'=N/||N|| is the normalized normal)
+		//		R = (0,0,-1) + 2.N'z.N'
+		//
+		// Similarly, when we need to sample the paraboloïd envmap in a given direction R, we can write:
+		//		Nsum = R + V
+		// Since N=(x,y,1) and Nsum = (Rx,Ry,Rz+1), to obtain N from Nsum we simply divide Nsum by its Z component:
+		//		N=Nsum/Nsum.z = (Rx/(1+Rz), Ry/(1+Rz), 1 )
+		//
+		// This implies:
+		//		x = Rx/(1+Rz)
+		//		y = Ry/(1+Rz)
+		//
+
+		// Samples the sky env map in the specified direction (world space)
+		float3	GetSkyReflection( float3 _Direction )
+		{
+			float2	UV = _Direction.xy / (1.0 + saturate(_Direction.z));
+					UV = 0.5 * (1.0 + UV);
+					UV *= 0.995;	// Scale a bit so we never quite get to the horizon...
+			return $(atm/sky/texEnvMap).SampleLevel( $linearClamp, UV, 0.0 ).xyz;
+		}
+	}
+}

@@ -1,0 +1,36 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float2	pixelSize = $positionToViewTexture.zw * $resolutionScale.xy * $resolutionScale.xy;
+		float2	pixelSizedBlurDirection = $(GaussianBlur/Direction).xy * pixelSize;
+
+		// take nine samples, with the distance blurSize between them
+		float4 sum = 0.0;
+
+		float offsets[9] = { -4.0, -3.0, -2.0, -1.0, 0, 1.0, 2.0, 3.0, 4.0 };
+		float weights[9] = { 0.05, 0.09, 0.12, 0.15, 0.16, 0.15, 0.12, 0.09, 0.05 };
+
+		[unroll]
+		for ( int i = 0; i < 9; ++i ) {
+			float2 currentCoord = ( $texcoord - pixelSizedBlurDirection * offsets[i] ) * $resolutionScale.xy;
+			sum += $(Identity/BufferIn).SampleLevel( $pointMirror, currentCoord, 0.0f ) * weights[i];
+		}
+
+		@sv_target = $(GaussianBlur/BoostFactor)>0.0 ? sum * ( (1.0/0.98) * $(GaussianBlur/BoostFactor) ) : saturate( sum * (1.0/0.98) );
+	}
+}

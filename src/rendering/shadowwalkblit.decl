@@ -1,0 +1,26 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		blend DST_COLOR ZERO
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float shadowWalk = 1.0-saturate($(rendering/BufferIn).Sample( $linearClamp,  $texcoord.xy + $(subpixelOffset).xy ).x);
+
+		@sv_target.xyz = lerp( $(shadowWalk/BlitColor).xyz, 1.0, pow(shadowWalk,$(shadowWalk/BlitPower).x) );
+		@sv_target.w = 1.0;
+	}
+}

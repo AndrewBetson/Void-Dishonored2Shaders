@@ -1,0 +1,22 @@
+{ newstyle
+	parms {
+	}
+	state {
+		cull NONE
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float2 scaledTexCoord = $texcoord * $(resolutionScale);
+#if defined( ORBIS )
+		// CopyTexture does not handle srgb well so we have to gamma correct the output ourself
+		// see https://ps4.scedev.net/support/issue/93842/_toolkit_CopyTexture
+		@sv_target = pow( $textureMap.Sample( $bilinearSampler, scaledTexCoord ), 1.0f / 2.2f );
+#else
+		@sv_target = $textureMap.Sample( $bilinearSampler, scaledTexCoord );
+#endif
+	}
+}

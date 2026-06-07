@@ -1,0 +1,55 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#define MAX_BLUR_RADIUS 64
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float4 result = 0.0;
+		uint nSamples = $(GaussianBlur/Radius) / 2;
+
+		if (nSamples <= 1) {
+			result = $(Identity/BufferIn).SampleLevel( $bilinearMirror, $texcoord.xy, 0.0);
+		}
+		else {
+			const float SIGMA = float( $(GaussianBlur/Radius) ) / 8.0;
+			const float sig2  = SIGMA * SIGMA;
+			float2 srcTexelSize;
+			$(Identity/BufferIn).GetDimensions( srcTexelSize.x, srcTexelSize.y );
+			srcTexelSize = 1.0/srcTexelSize;
+
+			//	set up incremental counter
+			float3 gaussInc;
+			gaussInc.x = 1.0 / (sqrt(TWOPI) * SIGMA);
+			gaussInc.y = exp(-0.5 / sig2);
+			gaussInc.z = gaussInc.y * gaussInc.y;
+
+			//	accumulate results
+			float2 screenLimit = $resolutionScale.xy - $positionToViewTexture.zw * 0.5f;
+			result = $(Identity/BufferIn).SampleLevel( $bilinearMirror, clamp( $texcoord.xy * $resolutionScale, float2(0, 0), screenLimit ), 0.0) * gaussInc.x;
+
+			for (uint i = 1; i < nSamples; ++i) {
+				gaussInc.xy *= gaussInc.yz;
+				float2 offset = float(i) * $(GaussianBlur/Direction) * srcTexelSize;
+				float2 UV1 = clamp( ( $texcoord.xy - offset ) * $resolutionScale, float2(0, 0), screenLimit );
+				float2 UV2 = clamp( ( $texcoord.xy + offset ) * $resolutionScale, float2(0, 0), screenLimit );
+				result += $(Identity/BufferIn).SampleLevel( $bilinearMirror, UV1, 0.0) * gaussInc.x;
+				result += $(Identity/BufferIn).SampleLevel( $bilinearMirror, UV2, 0.0) * gaussInc.x;
+			}
+		}
+
+		@sv_target = result;
+	}
+}

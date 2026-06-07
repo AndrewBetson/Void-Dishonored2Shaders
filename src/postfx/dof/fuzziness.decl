@@ -1,0 +1,111 @@
+{
+	newstyle
+
+	parms {
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <helper>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+		float2 result = 0;
+		float farDof = ($(POSTFX/DOF/CommonParams).x);
+		const float2 center = $(PostFX/DOF/center).xy;
+
+		#if $(PostFX/DOF/AUTOFOCUS)
+			float focusDist = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center, 0.0 ).x;
+			farDof += focusDist;
+		#endif
+
+		#if $(PostFX/DOF/DOF_TYPE) == 0 //ALPHA
+			//------------------------------------------------------------------------
+			// Compute Alpha Fuzziness
+			//------------------------------------------------------------------------
+			float farSharp   = $(PostFX/DOF/AlphaParams).x;
+			float farFuzzy   = $(PostFX/DOF/AlphaParams).y;
+			const float bias = $(PostFX/DOF/AlphaParams).z;
+
+			#if $(PostFX/DOF/AUTOFOCUS)
+				farSharp = (farSharp + focusDist) / farDof;
+				farFuzzy = (farFuzzy + focusDist) / farDof;
+			#endif
+
+			float depthAlpha = $(PostFX/DOF/ZbufferAlpha).SampleLevel( $pointClamp, $texcoord, 0.0 ).x; //zmax
+			depthAlpha = ComputeLinearZ( depthAlpha );
+			float depthAlphaLinear = LinearStep(0, farDof, depthAlpha);
+
+			float alpha_k1 = ( depthAlphaLinear - farSharp ) / (farFuzzy - farSharp);
+			float alpha_Fuzziness = ((depthAlphaLinear > farSharp) * alpha_k1) + bias;
+			float alpha_mask = alpha_Fuzziness * 4.0;
+			result = float2( alpha_Fuzziness, alpha_mask);
+
+		#elif $(PostFX/DOF/DOF_TYPE) == 1 //NEAR
+			//------------------------------------------------------------------------
+			// Fetch depth
+			//------------------------------------------------------------------------
+			float depthMin = $(PostFX/DOF/ZbufferAlpha).SampleLevel( $bilinearClamp, $texcoord, 0.0 ).x; //zmax	- should be z-max with alpha
+			float depthMinLinear = ComputeLinearZ( depthMin );
+			depthMinLinear = LinearStep(0,farDof,depthMinLinear);
+
+			//------------------------------------------------------------------------
+			// Compute Near Fuzziness
+			//------------------------------------------------------------------------
+			float nearFuzzy = ($(POSTFX/DOF/NearParams).x);
+			float nearSharp = ($(POSTFX/DOF/NearParams).y);
+
+			#if $(PostFX/DOF/AUTOFOCUS)
+				nearFuzzy = (focusDist + nearFuzzy) / farDof;
+				nearSharp = (focusDist - nearSharp) / farDof;
+			#endif
+
+			float k0 = ( depthMinLinear - nearSharp ) / (nearSharp - nearFuzzy);
+			float fuzziness = max( 0.0, -k0 );
+			result.x = fuzziness;
+
+		#elif $(PostFX/DOF/DOF_TYPE) == 2 //FAR
+			//------------------------------------------------------------------------
+			// Fetch depth
+			//------------------------------------------------------------------------
+			float depthMax = $(PostFX/DOF/ZbufferAlpha).SampleLevel( $pointClamp, $texcoord, 0.0 ).x; //zmax - should be z-max with alpha
+			float depthMaxLinear = ComputeLinearZ( depthMax );
+			depthMaxLinear = LinearStep(0,farDof,depthMaxLinear);
+
+			//------------------------------------------------------------------------
+			// Compute Far Fuzziness
+			//------------------------------------------------------------------------
+			float farSharp   = ($(POSTFX/DOF/FarParams).y);
+			float farFuzzy   = ($(POSTFX/DOF/FarParams).x);
+			const float bias = ($(POSTFX/DOF/FarParams).z);
+
+			#if $(PostFX/DOF/AUTOFOCUS)
+				farSharp = (farSharp + focusDist) / farDof;
+				farFuzzy = (farFuzzy + focusDist) / farDof;
+			#endif
+
+			float nearFuzziness = $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $texcoord, 0.0 ).x;
+			float k1 = ( depthMaxLinear - farSharp ) / (farFuzzy - farSharp);
+			float farFuzziness = ((depthMaxLinear > farSharp) * k1)+ bias;
+
+			result = saturate(float2(nearFuzziness, farFuzziness));
+
+		#else
+			errorf("Unknown fuzziness type");
+		#endif
+
+	@sv_target = result.xyxy;
+	}
+}

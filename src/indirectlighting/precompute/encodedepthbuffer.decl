@@ -1,0 +1,214 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 4	// Must be 4x4 because group shared memory can only support 65536 "entries" so 4x4x256 coeffs * sizeof(float) = 16 Kb total (I know I could be using 8x8 threads per group but the compiler keeps yelling at me!)
+		NUMTHREADY 4
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+	#ifndef __PSSL__
+		#include <indirectLighting/precompute/common>
+
+		groupshared float	gs_SH[NUMTHREADX*NUMTHREADY * SH_COEFFS_ENVIRONMENT_COUNT];
+//		groupshared float4	gs_Distance[NUMTHREADX*NUMTHREADY];
+
+		uint	OffsetFrom( uint2 _Position )
+		{
+			return SH_COEFFS_ENVIRONMENT_COUNT * ( NUMTHREADX*_Position.y + _Position.x );
+		}
+
+		uint	DistanceOffsetFrom( uint2 _Position )
+		{
+			return NUMTHREADX*_Position.y + _Position.x;
+		}
+
+	#endif // #ifndef __PSSL__
+	}
+
+	hlsl_cp_main {
+	#ifndef __PSSL__
+		uint2		Resolution;
+		uint		ElementsCount, MipLevelsCount;
+		$(indirectLighting/precompute/depthBuffer).GetDimensions( 0, Resolution.x, Resolution.y, ElementsCount, MipLevelsCount );
+
+		// =========================== Generate the SH coefficients for the current distance ===========================
+		uint		CubeSize = Resolution.x;
+		uint		CubeFaceIndex = $sv_groupID.z;
+		float3x3	Face2World = GetCubeFaceTransform( CubeFaceIndex );
+
+		uint2		Position = $sv_DispatchThreadID.xy;
+		uint3		UVW = uint3( Position, CubeFaceIndex );
+
+		// Unproject Z
+		float		Zproj = $(indirectLighting/precompute/depthBuffer).Load( uint4( UVW, 0 ) ).x;
+		float		Z = $(indirectLighting/precompute/parms).y / ($(indirectLighting/precompute/parms).z + Zproj);
+
+		float2		UV = 2.0 * (0.5 + Position) / CubeSize - 1.0;
+		float3		csView = float3( UV.x, -UV.y, - 1.0 );
+
+		// Retrieve the cube map texel's solid angle (from http://people.cs.kuleuven.be/~philip.dutre/GI/TotalCompendium.pdf)
+		// dw = cos(Theta).dA / r²
+		// cos(Theta) = Adjacent/Hypothenuse = 1/r
+		//
+		float		sqDistance2Texel = dot( csView, csView );
+		float		distance2Texel = sqrt( sqDistance2Texel );
+
+		const float	dA = 4.0 / (CubeSize * CubeSize);	// Cube face is supposed to be in [-1,+1], yielding a 2x2 square units that we divide equally among texels
+
+		float		solidAngle = dA / (distance2Texel * sqDistance2Texel);
+
+		// Transform view into world space
+		float3		wsView = mul( csView, Face2World );		// We normally multiply on the right but since we need the World=>Face transform we can multiply by the left instead of using the transpose
+					wsView /= distance2Texel;				// Normalize
+
+		// Compute clamped distance
+		float		distance2Scene = Z * distance2Texel;
+// 		gs_Distance[4*$sv_groupIndex+0] = distance2Scene;	// Store for reduction
+// 		gs_Distance[4*$sv_groupIndex+1] = distance2Scene;
+// 		gs_Distance[4*$sv_groupIndex+2] = distance2Scene;
+// 		gs_Distance[4*$sv_groupIndex+3] = 1.0 / distance2Scene;
+		distance2Scene = min( $(indirectLighting/precompute/parms).x, distance2Scene );	// Don't account for distances larger than 20m (default value)
+
+		// Compute SH
+		float	Phi = atan2( wsView.x, wsView.y );
+		float	CosTheta = wsView.z;
+		[loop]
+		[fastopt]
+		for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+			int	l = int( floor( sqrt( i ) ) );
+			int	m = int(i) - l*(l+1);
+			gs_SH[SH_COEFFS_ENVIRONMENT_COUNT*$sv_groupIndex+i] = (solidAngle * distance2Scene) * GetSHCoeff( l, m, Phi, CosTheta );
+		}
+
+		GroupMemoryBarrierWithGroupSync();	// We wait until all SH from the group are available
+
+		// =========================== Perform a reduction and accumulation of the buffer ===========================
+		#if NUMTHREADY > 16
+			// Collapse second half the array into first half
+			if ( all( $sv_groupThreadID.xy < 16 ) ) {
+				[loop]
+				[fastopt]
+				for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 16x16 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 16x16 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 16x16 block
+				}
+
+// 				// Reduce distances
+// 				uint	Offset = DistanceOffsetFrom($sv_groupThreadID.xy);
+// 				float4	D00 = gs_Distance[Offset];
+// 				float4	D01 = gs_Distance[DistanceOffsetFrom(16*uint2(1,0)+$sv_groupThreadID.xy)];
+// 				float4	D10 = gs_Distance[DistanceOffsetFrom(16*uint2(0,1)+$sv_groupThreadID.xy)];
+// 				float4	D11 = gs_Distance[DistanceOffsetFrom(16*uint2(1,1)+$sv_groupThreadID.xy)];
+// 				D00.x = min( min( min( D00.x, D01.x ), D10.x ), D11.x );
+// 				D00.y = max( max( max( D00.y, D01.y ), D10.y ), D11.y );
+// 				D00.zw = 0.25 * (D00.zw + D01.zw + D10.zw + D11.zw);
+// 				gs_Distance[Offset] = D00;
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		#if NUMTHREADY > 8
+			// Collapse second quarter the array into first quarter
+			if ( all( $sv_groupThreadID.xy < 8 ) ) {
+				[loop]
+				[fastopt]
+				for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 8x8 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 8x8 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 8x8 block
+				}
+
+// 				// Reduce distances
+// 				uint	Offset = DistanceOffsetFrom($sv_groupThreadID.xy);
+// 				float4	D00 = gs_Distance[Offset];
+// 				float4	D01 = gs_Distance[DistanceOffsetFrom(8*uint2(1,0)+$sv_groupThreadID.xy)];
+// 				float4	D10 = gs_Distance[DistanceOffsetFrom(8*uint2(0,1)+$sv_groupThreadID.xy)];
+// 				float4	D11 = gs_Distance[DistanceOffsetFrom(8*uint2(1,1)+$sv_groupThreadID.xy)];
+// 				D00.x = min( min( min( D00.x, D01.x ), D10.x ), D11.x );
+// 				D00.y = max( max( max( D00.y, D01.y ), D10.y ), D11.y );
+// 				D00.zw = 0.25 * (D00.zw + D01.zw + D10.zw + D11.zw);
+// 				gs_Distance[Offset] = D00;
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		#if NUMTHREADY > 4
+			// etc.
+			if ( all( $sv_groupThreadID.xy < 4 ) ) {
+				[loop]
+				[fastopt]
+				for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 4x4 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 4x4 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 4x4 block
+				}
+
+// 				// Reduce distances
+// 				uint	Offset = DistanceOffsetFrom($sv_groupThreadID.xy);
+// 				float4	D00 = gs_Distance[Offset];
+// 				float4	D01 = gs_Distance[DistanceOffsetFrom(4*uint2(1,0)+$sv_groupThreadID.xy)];
+// 				float4	D10 = gs_Distance[DistanceOffsetFrom(4*uint2(0,1)+$sv_groupThreadID.xy)];
+// 				float4	D11 = gs_Distance[DistanceOffsetFrom(4*uint2(1,1)+$sv_groupThreadID.xy)];
+// 				D00.x = min( min( min( D00.x, D01.x ), D10.x ), D11.x );
+// 				D00.y = max( max( max( D00.y, D01.y ), D10.y ), D11.y );
+// 				D00.zw = 0.25 * (D00.zw + D01.zw + D10.zw + D11.zw);
+// 				gs_Distance[Offset] = D00;
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		// etc.
+		if ( all( $sv_groupThreadID.xy < 2 ) ) {
+			[loop]
+			[fastopt]
+			for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 2x2 block
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 2x2 block
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 2x2 block
+			}
+
+// 			// Reduce distances
+// 			uint	Offset = DistanceOffsetFrom($sv_groupThreadID.xy);
+// 			float4	D00 = gs_Distance[Offset];
+// 			float4	D01 = gs_Distance[DistanceOffsetFrom(2*uint2(1,0)+$sv_groupThreadID.xy)];
+// 			float4	D10 = gs_Distance[DistanceOffsetFrom(2*uint2(0,1)+$sv_groupThreadID.xy)];
+// 			float4	D11 = gs_Distance[DistanceOffsetFrom(2*uint2(1,1)+$sv_groupThreadID.xy)];
+// 			D00.x = min( min( min( D00.x, D01.x ), D10.x ), D11.x );
+// 			D00.y = max( max( max( D00.y, D01.y ), D10.y ), D11.y );
+// 			D00.zw = 0.25 * (D00.zw + D01.zw + D10.zw + D11.zw);
+// 			gs_Distance[Offset] = D00;
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Final acumulation
+		if ( all( $sv_groupThreadID.xy == 0 ) ) {
+			uint	groupsCount = $(indirectLighting/precompute/parms2).x;
+
+ 			[loop]
+ 			[fastopt]
+			for ( uint i=0; i < SH_COEFFS_ENVIRONMENT_COUNT; i++ ) {
+				float	Coeff  = gs_SH[i];
+						Coeff += gs_SH[OffsetFrom(uint2(1,0))+i];	// Add right coeff
+						Coeff += gs_SH[OffsetFrom(uint2(0,1))+i];	// Add bottom coeff
+						Coeff += gs_SH[OffsetFrom(uint2(1,1))+i];	// Add bottom-right coeff
+				@(indirectLighting/precompute/bufferSHEnvironmentDistance)[SH_COEFFS_ENVIRONMENT_COUNT*(groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex)+$sv_GroupID.x)+i] = Coeff;
+			}
+
+// 			// Reduce distances
+// 			float4	D00 = gs_Distance[0];
+// 			float4	D01 = gs_Distance[DistanceOffsetFrom(uint2(1,0))];
+// 			float4	D10 = gs_Distance[DistanceOffsetFrom(uint2(0,1))];
+// 			float4	D11 = gs_Distance[DistanceOffsetFrom(uint2(1,1))];
+// 			D00.x = min( min( min( D00.x, D01.x ), D10.x ), D11.x );
+// 			D00.y = max( max( max( D00.y, D01.y ), D10.y ), D11.y );
+// 			D00.zw = 0.25 * (D00.zw + D01.zw + D10.zw + D11.zw);
+//
+// 			@(indirectLighting/precompute/bufferMinMaxDistances)[4*(groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex)+$sv_GroupID.x)+0] = D00.x;
+// 			@(indirectLighting/precompute/bufferMinMaxDistances)[4*(groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex)+$sv_GroupID.x)+1] = D00.y;
+// 			@(indirectLighting/precompute/bufferMinMaxDistances)[4*(groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex)+$sv_GroupID.x)+2] = D00.z;
+// 			@(indirectLighting/precompute/bufferMinMaxDistances)[4*(groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex)+$sv_GroupID.x)+3] = D00.w;
+		}
+	#endif	// #ifndef __PSSL__
+	}
+}

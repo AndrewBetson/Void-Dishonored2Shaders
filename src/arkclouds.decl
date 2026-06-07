@@ -1,0 +1,124 @@
+{
+	newstyle
+
+	options {
+		skyType	2
+	}
+	
+	parms {
+		stageSort	sortCoverage
+	}
+	
+	state {
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthWrite	0
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <pixel>
+		#include <helper>
+		#include <colorimetry>
+		#include <fogHelpers>
+		
+		float HenyeyGreenstein(float cosTheta, float g) {
+			return (1-g)*(1-g)/( 4*PI*pow((1+g*g - 2*g*cosTheta), 1.5));
+		}
+
+		float ComputeFogMask(float4 inputData) {
+			float2 texcoords = inputData.xy;
+			float sv_position = inputData.w;
+			float depthSrc = $cloudDepth.Sample( $trilinearSampler, texcoords ).x;
+			float depth = pow(1.f - depthSrc , $cloudDepthOffset);
+			return saturate(1.0 - depth);
+		}
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+		
+		#if ( $alphaTest || ( !$isShadow && !$isZPrePass ) )
+			@texcoords = vout._texcoords;
+			@texcoords.x += $localTime.x * $cloudSpeed;
+		#endif				
+		
+		#if !$(tool/unlit) && !$isShadow && !$isZPrePass
+			@wsPosition = vout._worldPosition;
+			@wsNormal = vout.m_wsNormal.xyz;
+			@texcoords.zw = vout._projPosition.zw;
+			@legacy_color = $vertex_color;
+		#endif
+		
+		#if !$(tool/unlit)
+			if($cloudProjOnFar) {
+				//Greater Equal
+				@sv_position = float4( vout._projPosition.xy, 0.f, vout._projPosition.w );	//project on far plane  //ARKANE (2015-06-12) - depth inversion		
+				//Less Equal
+				//@sv_position.z = vout._projPosition.w - 0.001;
+			}
+		#endif
+	}
+	
+	hlsl_fp_main {
+		// =======================================================================
+		// Standard Pass
+		#if ( !$isShadow && !$isZPrePass )
+			float4 m_diffuseAlbedo;
+			m_diffuseAlbedo.rgb = $diffusemap.Sample( $trilinearSampler, $texcoords.xy ).rgb;
+			m_diffuseAlbedo.a = $opacityMap.Sample( $trilinearSampler, $texcoords.xy ).r;
+			clip(m_diffuseAlbedo.a - 1.0/255.0);
+
+			#if $(tool/unlit)
+				float4 color = lerp(float4($wireFrameColor.rgb,lerp(0.25, 0.75, m_diffuseAlbedo.a)), m_diffuseAlbedo, $wireFrameBlend);
+				@sv_target = color;
+			#else
+
+				// Compute Alpha horizon
+				float dotView = Smootheststep(0, $(cloudVerticalAlpha), dot( normalize($wsNormal), float3(0,0,-1)) );
+				float alpha = dotView * m_diffuseAlbedo.a;
+
+				// Density
+				float density = $densityMap.Sample( $trilinearSampler, $texcoords.xy ).x;
+				float extinction = exp( -density * $(cloudDensityCoef) );
+
+				// Scattering
+				float3 wsViewDir = normalize($wsPosition.xyz);
+				float PhaseAngle = dot( $(atm/worldFog/ScatteringDirection), wsViewDir );
+				float Phase = PhaseFunctionMie( PhaseAngle, $(atm/worldFog/ScatteringPhase) );
+				float sunVerticalCoef = pow( dot($wsNormal, float3(0,0,-1)), $(cloudVerticalExtinction) );
+				float3 sunColor = $(atm/worldFog/ScatteringColor) * extinction * saturate(Phase);
+
+				// Back lighting
+				float3 sunDir = normalize( $(atm/worldFog/ScatteringDirection) );
+				float cosTheta = dot(-sunDir, $wsPosition.xyz) / length($wsPosition.xyz);
+				float backDensity = $backdensityMap.Sample( $trilinearSampler, $texcoords.xy ).r;
+				float curveG = -(1.0-backDensity);
+				float backLited = HenyeyGreenstein(cosTheta, curveG) * $cloudBackLitCoef.x;
+				sunColor += $(atm/worldFog/ScatteringColor) * backLited;
+
+				// Rim lighting
+				float rimLited = HenyeyGreenstein(cosTheta, -(1.0 - density)) * $cloudBackLitCoef.y;
+				sunColor += $(atm/worldFog/ScatteringColor) * rimLited * sunVerticalCoef;
+
+				// Ambient Light
+				float3 sunAmbientColor = $(atm/worldFog/ScatteringColor);
+				float3 ambientColor = m_diffuseAlbedo.rgb * lerp( $skyCoef, sunAmbientColor, sunVerticalCoef ) * $cloudAmbientExtinction;
+
+				// compute fog
+				@sv_target.xyz = RangeCompressColorToR11G11B10( (ambientColor + sunColor) * $legacy_color.rgb );
+				@sv_target.a = alpha * $legacy_color.a;
+
+				// compute clouds density
+				@sv_target1.yzw = 0.0;
+				@sv_target1.x = ComputeFogMask($texcoords) * alpha * $legacy_color.a * $(env/atm/sky/MaskingFactor).x;
+
+			#endif
+		#endif
+	}
+}

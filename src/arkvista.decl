@@ -1,0 +1,311 @@
+{
+	newstyle
+	state {
+	}
+	options {
+		noShadow 1
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <fresnel>
+		#include <helper>
+		#if defined( PC ) && !defined( RETAIL )
+			#include <PostFX/Luminance/common>
+		#endif
+
+		// =======================================================================
+		//  _ _ _   ___ ___ _  _ ___ ___ _____ _____   _____    ___ ___  _  _ _____ ___ _  _ _____   _ _ _
+		// | | | | / __| __| \| / __|_ _|_   _|_ _\ \ / / __|  / __/ _ \| \| |_   _| __| \| |_   _| | | | |
+		// |_|_|_| \__ \ _|| .` \__ \| |  | |  | | \ V /| _|  | (_| (_) | .` | | | | _|| .` | | |   |_|_|_|
+		// (_|_|_) |___/___|_|\_|___/___| |_| |___| \_/ |___|  \___\___/|_|\_| |_| |___|_|\_| |_|   (_|_|_)
+		//
+		// This small function is at the heart of mapping the artist's textures to physical values used by the lighting
+		// !PLEASE! Don't change anything without asking me (Pom) because you might break the entire base of
+		//	gloss/metallic textures the artists carefully tweaked by hand to match the settings of this function!
+		// =======================================================================
+		void NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY_VISTA( float _Gloss, float _Metallic, inout float3 _DiffuseAlbedo, float3 _SpecularTint, out float3 _IOR, out float _FresnelStrength, float3 _SpecularTintForDielectrics=0.04, float3 _DiffuseAlbedoForMetals=0.0, bool _UseMetallicToComputeSpecular=true ) {
+			_Metallic *= _Metallic;		// Artists prefer that...
+
+			if ( _UseMetallicToComputeSpecular ) {
+				// ARKANE: bmayaux (2014-02-24) As of today, specular tint is derived from diffuse based on metallic, and uses a global value of 4% (default) for dielectrics (i.e. plastic, glass, etc.)
+				_SpecularTint = lerp( _SpecularTintForDielectrics, _DiffuseAlbedo, _Metallic );
+
+				// Artists want to have a true matte rendering when gloss is 0...
+				//_SpecularTint *= saturate( _Gloss / 0.1 );					// 1st draft - This is okay but a bit too hard
+				//_SpecularTint *= smoothstep( 0.0, 0.1, _Gloss + _Metallic );	// 2nd draft - They're okay with this, although I still can see the transition. I added metallic to gloss so the attenuation doesn't occur with metallic materials
+				
+				// 3rd draft - try to re-range gloss to avoid white veil on low gloss value
+				float glossMin = smoothstep(0.0 , 1.07, _Gloss);
+				float glossMax = smoothstep(0.05, 1.0 , _Gloss);
+				float Gloss = lerp(glossMin, glossMax, _Gloss);
+				_SpecularTint *= LinearStep( 0.0, 0.05, Gloss + _Metallic );				
+			}
+
+ 			// ARKANE: bmayaux (2014-02-24) As of today, diffuse is interpolated to a global value of black (default) based on metallic
+			_DiffuseAlbedo = lerp( _DiffuseAlbedo, _DiffuseAlbedoForMetals, _Metallic );
+
+			// Make the Fresnel disappear completely if rough and non-metallic so we get our diffuse lighting back
+			// Should be useless if users set a very low dielectric specular tint...
+//			_SpecularTint *= max( smoothstep( 0.0, 0.2, _Gloss ), smoothstep( 0.0, 0.2, _Metallic ) );
+// 			_SpecularTint *= saturate( smoothstep( 0.0, 0.2, _Gloss ) + smoothstep( 0.0, 0.7, _Metallic ) );	// Not used anymore since the error was a specular PI* larger than diffuse, that's why it was always showing no matter what!
+
+			// ARKANE: bmayaux (2014-02-24) As of today, IOR is derived from specular tint
+// 			// Retrieve Index of Refraction based on metallic coefficient
+// //		_IOR = exp2( lerp( 0.26303440583379383358341951445843, 9.9657842846620870436109582884682, _Metallic ) );	// IOR in [1.2, 1000]
+// //		_IOR = exp2( lerp( log2( 1.0 ), log2( 10.0 ), _Metallic*_Metallic ) );	// Quite good => hardcoded value below
+// 			_IOR = exp2( lerp( 0.0, 3.3219280948873623478703194294894, _Metallic*_Metallic ) );	// IOR in [1.0, 10]
+
+			_IOR = Fresnel_IORFromF0( _SpecularTint );
+
+			// Make Fresnel appear with gloss
+			_FresnelStrength = smoothstep( 0.1, 1.0, _Gloss );	// Satisfying: the smoothstep gives kind of a linear control over Fresnel strength
+		}
+
+		#if defined( PC ) && !defined( RETAIL )
+			void DebugDrawOverrideVISTA( inout float3 _sv_target, float _roughness, float _metal, float3 _accumAmbient, float3 _accumDiffuse, float3 _accumSpecular, float3 _accumEmissive ) {
+				bool	makeLDR = false;
+
+				// bmayaux (2014-11-09) Lighting debug modes for idStudio
+				if ( ($(indirectLighting/globalParms1).z & 32) != 0 ) {
+					// Only show gloss
+					_sv_target = 1.0 - _roughness;
+					makeLDR = true;
+				} else if ( ($(indirectLighting/globalParms1).z & 64) != 0 ) {
+					// Only show metallic
+					_sv_target = _metal;
+					makeLDR = true;
+				}
+				
+				uint	lightingDebugFlags = ($(indirectLighting/globalParms1).z >> 9) & 0x1F;
+				if ( lightingDebugFlags != 0 ) {
+					_sv_target = 0.0;
+					if ( lightingDebugFlags & 1 )	_sv_target += _accumAmbient;
+					if ( lightingDebugFlags & 2 )	_sv_target += _accumDiffuse;
+					if ( lightingDebugFlags & 4 )	_sv_target += _accumSpecular;
+					if ( lightingDebugFlags & 8 )	_sv_target += _accumEmissive;
+				}
+
+				if ( makeLDR ) {
+					// Unexpose so after exposition it's in [0,1]
+					$(PostFX/Luminance/autoExposure_t)      Adaptation = ReadAutoExposureParameters();
+					_sv_target /= Adaptation.EngineLuminanceFactor;
+				}
+			}
+		#endif
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+
+		#if $isZPrePass
+			#if !$isAlpha && !$isZPrePassAlpha
+				//The motion vector generation for motion blur & temporalAA is done here
+				VertexOutContext previousFrameVout = TransformVertex( victx, true );
+				@psPosition = vout._projPosition;
+				@psPreviousPosition = previousFrameVout._projPosition;
+			#endif
+		#elif !$(tool/unlit) && !$isShadow
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+			@wsPosition = vout._worldPosition;
+		#endif
+		
+		#if $alphaTest || ( !$isZPrePass && !$isShadow )
+			@texcoords.xy = $vertex_texcoord.xy;
+			@texcoords.zw = $vertex_texcoord1.xy;
+		#endif
+		
+	}
+	
+	hlsl_fp_main {
+		float4 diffuse = 1.0;
+		#if $alphaTest || ( !$isZPrePass && !$isShadow )
+			diffuse = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy ); 
+			clip( diffuse.w - 0.5 );
+		#endif
+		
+		#if $isZPrePass
+			//Motion vector
+			#if !$isAlpha && !$isZPrePassAlpha
+				float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+				psMotionVector -= $jitterRelativeToPreviousFrame;
+				psMotionVector *= 0.5f;
+				psMotionVector.y *= -1.0f;
+				@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+			#endif
+			return;
+		#elif $isShadow
+			return;
+		#elif $(tool/unlit)
+			float4	lightmap = $lightMap.Sample( $trilinearSampler, $texcoords.zw );
+			@sv_target.xyz = diffuse.xyz * lightmap.xyz + diffuse.xyz * INVPI * lightmap.w;
+			@sv_target.w = 1.0;
+		#else
+			float3 wsTangent = $wsTangent.xyz;
+			float3 wsNormal = normalize( $wsNormal * GetFrontFacingFactor($sv_isFrontFace) );
+			float3 wsBiTangent = cross( wsNormal, wsTangent ) * sign( $IBLLuminanceFactor );
+			float3 wsVtxNormal = wsNormal;
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					diffuse.xyz = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			#if $hasBumpMap
+				float3 wsVtxBiTangent = wsBiTangent;
+				float3 wsVtxTangent = wsTangent;
+				
+				float2 rawTsNormal = $bumpmap.Sample( $trilinearSampler, $texcoords.xy ).xy;
+				float3 tsNormal = UnpackBC5NormalMap( rawTsNormal ); 
+
+				wsNormal = normalize( tsNormal.x * wsVtxTangent + tsNormal.y * wsVtxBiTangent + tsNormal.z * wsVtxNormal );
+				wsTangent = normalize( cross( wsVtxBiTangent, wsNormal ) );
+				wsBiTangent = cross( wsNormal, wsTangent );
+			#endif
+			
+			float gloss = $wardRoughness.y;
+			#if $hasGlossMap
+				float glossMap = $glossMap.Sample( $trilinearSampler, $texcoords.xy ).x;
+				gloss = lerp( $wardRoughness.x, $wardRoughness.y, glossMap );
+			#endif
+
+			float	metallic = $metallicMinMax.y;	// Default is max value
+
+			float4	lightmap = $lightMap.Sample( $trilinearSampler, $texcoords.zw );
+
+			// brdf.ComputeLighting( Result, _Surface, light );
+			float3	View = normalize( $wsCamPos - $wsPosition );
+			float3	Light = $parallelLightDir.xyz;
+			float3	Normal = wsNormal;
+			float3	Half_unorm = View + Light;
+
+			float	LdotN = dot( Light, Normal );
+			float	VdotN = saturate( dot( View, Normal ) );
+
+			// BEGIN bmayaux (2015-12-10) Boost gloss by making the half vector align to the normal
+ 			float	glossBoost = smoothstep( $(arkVista/glossBoost/lightAngle_start), $(arkVista/glossBoost/lightAngle_end), LdotN );				// First, gloss boost depends on light's angle with surface
+					glossBoost *= smoothstep( $(arkVista/glossBoost/glossMap_start), $(arkVista/glossBoost/glossMap_end), gloss );					// Then, it also depends whether the gloss map is already kind of glossy or not
+					glossBoost *= smoothstep( $(arkVista/glossBoost/lightMapShadow_start), $(arkVista/glossBoost/lightMapShadow_end), lightmap.w );	// Finally, make the effect depend on the light map's shadowing
+
+			// Now we use the gloss boost factor to:
+			//	• Force a fake alignment of the normal with the light so specular reflection is increased
+			//	• Force actual gloss to interpolate between current value in gloss map and a maximum value set by the user
+			//	• Increase metallicness of the surface to color specular reflections
+			//	• Fake grazing reflection angle
+			//
+			Half_unorm = lerp( Half_unorm, wsNormal, glossBoost );						// Align normal
+			gloss = lerp( gloss, $(arkVista/glossBoost/target_gloss), glossBoost );		// Gloss is increased
+			metallic = $metallicMinMax.y * smoothstep( $(arkVista/glossBoost/metal_min), $(arkVista/glossBoost/metal_max), glossBoost );	// Surface becomes metallic if gloss boost above a certain value
+			// END bmayaux (2015-12-10)
+
+
+			LdotN = saturate( LdotN );
+			
+			float3 specularTint = 1.0;
+			float3 IOR = 0.0;
+			float fresnelStrength = 1.0;
+			NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY_VISTA( gloss, metallic, diffuse.xyz, specularTint, IOR, fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz );
+
+			float3	Irradiance = $parallelLightColor.xyz;
+			float3	Irradiance_shadowed = lightmap.w * Irradiance;
+
+			// =================================================================
+			// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+			float3	FresnelSpecular = FresnelAccurate( IOR, VdotN, fresnelStrength );
+			float3	FresnelDiffuse = 1.0 - FresnelSpecular;	// Diffuse Fresnel is always left with what has not been specularly reflected...
+
+			// ====== Diffuse lighting ======
+			float3 accumDiffuse = FresnelDiffuse * Irradiance_shadowed * INVPI * diffuse.xyz * saturate( dot( $parallelLightDir.xyz, wsNormal ) );
+
+			// ====== Ambient lighting ======
+			float3 accumAmbient = diffuse.xyz * lightmap.xyz * $lightMapLuminance.x;
+
+			float3	Reflection = reflect( View, wsVtxNormal );
+			float	RdotUp = saturate( 0.5 - Reflection.z*0.5 );
+//			float	VdotGeoN = smoothstep( -0.2, 1.0, smoothstep( 0.9, 1.0, dot( View, wsVtxNormal )));
+//			float	VdotGeoN = smoothstep( 0.9, 1.0, dot( View, wsVtxNormal ));
+			float	VdotGeoN = pow( saturate( dot( View, wsVtxNormal ) ), $(arkVista/glossBoost/viewDependantExponent) );
+
+			float	viewDependantFactor = VdotGeoN * RdotUp;
+
+//			accumAmbient += ($parallelLightColor.xyz * lightmap.xyz * $lightMapLuminance.y) * gloss * viewDependantFactor;
+			//, $lightMapLuminance.y, gloss) * (1.0-VdotN);
+			accumAmbient += $(arkVista/glossBoost/viewDependantFactor) * $parallelLightColor.xyz * gloss * viewDependantFactor;
+
+			float3	accumEmissive = 0.0f;
+			#if $hasEmissiveMap
+				accumEmissive = $emissiveIntensity * $emissiveMap.Sample( $anisotropicSampler, $texcoords.xy ).xyz;
+			#endif
+
+
+			// ====== Specular lighting ======
+			float surf_Roughness = 1.0 - gloss;
+
+			/////////////////////////////////////////////////////
+			////////////////////// CreateWardContext begin
+			// Tweak roughness so the user feels it's a linear parameter
+			float	Roughness = surf_Roughness * surf_Roughness;	// Roughness squared seems to give a nice linear feel...
+																	// People at Disney seem to agree with me! (cf §5.4 http://blog.selfshadow.com/publications/s2012-shading-course/burley/s2012_pbs_disney_brdf_notes_v2.pdf)
+
+			float	invRoughness = 1.0 / Roughness;
+			float3	anisoTangentDivRoughness = wsTangent * invRoughness;
+			float3	anisoBitangentDivRoughness = wsBiTangent * invRoughness;
+
+			float	specularNormalization = INVPI * invRoughness * invRoughness;
+			////////////////////// CreateWardContext end
+			/////////////////////////////////////////////////////
+			////////////////////// ComputeWardTerm begin
+			float	HdotN = dot( Half_unorm, Normal );
+			float	invHdotN_2 = 1.0 / max( 1e-2, square( HdotN ) );
+			float	invHdotN_4 = square( invHdotN_2 );
+
+			float	HdotT = dot( Half_unorm, anisoTangentDivRoughness );
+			float	HdotB = dot( Half_unorm, anisoBitangentDivRoughness );
+			float	HdotH = dot( Half_unorm, Half_unorm );
+			
+			float	exponent = -invHdotN_2 * (square( HdotT ) + square( HdotB ));
+
+			float	SpecularTerm = specularNormalization * exp( exponent ) * HdotH * invHdotN_4 * LdotN;
+			////////////////////// ComputeWardTerm end
+			/////////////////////////////////////////////////////
+
+			float3	accumSpecular = FresnelSpecular * Irradiance_shadowed * SpecularTerm;
+
+
+			// bmayaux (2016-07-25) Avoid infinites by clamping to max 16 bits float value: 65503 (actually, clamp to even less!)
+			float3	finalColor = min( 32768.0, accumDiffuse + accumSpecular + accumAmbient + accumEmissive );
+
+			@sv_target = float4( RangeCompressColorToR11G11B10( finalColor ), 1.0 );
+
+
+			// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+			#if defined( PC ) && !defined( RETAIL )
+				if ( $alwaysOne ) {
+					#if $buildingEnvironmentProbe
+						uint	modelID = $(precomputeIL/modelSurfaceID).x;
+						uint	surfaceID = $(precomputeIL/modelSurfaceID).y;
+						uint	faceID = $SV_PRIMITIVEID;
+						uint	materialID = $(precomputeIL/materialID).x;
+						// Write result into multiple RTs
+						@sv_target  = 0.0;															// Doesn't contribute to lighting
+						@sv_target1 = asfloat( uint4( modelID, surfaceID, faceID, materialID ) );	// But has valid material + model ID so it's not considered an invalid model and used as sky
+						@sv_target2 = 0.0;															// No albedo, no F0
+						@sv_target3 = float4( 0, 0, 0, 10.0 );										// No normal, medium distance so pixels always accounted for regardless of probe's position
+					#else	// !$buildingEnvironmentProbe
+						// ========= Debug rendering =========
+						DebugDrawOverrideVISTA( @sv_target.xyz, surf_Roughness, metallic, accumAmbient, accumDiffuse, accumSpecular, accumEmissive );
+					#endif	// $buildingEnvironmentProbe
+				}
+			#endif
+		#endif
+	}
+}

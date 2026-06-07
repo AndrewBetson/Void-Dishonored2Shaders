@@ -1,0 +1,32 @@
+{
+	newstyle
+	state {
+		cull none
+		depthFunc always
+		depthWrite 0
+	}
+	
+	options {
+	}
+	
+	hlsl_prefix {		
+	}
+
+	hlsl_vp_main {
+		float3 disp = $(FFTWaves/FFTDisplacement).SampleLevel( $bilinearSampler, $vertex_position.xy, 0.0f ).xyz;
+		
+		const float patchLength = 50.0f; //TODO don't hardcode
+
+		disp.xy /= patchLength;
+
+		@sv_position = float4( $vertex_position.xy + disp.xy, 0.0f, 1.0f );
+		@sv_position.xy = @sv_position.xy * 2 - 1; //From UV [0, 1] to NDC [-1, 1]
+		@sv_position.y = - @sv_position.y; //flip vertically
+
+		@texcoords = float4( disp.z, 0, 0, 0 ); //TODO use float interpolator instead of float4
+	}
+
+	hlsl_fp_main {	
+		@sv_target = float4( $texcoords.xxx, 1 );
+	}
+}

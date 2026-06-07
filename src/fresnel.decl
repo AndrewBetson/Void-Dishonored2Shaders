@@ -1,0 +1,219 @@
+{
+	newstyle
+	hlsl_prefix {
+		///////////////////////////////////////////////////////////////////////////////////////////////
+		// ARKANE_BEGIN: bmayaux (2013-11-06) Fresnel Helpers
+#ifndef FRESNEL_INCLUDED
+#define FRESNEL_INCLUDED
+
+		// ===== FRESNEL =====
+		// Some nice Fresnel / Index Of Refraction resources can be found at the following links:
+		//	http://refractiveindex.info/
+		//	http://www.robinwood.com/Catalog/Technical/Gen3DTuts/Gen3DPages/RefractionIndexList.html
+		//	http://interactagram.com/physics/optics/refraction/
+		//	http://macdesignstudio.files.wordpress.com/2012/01/fresnel-ior_reflection-glossiness-matrix.jpg
+		//
+
+		// F0 = ((n2 - n1) / (n2 + n1))²
+		// Assuming n1=1 (air) we get:
+		//	n2 = (1 + sqrt(F0)) / (1 - sqrt(F0))
+		//
+		float	Fresnel_IORFromF0( float _F0 )
+		{
+			float	SqrtF0 = sqrt( _F0 );
+			return (1.0 + SqrtF0) / (1.00001 - SqrtF0);
+		}
+		float3	Fresnel_IORFromF0( float3 _F0 )
+		{
+			float3	SqrtF0 = sqrt( _F0 );
+			return (1.0 + SqrtF0) / (1.00001 - SqrtF0);
+		}
+
+		// F0 = ((n2 - n1) / (n2 + n1))²
+		// Assuming n1=1 (air) we get:
+		//	F0 = ((n2 - 1) / (n2 + 1))²
+		//
+		float	Fresnel_F0FromIOR( float _IOR )
+		{
+			float	ratio = (_IOR - 1.0) / (_IOR + 1.0);
+			return ratio * ratio;
+		}
+		float3	Fresnel_F0FromIOR( float3 _IOR )
+		{
+			float3	ratio = (_IOR - 1.0) / (_IOR + 1.0);
+			return ratio * ratio;
+		}
+
+		// Schlick's approximation to Fresnel reflection (http://en.wikipedia.org/wiki/Schlick's_approximation)
+		float FresnelSchlick(float u)
+		{
+			float m = saturate(1-u);
+			float m2 = m*m;
+			return m2*m2*m; // pow(m,5)
+		}
+		
+		float FresnelSchlick( float _F0, float _CosTheta )
+		{
+			float	t = 1.0f - _CosTheta;
+			float	t2 = t * t;
+			float	t4 = t2 * t2;
+			return lerp( _F0, 1.0f, t4 * t );
+		}
+		
+		float3	FresnelSchlick( float3 _F0, float _CosTheta, float _FresnelStrength=1.0 )
+		{
+			float	t = 1.0 - saturate( _CosTheta );
+			float	t2 = t * t;
+			float	t4 = t2 * t2;
+			return lerp( _F0, float3( 1.0, 1.0, 1.0 ), _FresnelStrength * t4 * t );
+		}
+
+		// Full accurate Fresnel computation (from Walter's paper §5.1 => http://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf)
+		// For dielectrics only but who cares!?
+		float3	FresnelAccurate( float3 _IOR, float _CosTheta, float _FresnelStrength=1.0 ) {
+			float	c = lerp( 1.0, _CosTheta, _FresnelStrength );
+			float3	g_squared = max( 0.0001, _IOR*_IOR - 1.0 + c*c );
+// 			if ( g_squared < 0.0 )
+// 				return 1.0;	// Total internal reflection
+
+			float3	g = sqrt( g_squared );
+
+			float3	a = (g - c) / (g + c);
+					a *= a;
+			float3	b = (c * (g+c) - 1.0) / (c * (g-c) + 1.0);
+					b = 1.0 + b*b;
+
+			return 0.5 * a * b;
+		}
+
+		// Yet another fresnel function ...
+		// bmayaux (2016-08-16) From where?? How is it different from the one given by Walter?
+		float FresnelAccurate( float _IOR, float _CosTheta, out bool _totalInternalReflection ) {
+			float g_squared = 1.0f - _IOR * _IOR * ( 1.0f - _CosTheta * _CosTheta );
+					
+			if( g_squared < 0.0f )
+			{
+				_totalInternalReflection = true;
+				return 1.0f;	// Total internal reflection
+			}
+						
+			_totalInternalReflection = false;
+					
+			float g = sqrt( g_squared );
+					
+			float IOR_CosTheta = _IOR * _CosTheta;
+			float IOR_g = _IOR * g;
+					
+			float Rs = (IOR_CosTheta - g) / (IOR_CosTheta + g);
+			Rs = Rs * Rs;
+					
+			float Rp = (IOR_g - _CosTheta) / (IOR_g + _CosTheta);
+			Rp = Rp * Rp;
+
+			return (Rs + Rp) * 0.5f;
+		}
+
+		// More complex Fresnel with roughness from Disney (cf. §5.3 of http://disney-animation.s3.amazonaws.com/library/s2012_pbs_disney_brdf_notes_v2.pdf)
+		// This is mainly used for rough diffuse surfaces like fabrics, velvet, skin, hair, etc.
+		//	_LdotN, dot product of unit to-light and normal vectors
+		//	_VdotN, dot product of unit to-camera and normal vectors
+		//	_LdotH, dot product of unit to-light and half way vectors
+		//	_Sheen, the color of the sheen effect that will appear on the sides of the object depending on view/light angles
+		//	_SheenImportance, the amplitude of the sheen effect
+		//
+		float3	FresnelDisney( float _LdotN, float _VdotN, float _LdotH, float3 _Sheen, float _SheenImportance ) {
+			const float	MAX_DIFFUSE_ROUGHNESS = 4.0;	// Determined empirically, over this and it's not physically plausible anymore...
+														// It's a bit larger than Disney's so the effect is clearly visible.
+														// Necessary since we're not doing a complete BRDF integral so we have to boost some stuff.
+//			const float	MAX_DIFFUSE_ROUGHNESS = 8.0;	// ARKANE: bmayaux (2014-02-05) Pushed even further as requested by artists
+
+			float	cosThetaD = _LdotH;	// Angle between view/half or light/half
+
+			float	compCosThetaL = 1.0 - saturate( _LdotN );		// 1 - cos(theta_l)
+			float	compCosThetaV = 1.0 - saturate( _VdotN );		// 1 - cos(theta_v)
+			float3	Fd90_minus_1 = 0.5 + (_Sheen * MAX_DIFFUSE_ROUGHNESS) * cosThetaD*cosThetaD - 1.0;
+
+// Original formula is like a double schlick and uses a pow(5)
+// 			float	compCosThetaL5 = compCosThetaL*compCosThetaL;	// ^2
+// 					compCosThetaL5 *= compCosThetaL5;				// ^4
+// 					compCosThetaL5 *= compCosThetaL;				// ^5
+// 
+// 			float	compCosThetaV5 = compCosThetaV*compCosThetaV;	// ^2
+// 					compCosThetaV5 *= compCosThetaV5;				// ^4
+// 					compCosThetaV5 *= compCosThetaV;				// ^5
+
+			// ARKANE: bmayaux (2014-02-05) As requested by artists, they can now choose the shape of the attenuation to make the fresnel grow more "inward" by varying the exponent of the fresnel curve
+			float	Exponent = exp2( lerp( 3.3219280948873623478703194294894, 1.0, _SheenImportance ) );	// lerp( log2(10), log2(2), t )
+			float	compCosThetaL5 = pow( compCosThetaL, Exponent );
+			float	compCosThetaV5 = pow( compCosThetaV, Exponent );
+
+			return (1.0 + Fd90_minus_1 * compCosThetaL5) * (1.0 + Fd90_minus_1 * compCosThetaV5);
+		}
+
+
+		// Diffuse Fresnel Reflectance (for Ward BRDF only, should be moved in Wardbrdf.mrpr but for the moment that's the only one we're using)
+		// Returns the total amount of light that is NOT specularly reflected by the Ward specular BRDF that can be used for diffuse reflection
+		//	_IOR, the surface's IOR
+		//	_roughness, the surface's roughness
+		//
+		float3	DiffuseFresnelReflectance_Ward( float3 _IOR, float _roughness ) {
+			float	r = _roughness;
+			float	r2 = r*r;
+			float	r3 = r2*r;
+
+			// As you certainlyy know, we have a precomputed Ward BRDF table that is stored in texPreIntegratedBRDF_Ward
+			// It indicates the amount of specular reflection to apply depending on the view angle and the surface's roughness
+			//	and we use it to weigh against irradiance cube maps to know how much of the cube map the material is reflecting.
+			// By summing all contributions from all view angles we can compute the TOTAL specular reflection that now only
+			//	depends on the surface's roughness.
+			// As for the initial table, the results are stored into a float2 because one part is dependent on F0 while the other
+			//	is not. They are later recombined as Value0 + F0 * Value1.
+			//
+			// It turns out this gives us 2 very simple functions easily fit using Mathematica:
+			//
+			//		Base(roughness) ~= 0.181446 - 0.133354 * r - 0.141096 * r^2 + 0.142539 * r^3
+			//		F0(roughness) ~= 0.818887 + 0.156573 * r - 0.669738 * r^2 + 0.262344 * r^3
+			//
+			float	totalSpecularReflection_Base = 0.181446 - 0.133354 * r - 0.141096 * r2 + 0.142539 * r3;
+			float	totalSpecularReflection_F0 = 0.818887 + 0.156573 * r - 0.669738 * r2 + 0.262344 * r3;
+
+			// Recombine into total specular reflection
+			float3	F0 = Fresnel_F0FromIOR( _IOR );
+			float3	totalSpecularReflection = (1.0-r2) * totalSpecularReflection_Base + F0 * totalSpecularReflection_F0;
+
+			// And we're after the complement, the "total diffuse reflection", or rather "what's not specularly reflected" that can get diffusely reflected
+			return 1.0 - totalSpecularReflection;
+		}
+
+
+		// Analytic expression for Fdr as found in eq. 7 of "Rendering Translucent Materials Using Photon Diffusion", Jensen (2007)
+		// Okay-ish while _eta < 2, don't use otherwise
+		//	_eta = IOR_outside / IOR_inside  (so in our typical usage, _eta = 1/Surface_IOR)
+		//
+		float	Fdr_Analytic( float _eta ) {
+			float	rcp_eta = 1.0 / _eta;
+			float	rcp_eta2 = rcp_eta * rcp_eta;
+			float	rcp_eta3 = rcp_eta * rcp_eta2;
+			return _eta >= 1.0  ? saturate( -1.4399 * rcp_eta2 + 0.7099f * rcp_eta + 0.6681f + 0.0636f * _eta )
+								: -0.4399 + 0.7099f * rcp_eta - 0.3319 * rcp_eta2 + 0.0636f * rcp_eta3;
+		}
+
+		// Only for _eta < 1.0 (default usage)
+		float3	Fdr_Analytic_Inf1( float3 _eta ) {
+			float3	rcp_eta = 1.0 / _eta;
+			float3	rcp_eta2 = rcp_eta * rcp_eta;
+			float3	rcp_eta3 = rcp_eta * rcp_eta2;
+			return -0.4399 + 0.7099 * rcp_eta - 0.3319 * rcp_eta2 + 0.0636 * rcp_eta3;
+		}
+		// Only for _eta >= 1.0
+		float3	Fdr_Analytic_Sup1( float3 _eta ) {
+			float3	rcp_eta = 1.0 / _eta;
+			float3	rcp_eta2 = rcp_eta * rcp_eta;
+			return saturate( -1.4399 * rcp_eta2 + 0.7099 * rcp_eta + 0.6681 + 0.0636 * _eta );
+		}
+
+#endif	// #ifndef FRESNEL_INCLUDED
+		// ARKANE_END: bmayaux (2013-11-06) /Fresnel Helpers
+		///////////////////////////////////////////////////////////////////////////////////////////////
+	}
+}

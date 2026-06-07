@@ -1,0 +1,36 @@
+{
+	newstyle
+	options {
+	}
+	state {
+		depthWrite 0		// No Z write
+ 		depthfunc	ALWAYS	// No Z read
+		depthEnable	0
+		cull none
+	}
+	hlsl_prefix {
+		float4 ComputeLinear4Z( in float4 _rawZFromDepthBuffer ) {
+			// optimized version with standard projection
+			float4 one_over_e = -$inverseProjectionMatrix[2].wwww;
+			float4 one_over_d = $inverseProjectionMatrix[3].zzzz;
+			float4 c_over_de = $inverseProjectionMatrix[3].wwww;
+			return one_over_e / ( one_over_d * _rawZFromDepthBuffer + c_over_de );
+		}
+	}
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float4 waterDepthProj = $(downsamplingPS/depthBuffer).Gather( $pointClamp, $texcoord, 0.0f );
+		float4 waterDepthLinear = ComputeLinear4Z( waterDepthProj );
+
+		float2	ZAvgMinMax = 0.0;
+		float2 sampleMin = min(waterDepthLinear.xy, waterDepthLinear.zw);
+		ZAvgMinMax.x = min(sampleMin.x, sampleMin.y);
+		float2 sampleMax = max(waterDepthLinear.xy, waterDepthLinear.zw);
+		ZAvgMinMax.y = max(sampleMax.x, sampleMax.y);
+
+		@sv_target = ZAvgMinMax.xyxy;
+	}
+}

@@ -1,0 +1,22 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 16
+		NUMTHREADY 16
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+	}
+	hlsl_cp_main {
+		uint2	ResolutionSource;
+		uint	ElementsCount, MipLevelsCount;
+		$(areaLights/replaceTexture/texSource).GetDimensions( $(areaLights/replaceTexture/targetMipLevel), ResolutionSource.x, ResolutionSource.y, MipLevelsCount );
+		uint2	ResolutionTarget;
+		@(areaLights/replaceTexture/texTarget).GetDimensions( ResolutionTarget.x, ResolutionTarget.y, ElementsCount );
+
+		if ( all( $sv_dispatchThreadID.xy < ResolutionSource ) && all( $sv_dispatchThreadID.xy < ResolutionTarget ) ) {
+			float4	color = $(areaLights/replaceTexture/texSource).Load( int3( $sv_dispatchThreadID.xy, $(areaLights/replaceTexture/targetMipLevel) ) );
+			@(areaLights/replaceTexture/texTarget)[ uint3( $sv_dispatchThreadID.xy, 0 ) ] = color;
+		}
+	}
+}

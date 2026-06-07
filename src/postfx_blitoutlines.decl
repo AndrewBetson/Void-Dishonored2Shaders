@@ -1,0 +1,26 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		
+		$(PostFX/Luminance/autoExposure_t)  Adaptation = ReadAutoExposureParameters();
+		
+		@sv_target.xyz = RangeCompressColorToR11G11B10( $outlinePrecisionFactor.xxx * $outlineColor.www * $outlineColor.xyz * $(Identity/BufferIn).SampleLevel( $pointMirror, float2( $texcoord.x, $texcoord.y) * $resolutionScale.xy, 0.0f ).xxx / Adaptation.EngineLuminanceFactor );
+		@sv_target.w = 1.0f;
+	}
+}

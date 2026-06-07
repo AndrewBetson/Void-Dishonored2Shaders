@@ -1,0 +1,39 @@
+{
+	newstyle
+
+	state {
+		blend		ONE ZERO
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+	
+	hlsl_prefix {
+		#include <helper>
+	}	
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoords.xy = 0.5f.xx * float2(1.f,-1.f) * $vertex_position.xy + 0.5f.xx;
+		@texcoords.zw = float2(0, 0);
+	}
+	hlsl_fp_main {
+		float4 originalPixel = $viewColorMap.Sample( $bilinearClamp, $texcoords.xy );
+		originalPixel.xyz = RangeExpandColorFromR11G11B10( originalPixel.xyz );
+		
+		float maskFetch = $(PostFX/colorGrading/masking).Sample( $bilinearClamp, $texcoords.xy ).r;
+		
+		#if $(PostFX/colorGrading/invert)
+			float mask = maskFetch;
+		#else
+			float mask = 1.0 - maskFetch;
+		#endif
+		
+		float4 colorGrey = float4( max(originalPixel.x, max(originalPixel.y,originalPixel.z)).xxx, originalPixel.w );
+		
+		float4 result = lerp(originalPixel, colorGrey, mask * $(PostFX/colorGrading/greyAmount).x);
+		@sv_target.xyz = RangeCompressColorToR11G11B10( result.xyz );
+		@sv_target.w = result.w;
+	}
+}

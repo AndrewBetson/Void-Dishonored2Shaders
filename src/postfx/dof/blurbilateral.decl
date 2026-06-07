@@ -1,0 +1,60 @@
+{
+	newstyle
+
+	parms {
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		float4 offsets0 = $(PostFX/DOF/Blur/Offset0);
+		float4 offsets1 = $(PostFX/DOF/Blur/Offset1);
+		float4 offsets2 = $(PostFX/DOF/Blur/Offset2);
+		float4 offsets3 = $(PostFX/DOF/Blur/Offset3);
+
+		@legacy_texcoord.xy  = $vertex_texcoord + offsets0.xy;
+		@legacy_texcoord.zw  = $vertex_texcoord + offsets0.zw;
+		@legacy_texcoord1.xy = $vertex_texcoord + offsets1.xy;
+		@legacy_texcoord1.zw = $vertex_texcoord + offsets1.zw;
+		@legacy_texcoord2.xy = $vertex_texcoord + offsets2.xy;
+		@legacy_texcoord2.zw = $vertex_texcoord + offsets2.zw;
+		@legacy_texcoord3.xy = $vertex_texcoord + offsets3.xy;
+		@legacy_texcoord3.zw = $vertex_texcoord + offsets3.zw;
+	}
+
+	hlsl_fp_main {
+		//Weight
+		float weight0 = $(PostFX/DOF/Blur/Weight0).x;
+		float weight1 = $(PostFX/DOF/Blur/Weight1).x;
+		float weight2 = $(PostFX/DOF/Blur/Weight2).x;
+		float weight3 = $(PostFX/DOF/Blur/Weight3).x;
+		float weight4 = $(PostFX/DOF/Blur/Weight4).x;
+		float weight5 = $(PostFX/DOF/Blur/Weight5).x;
+		float weight6 = $(PostFX/DOF/Blur/Weight6).x;
+		float weight7 = $(PostFX/DOF/Blur/Weight7).x;
+
+		//Fetch
+		float result;
+		result  = $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord.xy,  0.0 ).x * weight0;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord.zw,  0.0 ).x * weight1;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0 ).x * weight2;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0 ).x * weight3;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord2.xy, 0.0 ).x * weight4;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord2.zw, 0.0 ).x * weight5;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord3.xy, 0.0 ).x * weight6;
+		result += $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $legacy_texcoord3.zw, 0.0 ).x * weight7;
+
+	@sv_target = result.xxxx;
+	}
+}

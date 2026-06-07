@@ -1,0 +1,62 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <cubeMap/generateMips/Common>
+	}
+	hlsl_cp_main {
+		uint2	Resolution;
+		uint	ArraySize;
+		@(cubeMap/generateMips/targetMip).GetDimensions( Resolution.x, Resolution.y, ArraySize );
+		
+		uint2	Position = uint2( NUMTHREADX, NUMTHREADY ) * $sv_groupID.xy + $sv_groupThreadId.xy;
+		if ( any( Position >= Resolution ) )
+			return;	// Out of range
+
+		uint	CubeFaceIndex = uint( $(cubeMap/generateMips/parameters).y );
+
+		// Compute the total amount of pixels from one side to the other side of the cube if we split the hemicube with a plane.
+		// This roughly corresponds to the amount of pixels we would span if we had an aperture angle of PI
+		// That will help us determine the amount of samples to take based on actual required aperture angle...
+		//
+		//			 Full
+		//		  ___________
+		//		 |           |
+		//  Half |           | Half
+		//		 |...........|
+		//
+		uint	CubeSize = Resolution.x;
+		uint	TotalPixels = CubeSize / 2	// Half a cube size on the left
+							+ CubeSize		// A full cube size on the top
+							+ CubeSize / 2;	// Half a cube size on the right
+
+		float	Alpha = $(cubeMap/generateMips/parameters).x;
+		uint	SamplesCountTheta = uint( ceil( SAMPLES_FACTOR * TotalPixels * Alpha * INVPI ) );	// A simple ratio based on the total pixels if we had a PI aperture...
+
+		float4x4	Face2World = float4x4( $(cubeMap/generateMips/face2WorldX), $(cubeMap/generateMips/face2WorldY), $(cubeMap/generateMips/face2WorldZ), $(cubeMap/generateMips/face2WorldW) );
+
+		// Compute world space matrix for our rays
+		float2	UV = 2.0 * float2( 0.5+Position ) / Resolution - 1.0;
+				UV.y = -UV.y;
+
+		float3	tsN = normalize( float3( UV, -1.0 ) );
+		float3	tsT = normalize( cross( float3( 0, 1, 0 ), tsN ) );
+		float3	tsB = cross( tsN, tsT );
+
+		float3	wsN = mul( Face2World, float4( tsN, 0.0 ) ).xyz;
+		float3	wsT = mul( Face2World, float4( tsT, 0.0 ) ).xyz;
+		float3	wsB = mul( Face2World, float4( tsB, 0.0 ) ).xyz;
+
+		float	RandomSeed = dot( Position, float2( 0.123456789, 0.91879213 ) );
+
+		float4	Result = ImportanceSample( Alpha, wsN, wsT, wsB, SamplesCountTheta, RandomSeed );
+
+//Result = $(cubeMap/generateMips/sourceMip).SampleLevel( $anisotropicSampler, wsN, 0.0 );
+
+		@(cubeMap/generateMips/targetMip)[uint3( Position, CubeFaceIndex )] = Result;
+	}
+}

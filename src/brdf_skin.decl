@@ -1,0 +1,265 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef BRDF_SKIN_INCLUDED
+		#define BRDF_SKIN_INCLUDED
+		#define BRDF_OK	1			// Every BRDF include file must define this so we can easily spot the shaders that forgot to include a BRDF model!
+		#define	BRDF_SKIN	1
+
+		// Translucency needs both shadow transforms!
+		#if $(translucency_hq/enable)
+			#define	SHADOW_INVERSE_TRANSFORM_REQUIRED	1
+		#endif
+
+		//////////////////////////////////////////////////////////////
+		// Retrieves the values of the pre-integrated BRDF (cf. http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)
+		//	_VdotN, dot( View, Normal )
+		//	_SurfaceRoughness, the surface roughness in [0,1]
+		//
+		// Returns a scale (X) and bias (Y) value to use in the following manner:
+		//
+		//	float3	PreFilteredIrradiance = SampleIBL( Direction, Roughness );	// Or any other source of irradiance
+		//	float3	CorrectedPreFilteredIrradiance = PreFilteredIrradiance * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y);
+		//
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness ) {
+			return $texPreIntegratedBRDF_Ward.SampleLevel( $bilinearClamp, float2( _VdotN, _SurfaceRoughness ), 0.0 ).xy;
+		}
+
+		// ================================================================================================
+		// Skin additional surface info
+		#define	BRDF_SURFACE_INFO_OK	1
+		struct BRDFSurfaceInfo {
+		
+			float dummy; //Workaround a shader compiler bug (to be fixed soon by sony) where an empty struct cause an internal compiler error
+
+			#if $(translucency_hq/useFakeNormalMap)
+				float3		wsFakeTranslucencyNormal;
+			#endif
+			
+			#if $(SSS/useSecondarySpecular)
+				float		secondaryRoughness;
+				float		thirdRoughness;
+			#endif
+
+			void	Clear() {
+				dummy = 0.0f;
+				
+				#if $(translucency_hq/useFakeNormalMap)
+					wsFakeTranslucencyNormal = float3(0,0,0);
+				#endif
+				
+				#if $(SSS/useSecondarySpecular)
+					secondaryRoughness = 0.0f;
+					thirdRoughness = 0.0f;
+				#endif
+			}
+		};		
+		
+		#include <surfaceContext>	// Contains information about the surface
+		#include <lightContext>		// Contains information about the light
+		#include <areaLight>
+		#include <ward>				// Ward specular model
+		#include <fresnel>
+		#include <colorimetry>
+		#include <translucency>
+		#include <orenNayar>
+
+		// ================================================================================================
+		// Skin specifics
+
+		struct BRDF {
+
+			WardContext			m_ward;				//	Contains all the information to compute the Ward specular model
+			#if $(SSS/useSecondarySpecular)
+				WardContext		m_secondaryWard;	// Add a second specular term for hair
+				WardContext		m_thirdWard;		// Add a third specular term for hair
+			#endif
+			float3				m_sheenColor;
+
+			//////////////////////////////////////////////////////////////
+			// BRDF Initialization
+			void	Init( in SurfaceContext _Surface ) {
+
+				// Create the ward context for our BRDF
+				CreateWardContext( m_ward, _Surface.roughness );
+
+				#if $(SSS/useSecondarySpecular)
+					// Secondary specular					
+					CreateWardContext( m_secondaryWard, _Surface.userData.secondaryRoughness  );
+					CreateWardContext( m_thirdWard, _Surface.userData.thirdRoughness );
+				#endif
+
+				// Compute sheen color
+				m_sheenColor = ComputeSheenColor( _Surface.diffuseAlbedo, _Surface.sheen );	// A sheen of -1 will show desaturated color, a sheen of +1 will show fully saturated color
+			}
+	
+			float DiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+				return ComputeOrenNayar( _Surface.wsNormal, _Light.m_wsToLight, _Surface.wsView, _Surface.roughness );
+			}
+			
+			#if $hasDiffuseLookup
+				float3	ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+					float ndotl = DiffuseTerm( _Surface, _Light );
+					return INVPI * $diffuseLookup.SampleLevel( $bilinearClamp, float2( ndotl, 0.5 ), 0 ).rgb;
+				}
+			#else
+				// =================================================================
+				// Standard case
+				float3	ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+					return INVPI * DiffuseTerm( _Surface, _Light );
+				}
+			#endif
+
+
+			//////////////////////////////////////////////////////////////
+			// Main lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the light
+			//
+			void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light ) {
+				#if $(translucency/enable) || $(translucency_hq/enable)
+					bool isTranslucent = true;
+				#else
+					bool isTranslucent = false;
+				#endif
+
+				if ( _Light.m_attenuation > 0.0 && (isTranslucent || _Light.m_shadow > 0.0) ) {
+					float3	View = _Surface.wsView;
+					float3	Light = _Light.m_wsToLight;
+					float3	Normal = _Surface.wsNormal;	// Specular normal
+					float3	Half_unorm = View + Light;
+					float3	Half = normalize( Half_unorm );
+
+					float	LdotN = saturate( dot( Light, Normal ) );
+					float	VdotN = saturate( dot( View, Normal ) );
+					float	LdotH = dot( Light, Half );
+
+					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+					float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+					float3	Irradiance_shadowed = _Light.m_shadow * cloudShadow * Irradiance;
+
+					// =================================================================
+					// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+					float3	FresnelSpecular = FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength );
+					FresnelSpecular *= _Light.m_SpecularAttn; // Apply attenuation factor from artist settings. (cf. dlaurent for more infos)
+					float3	FresnelDiffuse = 1.0 - FresnelSpecular;	// Diffuse Fresnel is always left with what has not been specularly reflected...
+
+					// ====== Diffuse lighting ======
+					float3	diffuseTerm = lerp( _Surface.diffuseAlbedo, m_sheenColor, _Surface.roughness * pow( FresnelSchlick(VdotN), _Surface.sheenImportance ) );
+							diffuseTerm *= ComputeDiffuseTerm( _Surface, _Light );
+					_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * diffuseTerm;
+
+					// ====== Specular lighting ======
+					#if $(SSS/useSecondarySpecular)
+						float primarySpecularTerm = m_ward.ComputeWardTerm( Normal, Light, View ) * $(SSS/tweakSpecularIntensity).x;
+						float secondarySpecularTerm = m_secondaryWard.ComputeWardTerm( Normal, Light, View ) * $(SSS/tweakSpecularIntensity).y;
+						float thirdSpecularTerm = m_thirdWard.ComputeWardTerm( Normal, Light, View ) * $(SSS/tweakSpecularIntensity).z;
+
+						float specularTerm = ( primarySpecularTerm + secondarySpecularTerm + thirdSpecularTerm ) * LdotN; //Not energy conservative !
+					#else
+						float specularTerm = m_ward.ComputeWardTerm( Normal, Light, View ) * LdotN * $(SSS/tweakSpecularIntensity).x;
+					#endif
+
+					_Result.accumSpecular += FresnelSpecular * Irradiance_shadowed * specularTerm;
+
+					#if $(fuzz/enable)
+						float fuzz = pow( 1.0f - VdotN, $(fuzz/fresnel) ) * $(fuzz/intensity);
+						#if $(fuzz/hasMask)
+							fuzz *= _Surface.fuzzMask;
+						#endif
+						_Result.accumSpecular += Irradiance_shadowed * fuzz * LdotN;
+					#endif
+
+					// =================================================================
+					// Translucency
+					#if $(translucency_hq/enable)
+						if ( _Light.m_ShadowSetup != 0xFFFFFFFF ) {
+							float3 shadowWSPos = GetShadowMapZandPos(
+									_Surface.wsPosition,
+									_Surface.wsVertexNormal,
+									_Light.m_shadowInfo.mWorldToShadowMat,
+									_Light.m_shadowInfo.mShadowToWorldMat,
+									SHADOW_SLICE_INDEX(_Light.m_shadowInfo.mInfo),
+									_Light.m_isDirectionalLight );
+
+							float3 wsNormal;
+							#if $(translucency_hq/useFakeNormalMap)
+								wsNormal = _Surface.userData.wsFakeTranslucencyNormal;
+							#else
+								wsNormal = _Surface.wsNormal;
+							#endif
+
+							float3 translucency = SSSTransmittance( _Surface.translucency, wsNormal, _Surface.wsPosition, shadowWSPos, Light );
+							// I know that translucency is not really diffuse lighting but since it will be outputed in the same target as diffuse in order to get blurred
+							_Result.accumDiffuse += _Surface.diffuseAlbedo * translucency * _Light.m_attenuation * _Light.m_color;
+						}
+					#endif
+				}
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Area light lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the area light
+			//	_BaseLight, standard information about the original light
+			//
+			void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight ) {
+
+				// Standard lighting
+				COMPUTE_AREA_LIGHT_LIGHTING( _Result, _Surface, _Light );
+
+				// =================================================================
+				// Translucency
+				#if $(translucency_hq/enable)
+				if ( _BaseLight.m_ShadowSetup != 0xFFFFFFFF ) {
+					float3 shadowWSPos = GetShadowMapZandPos(
+						_Surface.wsPosition,
+						_Surface.wsNormal,
+						_BaseLight.m_shadowInfo.mWorldToShadowMat,
+						_BaseLight.m_shadowInfo.mShadowToWorldMat,
+						SHADOW_SLICE_INDEX(_BaseLight.m_shadowInfo.mInfo),
+						_BaseLight.m_isDirectionalLight );
+
+					//thickness is computed with z-buffer and shadow depth
+					float3 translucency = SSSTransmittance( _Surface.translucency, _Surface.wsNormal, _Surface.wsPosition, shadowWSPos, _Light.m_wsLight );
+					// I know that translucency is not really diffuse lighting but since it will be outputed in the same target as diffuse in order to get blurred
+					_Result.accumDiffuse += _Surface.diffuseAlbedo * translucency* _Light.m_irradianceDiffuse * _Light.m_attenuation * _Light.m_color;
+				}
+				#endif
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Indirect/Ambient lighting computation
+			float3	ComputeSkinAmbientLighting( SurfaceContext _Surface, float _AO, const uint _quality ) {
+				float3	wsOriginalVertexTangent = _Surface.wsVertexTangent;
+				float3	wsOriginalVertexBiTangent = _Surface.wsVertexBiTangent;
+				float3	wsOriginalVertexNormal = _Surface.wsVertexNormal;
+				float3	AmbientTerm = 0.0;
+
+				#if $(translucency_hq/enable)
+					float3 wsNormal = lerp( _Surface.wsNormal, _Surface.wsView, _Surface.translucency );
+					AmbientTerm = UnPackSHPrincipalDirections( wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+				#else
+					// Let the SH compute the irradiance
+					AmbientTerm = UnPackSHPrincipalDirections( _Surface.wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+				#endif
+
+				float3	Fdr = DiffuseFresnelReflectance_Ward( _Surface.IOR, _Surface.roughness );
+				return INVPI * _Surface.diffuseAlbedo * Fdr * AmbientTerm;
+			}
+
+			void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality ) {
+				float AO = ComputeAmbientOcclusion( _Surface, _Surface.AO.x, _ssao );
+				_Result.accumAmbient += ComputeSkinAmbientLighting( _Surface, AO, _quality );
+				
+				#if !$buildingEnvironmentProbe
+					_Result.accumSpecular += AO * $(SSS/tweakSpecularIntensity).w * COMPUTE_IBL( _Surface, _quality );
+				#endif
+			}
+		};
+
+		#endif	// #ifndef BRDF_SKIN_INCLUDED
+	}
+}

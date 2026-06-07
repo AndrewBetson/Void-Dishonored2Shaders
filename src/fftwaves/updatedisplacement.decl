@@ -1,0 +1,35 @@
+{
+	newstyle
+	
+	state {
+		cull none
+		depthFunc always
+		depthWrite 0
+	}
+	
+	options {
+	}
+	
+	hlsl_prefix {		
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+			
+		uint index_x = $sv_position.x; //(uint)(In.TexCoord.x * (float)$(FFTWaves/OutSize).x );
+		uint index_y = $sv_position.y; //(uint)(In.TexCoord.y * (float)$(FFTWaves/OutSize).y );
+		uint addr = $(FFTWaves/OutSize).x * index_y + index_x;
+
+		// cos(pi * (m1 + m2))
+		int sign_correction = ((index_x + index_y) & 1) ? -1 : 1;
+
+		float dx = $(FFTWaves/InputDxyz)[ addr + $(FFTWaves/DtAddressOffset).x ].x * sign_correction * $(FFTWaves/Choppiness);
+		float dy = $(FFTWaves/InputDxyz)[ addr + $(FFTWaves/DtAddressOffset).y ].x * sign_correction * $(FFTWaves/Choppiness);
+		float dz = $(FFTWaves/InputDxyz)[ addr ].x * sign_correction;
+
+		@sv_target = float4( dx, dy, dz, 1 );
+	}
+}

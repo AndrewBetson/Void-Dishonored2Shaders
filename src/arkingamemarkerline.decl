@@ -1,0 +1,24 @@
+{
+	newstyle
+
+	parms {
+		stageSort	sortPostTonemap
+	}
+	state {
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		cull none
+	}
+
+	hlsl_vp_main {
+		@sv_position.x = dot( float4($vertex_position.xyz,1), $mvpMatrixX );
+		@sv_position.y = dot( float4($vertex_position.xyz,1), $mvpMatrixY );
+		@sv_position.z = dot( float4($vertex_position.xyz,1), $mvpMatrixZ );
+		@sv_position.w = dot( float4($vertex_position.xyz,1), $mvpMatrixW );
+		@legacy_texcoord = float4( $vertex_texcoord.xy, 0, 0 );
+	}
+
+	hlsl_fp_main {
+		float2 uv = $legacy_texcoord.xy * $Layer0_ScaleBias.xy + $Layer0_ScaleBias.zw;
+		@sv_target = $diffuseMap.Sample( $bilinearSampler, uv );
+	}
+}

@@ -1,0 +1,181 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		#ifndef		POSTFX_DEBUG_DRAWDIGITS_INCLUDED
+		#define		POSTFX_DEBUG_DRAWDIGITS_INCLUDED
+
+		static const int	DEBUG_DRAW_DIGIT_HEIGHT = 6;	// Digits are 6 pixels high
+
+		// Usage:
+		// Call MyColor = drawNumber( NumberToDisplay, PixelPosition );	// Returns 1 if pixel should be lit
+		//	
+		//	_Position, the current screen position (in pixels)
+		//	_TextScale, the text's scale factor
+		//
+		// Measures the amount of pixels that will be used to draw the number
+		float2	measureStringSize( float _Number, float _TextScale=1.0 ) {
+			uint	width = 0;
+			bool	on = false;
+
+			// minus sign
+			if( _Number < 0.0 ) {
+				width += 4;
+				_Number = -_Number;
+			}
+			// tens of thousands
+			float d = floor(fmod(_Number/10000.,10.0));
+			if( on || d > 1e-3 ) {
+				width += 4;
+				on = true;
+			}
+			// thousands
+			d = floor(fmod(_Number/1000.,10.0));
+			if( on || d > 1e-3 ) {
+				width += 4;
+				on = true;
+			}
+			// hundreds
+			d = floor(fmod(_Number/100.,10.0));
+			if( on || d > 1e-3 ) {
+				width += 4;
+				on = true;
+			}
+			// tens
+			d = floor(fmod(_Number/10.,10.0));
+			if( on || d > 1e-3 ) {
+				width += 4;
+				on = true;
+			}
+			// ones
+			d = floor(fmod(10.0*_Number,10.0));
+			width += 4;
+			// dec pt
+			width += 2;
+			// tenths
+			width += 4;
+			// hundredths
+			d = floor(.5+fmod(100.0*_Number,10.0));
+			if( d > 1e-3 )
+				width += 4;
+			// thousandths
+			d = floor(.5+fmod(1000.0*_Number,10.0));
+			if( d > 1e-3 )
+				width += 4;
+
+			return _TextScale * float2( width, DEBUG_DRAW_DIGIT_HEIGHT );
+		}
+
+		//-------------------------------------------------------------------------------------------------------------------------------
+		// Pre-declaration
+		float drawDecPt( int2 _Position );
+		float drawMinus( int2 _Position );
+		float drawDigit( uint _digit, int2 _Position );
+
+		// max num width is 38px (minus, 5 nums, dec pt, 3 nums)
+		// max height is 6px
+		float	drawNumber( float _Number, int2 _Position, float _TextScale=1.0 ) {
+			float	result = 0.;
+			bool	on = false;
+			float	d;
+
+			_Position = (int2)(float2(_Position)/_TextScale);
+
+			// minus sign
+			if( _Number < 0.0 ) {
+				result += drawMinus( _Position );
+				_Position.x -= 4U;
+				_Number = -_Number;
+			}
+			// tens of thousands
+			d = floor(fmod(_Number/10000.0,10.0));
+			if( on || d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+				on = true;
+			}
+			// thousands
+			d = floor(fmod(_Number/1000.0,10.0));
+			if( on || d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+				on = true;
+			}
+			// hundreds
+			d = floor(fmod(_Number/100.0,10.0));
+			if( on || d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+				on = true;
+			}
+			// tens
+			d = floor(fmod(_Number/10.0,10.0));
+			if( on || d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+				on = true;
+			}
+			// ones
+			d = floor(fmod(_Number,10.0));
+			result += drawDigit( d, _Position );
+			_Position.x -= 4U;
+			// dec pt
+			result += drawDecPt( _Position );
+			_Position.x -= 2U;
+			// tenths
+			d = floor( fmod(10.0*_Number,10.0) );
+			if( true ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+			}
+			// hundredths
+			d = floor( fmod(100.0*_Number,10.0) );
+			if( d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+			}
+			// thousandths
+			d = floor( fmod(1000.0*_Number,10.0) );
+			if( d > 1e-3 ) {
+				result += drawDigit( d, _Position );
+				_Position.x -= 4U;
+			}
+
+			return saturate( result );
+		}
+
+		float drawDig( int2 _Position, uint bitfield ) {
+			// Test if we're currently standing in the digit's rectangle
+			int2	ic = _Position;
+			if ( ic.x >= 0 && ic.x < 3 && ic.y > 0 && ic.y < DEBUG_DRAW_DIGIT_HEIGHT ) {
+				uint	bitIndex = uint( (DEBUG_DRAW_DIGIT_HEIGHT-1-ic.y)*3 + ic.x );	// compute 1d bitindex from 2d position
+				return (bitfield >> bitIndex) & 1;				// isolate the bit
+			}
+			return 0.0;
+		}
+		// decimal point
+		float drawDecPt( int2 _Position ) {
+			return drawDig( _Position, 1U );
+		}
+		// minus sign
+		float drawMinus( int2 _Position ) {
+			return drawDig( _Position, 448U );
+		}
+		// digits 0 to 9
+		float drawDigit( uint _digit, int2 _Position ) {
+			if( _digit == 1U ) return drawDig( _Position, 18724U );
+			if( _digit == 2U ) return drawDig( _Position, 31183U );
+			if( _digit == 3U ) return drawDig( _Position, 31207U );
+			if( _digit == 4U ) return drawDig( _Position, 23524U );
+			if( _digit == 5U ) return drawDig( _Position, 29671U );
+			if( _digit == 6U ) return drawDig( _Position, 29679U );
+			if( _digit == 7U ) return drawDig( _Position, 31012U );
+			if( _digit == 8U ) return drawDig( _Position, 31727U );
+			if( _digit == 9U ) return drawDig( _Position, 31719U );
+			return drawDig( _Position, 31599U );	// 0
+		}
+
+		#endif	//	POSTFX_DEBUG_DRAWDIGITS_INCLUDED
+	}
+}

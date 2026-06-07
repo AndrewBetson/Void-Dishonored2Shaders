@@ -1,0 +1,146 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	LUM_HISTOGRAM_INSET_WIDTH = 0.3;	// Size of the histogram inset in UV space (1 means the entire screen!)
+		static const float	LUM_HISTOGRAM_INSET_HEIGHT = 0.25;	// Size of the histogram inset in UV space (1 means the entire screen!)
+
+		#include <PostFX/Debug/DrawDigits>
+		
+		float	DrawGraduationText( float2 _UV, float _Value, int _GraduationIndex ) {
+			float2	HistogramResolution_pixels = (float2( LUM_HISTOGRAM_INSET_WIDTH, LUM_HISTOGRAM_INSET_HEIGHT ) / $positionToViewTexture.zw);
+			int2	Pos_pixels = (int2)(_UV * HistogramResolution_pixels);
+
+			float	GraduationX_pixels = round(HistogramResolution_pixels.x) * _GraduationIndex / SCENE_LUMINANCE_MAGNITUDE_ORDERS;
+			float	TextWidth_pixels = measureStringSize( _Value, 2.0 ).x;
+			float	TexPosLeft_pixels = GraduationX_pixels - 0.5 * TextWidth_pixels;
+
+			return drawNumber( _Value, Pos_pixels - int2( TexPosLeft_pixels, 10.0 ), 2.0 );
+		}
+
+		// Displays the luminance histogram as computed by the auto-exposure algorithm
+		// You can hover the mouse cursor on the histogram to highlight a specific range of luminance on screen
+		//	and also see an "out of bounds" checker board whenever the luminance is below or above the LDR range...
+		//
+		void	DEBUG_DisplayLuminanceHistogram( float2 _UV, inout float3 _Color, float3 _OriginalColor, float _debugLuminanceLevel ) {
+			$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();
+
+			float	ScreenWorldLuminance = ARKANE_TO_WORLD_LUMINANCE * dot( LUMINANCE, _OriginalColor );
+
+			// Debug on screen luminances that are over- or under-exposed
+			if ( $mouseCursorPosition.z < LUM_HISTOGRAM_INSET_WIDTH && $mouseCursorPosition.w > 1.0-LUM_HISTOGRAM_INSET_HEIGHT ) {
+				#if 1
+					// Show an ugly scrolling checker board
+					if ( ScreenWorldLuminance < Adaptation.MinLuminanceLDR || ScreenWorldLuminance > Adaptation.MaxLuminanceLDR ) {
+						uint2	PixelPos = uint2( floor( _UV / $positionToViewTexture.zw + 20.0 * $time.x ) );
+								PixelPos >>= 2;
+						_Color = lerp( float3( 0, 0, 0 ), float3( 1, 1, 0 ), (PixelPos.x ^ PixelPos.y) & 1 );
+					}
+				#else
+					// Show blue/red zones
+					if ( ScreenWorldLuminance < Adaptation.MinLuminanceLDR )
+//						_Color.yz += 0.05 * float2( 1, 2 );		// Blue-ize under-exposed areas
+						_Color = float3( 0, 0.0, 0.4 );
+					if ( ScreenWorldLuminance > Adaptation.MaxLuminanceLDR )
+//						_Color.yz -= 0.8 * float2( 0.8, 1.0 );	// Red-ize over-exposed areas
+						_Color = float3( 0.9, 0, 0 );
+				#endif
+			}
+
+			// Show debug luminance value
+			if ( _debugLuminanceLevel > 0.0 ) {
+				float	Color_dB = Luminance2dB( ScreenWorldLuminance );
+				float	Debug_dB = Luminance2dB( _debugLuminanceLevel );
+				if ( abs( Color_dB - Debug_dB ) < 0.4 ) {
+					uint2	PixelPos = uint2( floor( _UV / $positionToViewTexture.zw + 20.0 * $time.x ) );
+							PixelPos >>= 2;
+					_Color = lerp( float3( 1, 0, 0 ), float3( 0, 0, 1 ), (PixelPos.x ^ PixelPos.y) & 1 );
+				}
+			}
+
+			// Debug on screen luminances by pointing the histogram with the mouse
+			if ( $mouseCursorPosition.z < LUM_HISTOGRAM_INSET_WIDTH && $mouseCursorPosition.w > 1.0-LUM_HISTOGRAM_INSET_HEIGHT ) {
+				float2	MouseUV = float2( $mouseCursorPosition.z / LUM_HISTOGRAM_INSET_WIDTH, ($mouseCursorPosition.w - 1.0 + LUM_HISTOGRAM_INSET_HEIGHT) / LUM_HISTOGRAM_INSET_HEIGHT );
+				float	fHistoBucketIndex = HISTOGRAM_BUCKETS_COUNT * MouseUV.x;
+				float	HistoLuminance = MIN_ADAPTABLE_SCENE_LUMINANCE * dB2Luminance( fHistoBucketIndex * HISTOGRAM_BUCKET_RANGE_DB );
+				float	ArkaneLuminance = WORLD_TO_ARKANE_LUMINANCE * HistoLuminance;
+
+				float	ScreenLuminance = dot( LUMINANCE, _OriginalColor );
+				_Color = lerp( float3( 1, 0, 0 ), _Color, saturate( 10.0 * abs( ScreenLuminance - ArkaneLuminance ) / ArkaneLuminance ) );
+			}
+
+			if ( _UV.x < LUM_HISTOGRAM_INSET_WIDTH && _UV.y > 1.0-LUM_HISTOGRAM_INSET_HEIGHT ) {
+				// Renormalize UVs
+				_UV.x /= LUM_HISTOGRAM_INSET_WIDTH;
+				_UV.y = (_UV.y - 1.0+LUM_HISTOGRAM_INSET_HEIGHT) / LUM_HISTOGRAM_INSET_HEIGHT;
+
+				// Determine histogram factors from screen's resolution
+				uint	Width = 1.0 / $positionToViewTexture.z;
+				uint	Height = 1.0 / $positionToViewTexture.w;
+				uint	TotalPixels = Width * Height;								// Highest possible histogram peak
+				float	AveragePixelsCount = float(TotalPixels) / HISTOGRAM_BUCKETS_COUNT;	// Average peak size if all pixels were distributed over the entire histogram
+				float	HistoFactor = 3.0 / AveragePixelsCount;						// Multiplied by 3.0 for good measure
+
+				// Display the histogram
+				float	fHistoBucketIndex = HISTOGRAM_BUCKETS_COUNT * _UV.x;
+				uint2	HistoPos = uint2( floor( fHistoBucketIndex ), 0 );//$mouseCursorPosition.w * H / 4 );
+
+// We could lerp the histogram but I suspect we'll miss some infos...
+// 		 		float	HistoValue0 = saturate( HistoFactor * $(PostFX/Luminance/texHistogram)[HistoPos].x );
+// 		 		float	HistoValue1 = saturate( HistoFactor * $(PostFX/Luminance/texHistogram)[HistoPos+uint2(1,0)].x );
+// 				float	HistoValue = lerp( HistoValue0, HistoValue1, smoothstep( 0, 1, fHistoBucketIndex - HistoPos.x ) );
+
+// So instead we use the square value...
+				float	HistoValue = saturate( HistoFactor * $(PostFX/Luminance/texHistogram)[HistoPos].x );
+
+				// Check if we're within adapted range
+				// Retrieve the luminance represented by the current histogram column
+				float	HistoLuminance = HistogramBucketIndex2Luminance( fHistoBucketIndex );
+				float	InRange = HistoLuminance > Adaptation.MinLuminanceLDR && HistoLuminance < Adaptation.MaxLuminanceLDR ? 1.0 : 0.0;
+				float	InRangeUnitWhiteLevel = HistoLuminance > Adaptation.MinLuminanceLDR && HistoLuminance < Adaptation.MinLuminanceLDR * TARGET_MONITOR_LUMINANCE_RANGE ? 1.0 : 0.0;
+
+				// Compute histogram background color with graduations
+				float3	BackgroundColor = lerp( 0.2, 0.7, _UV.x );																			// Nice gradient background
+						BackgroundColor *= lerp( 1.0, lerp( float3( 0.4, 0.6, 0.4 ), 0.6, InRangeUnitWhiteLevel ), InRange );				// Darken when in range, special color when above unit white level
+
+				float	IsGraduation = saturate( fmod( fHistoBucketIndex, HISTOGRAM_BUCKETS_COUNT / SCENE_LUMINANCE_MAGNITUDE_ORDERS ) );	// The division by 7 is there because we're visualizing 7 orders of magnitude in luminance (from 10^-2 to 10^5)
+				float	IsRef = 0.0;//floor( fHistoBucketIndex / (HISTOGRAM_BUCKETS_COUNT / SCENE_LUMINANCE_MAGNITUDE_ORDERS) ) == 4;		// 4th graduation is 10^2, our reference luminance for 100W lightbulb
+				float3	GraduationColor = lerp( float3( 0.5, 0.0, 0.0 ), float3( 0.0, 0.5, 0 ), IsRef );									// Paint ref graduation in green, others in red
+						GraduationColor = lerp( GraduationColor, BackgroundColor, _UV.y );													// Make a nice gradient to avoid painting dull graduations
+
+				#if 1	// ==== Paint the integral ====
+//					float	CurrentFrameTargetBucket = ComputeStickyIntegralTargetBucket( Adaptation );
+					float	Integral = 0.0;
+					for ( int BucketIndex=0; BucketIndex < TARGET_MONITOR_BUCKETS_COUNT; BucketIndex++ ) {
+						uint	CurrentHistoValue = $(PostFX/Luminance/texHistogram)[uint2( HistoPos.x+BucketIndex, 0)].x;
+//						float	Weight = ComputeStickyIntegralWeight( BucketIndex - CurrentFrameTargetBucket );
+						float	Weight = 1.0;
+						Integral += Weight * CurrentHistoValue;
+					}
+					Integral *= 5.0 / (AveragePixelsCount * TARGET_MONITOR_BUCKETS_COUNT);
+					BackgroundColor = lerp( _UV.y < Integral ? float3( 0.5, 0.3, 0.0 ) : BackgroundColor, BackgroundColor, 0.5 );
+				#endif
+
+				BackgroundColor = lerp( GraduationColor, BackgroundColor, IsGraduation );
+
+				#if 1	// ==== Paint graduation values ====
+					BackgroundColor = DrawGraduationText( _UV, 0.1, 1 ) > 0.5 ? 0 : BackgroundColor;
+					BackgroundColor = DrawGraduationText( _UV, 1.0, 2 ) > 0.5 ? 0 : BackgroundColor;
+					BackgroundColor = DrawGraduationText( _UV, 10.0, 3 ) > 0.5 ? 0 : BackgroundColor;
+					BackgroundColor = DrawGraduationText( _UV, 100.0, 4 ) > 0.5 ? 0 : BackgroundColor;
+					BackgroundColor = DrawGraduationText( _UV, 1000.0, 5 ) > 0.5 ? 0 : BackgroundColor;
+					BackgroundColor = DrawGraduationText( _UV, 10000.0, 6 ) > 0.5 ? 0 : BackgroundColor;
+				#endif
+
+				float3	HistoColor = lerp( float3( 0, 0, 0 ), float3( 0.8, 0, 0 ), InRange );
+				_Color = _UV.y < 1.0 - 0.002 - HistoValue ? BackgroundColor : HistoColor;		// Paint the peak
+
+				// Show debug luminance graduation
+				float	DebugLuminanceHistoBucketIndex = Luminance2HistogramBucketIndex( _debugLuminanceLevel );
+				float	IsDebug = smoothstep( 0.5, 0.0, abs( fHistoBucketIndex - DebugLuminanceHistoBucketIndex ) );
+				_Color = lerp( _Color, float3( 1.0, 0.8, 0.2 ), IsDebug );		// Paint orange line where our debug luminance is
+			}
+		}
+	}
+}

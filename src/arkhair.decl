@@ -1,0 +1,335 @@
+{
+	newstyle
+
+	options {
+		alphatest				1
+		forcePixelShader		1
+		hairType				1
+		translucency_hq/enable	1
+	}
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <BRDF_hair>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+		#include <fogHelpers>
+
+		float3 GetFresnelLUT( float3 wsView, float3 wsNormal ) {
+			#if $useFresnelLUT
+				float fresnel = max( dot( wsView, wsNormal ), 0.0f );
+				float3 fresnelLUT = $hairFresnelLUT.Sample( $anisotropicSampler, float2( fresnel, 0.5f ) ).rgb;
+				return fresnelLUT;
+			#else
+				return 0.0;
+			#endif
+		}
+
+		float3	TransformFlowMapToWorldSpace( float3 _tsDir, float3 _wsTangent, float3 _wsBiTangent, float3 _wsNormal )
+		{
+			float3 wsDir = _tsDir.x * _wsTangent + _tsDir.y * _wsBiTangent + _tsDir.z * _wsNormal;
+			float lnDir = length(wsDir) + 1e-6;
+			wsDir /= lnDir;
+			return wsDir;
+		}
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		#if !$(tool/unlit) && !$isShadow && !$isZPrePass
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		#if !$isMasking && !$isShadow && !$isZPrePass && !$(tool/unlit) && !$isOutline
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+			WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+		#endif
+
+		#if $isZPrePass && !$isZPrePassAlpha
+			//The motion vector generation for motion blur & temporalAA is done here
+			VertexOutContext previousFrameVout = TransformVertex( victx, true );
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+
+		@sv_position = vout._projPosition;
+		#if ( !( $isShadow || $isZPrePass || $isMasking ) || (( $isShadow || $isZPrePass || $isMasking ) && $alphaTest) )
+			@texcoords = vout._texcoords;
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		SurfaceContext	surf;
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isMasking && !$isShadow && !$isZPrePass && !$(tool/unlit) && !$isOutline );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+		surf.Clear();
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if( $isShadow || $isZPrePass || $isMasking )
+			#if $alphaTest
+				#if $useAlphaMap
+					float alpha = $hairAlphaMap.Sample( $anisotropicSampler, $texcoords.xy ).r;
+				#else
+					float alpha = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy ).a;
+				#endif
+				
+				#if $isShadow
+					float mask = (1.0 / 17.0) * (1.0 + B8( uint2( pixelCtx.m_ssPosition.xy + 0.5 + $jitterVectors.xy ) ) / 64.0 );
+					clip( alpha - mask );
+				#else
+					//hair are rendered 2 times in the depth buffer
+					//1) standard depth buffer with alpha-test = 0.9 for help sorting
+					//2) alpha depth buffer with alpha-test = 0.5 for lighting and DOF
+					clip( alpha - $hairAlphaTest );
+				#endif
+			#endif
+
+			#if $isZPrePassDithering
+				ClipZfromDistance( pixelCtx );
+			#endif
+
+			#if $isZPrePass && !$isZPrePassAlpha //Motion vector for TemporalAA
+				float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+				psMotionVector -= $jitterRelativeToPreviousFrame;
+				psMotionVector *= 0.5f;
+				psMotionVector.y *= -1.0f;
+				@sv_target = float4( psMotionVector, 1, 0 );
+			#elif $isMasking
+				@sv_target = $(rendering/masking/bendTimeFactor).x;
+			#endif
+			return;
+		#elif $(tool/unlit)
+			float4 albedo;
+			#if $useAlphaMap
+				albedo.rgb = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy ).rgb;
+				albedo.a = $hairAlphaMap.Sample( $anisotropicSampler, $texcoords.xy ).r;
+			#else
+				albedo = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy );
+			#endif
+
+			float  faceColor = pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+			float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, albedo.a) ) * faceColor, albedo, $wireFrameBlend);
+			#if $alphatest
+				clip( color.a - $wireFrameBlend * 0.5 );
+			#endif
+			@sv_target = color;
+			return;
+		#elif $isOutline
+			// Don't do anything...
+			return;
+		#else
+			
+			ClipZfromDistance( pixelCtx );
+
+			// =======================================================================
+			// Standard Pass
+			HQ_DoParallaxMapping( pixelCtx );
+
+			// =================================================================
+			// Albedo and Ambient occlusion
+			// =================================================================
+			float4 albedo;
+			#if $useAlphaMap
+				albedo.rgb = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy ).rgb;
+				albedo.a = $hairAlphaMap.Sample( $anisotropicSampler, $texcoords.xy ).r;
+			#else
+				albedo = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy );
+			#endif
+
+			#if $alphatest
+				clip( albedo.a - $hairAlphaTest );
+			#endif
+
+			float AOFactor = HQ_FetchAO( $texcoords.xy );
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					albedo.xyz = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			// =================================================================
+			// Irradiance shadowed and blurred
+			// =================================================================
+			#if !$isMainPassAlpha
+				float3 scatteredIrradiance = $hairScatteredIrradiance[(uint2)$sv_position.xy].rgb;
+			#else
+				float3 scatteredIrradiance = 0;
+			#endif
+
+			// =================================================================
+			// TBN
+			// =================================================================
+			float3	wsVertexNormalRaw	= pixelCtx.m_wsVertexNormal;
+			HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+			float3 wsView = pixelCtx.m_wsView;
+			float3 wsNormalIBL = pixelCtx.m_wsNormal;
+
+			// =================================================================
+			// Transmittance
+			// =================================================================
+			float3 specularTex = $hairSpecularMask.Sample( $anisotropicSampler, $texcoords.xy ).rgb;
+			#if $useSpecularMask && $hairTranslucencyType
+				surf.userData.transmittance = specularTex;
+			#else
+				float3	albedoHSV = RGB2HSV( albedo.xyz );
+
+				albedoHSV.x += $(translucencyCoef).y;				// Hue shifting
+				albedoHSV.y *= $(translucencyCoef).x;				// Saturate
+				albedoHSV.z += 0.25 * $(translucencyCoef).x;		// Increase value
+
+				albedoHSV.y = min( albedoHSV.y, 1.0f );
+				albedoHSV.z = min( albedoHSV.z, 1.0f );
+
+				surf.userData.transmittance = HSV2RGB( albedoHSV );			// Now a nice, saturated transmittance-looking color
+			#endif
+
+			// =================================================================
+			// Specular and fresnel
+			// =================================================================
+			float3 specularMask = albedo.aaa;
+			#if $useSpecularMask
+				specularMask *= specularTex;
+			#else
+				specularMask *= saturate(albedo.g * 2.0);
+			#endif
+
+			float fuzzMask = 0.0;
+			#if $(fuzz/enable) && $(fuzz/hasMask)
+				fuzzMask = $(fuzz/mask).Sample( $bilinearSampler, $texcoords.xy ).r;
+			#endif
+
+			float3 fresnelLUT = GetFresnelLUT( wsView, pixelCtx.m_wsNormal );
+			float gloss = HQ_FetchGloss( pixelCtx );
+
+			// =================================================================
+			// Flow map
+			// =================================================================
+			float flowAngle = DegreesToRadians($specularFlowAngle.x);
+			#if $useFlowMap
+				float3  tsFlow = UnpackBC5NormalMap( $hairFlowMap.Sample( $anisotropicSampler, $texcoords.xy ).rg );
+				float3	wsFlow = TransformFlowMapToWorldSpace( tsFlow, pixelCtx.m_wsTangent, pixelCtx.m_wsBiTangent, pixelCtx.m_wsVertexNormal );
+				#if $hasBumpMap
+					flowAngle +=  safeAcos( dot(pixelCtx.m_wsNormal,wsFlow) );
+				#else
+					flowAngle +=  safeAcos( dot(float3(0,0,1),tsFlow) );
+				#endif
+			#endif
+
+			// =================================================================
+			// Noise
+			// =================================================================
+			float noiseShift = 0.0;
+			#if $useSpecularNoiseShift
+				noiseShift = $hairSpecularNoiseShift.Sample( $trilinearSampler, $texcoords.xy * $specularNoiseShiftScale.x ).x - 0.5;
+			#endif
+
+			float noisemask = 1.0;
+			float2 noiseAngle = $texcoords.xy;
+			#if $useSpecularNoiseMask
+				noisemask = $hairSpecularNoiseMask.Sample( $trilinearSampler, noiseAngle * $specularNoiseMaskScale.x ).x;
+			#endif
+
+			// =================================================================
+			// Compute lighting
+			// =================================================================
+			float4 currentPos = float4( pixelCtx.m_ssPosition.x*$positionToViewTexture.z*2.0-1.0, 1.0-pixelCtx.m_ssPosition.y*$positionToViewTexture.w*2.0, pixelCtx.m_ssPosition.z, 1.0 );
+			float4 wsPos = mul( $inverseViewProjectionMatrix, currentPos );
+
+			surf.pixelIndex			= uint2( $sv_position.xy );
+			surf.wsPosition			= $wsPosition.xyz;
+			surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+
+			surf.wsView				= wsView;
+			surf.distance			= pixelCtx.m_distance;
+			surf.wsNormal			= pixelCtx.m_wsNormal;
+			surf.wsTangent			= pixelCtx.m_wsTangent;
+			surf.wsBiTangent		= pixelCtx.m_wsBiTangent;
+			surf.wsVertexNormal		= pixelCtx.m_wsVertexNormal;
+			surf.wsVertexTangent 	= pixelCtx.m_wsVertexTangent;
+			surf.wsVertexBiTangent 	= pixelCtx.m_wsVertexBiTangent;
+			surf.diffuseAlbedo		= albedo.xyz;
+			surf.roughness			= 1.0 - gloss;
+			surf.sheen				= $sheen.x;
+			surf.sheenImportance	= $sheenImportance.x;
+			surf.anisotropyAngle	= flowAngle;
+			surf.IOR				= 1.55; // [Stamm et al. 1977]
+			surf.fresnelStrength	= $fresnelStrength.x;
+			surf.translucency		= 1.0;
+			surf.AO					= AOFactor;
+
+			surf.userData.specularMask				= INVPI * specularMask;
+			surf.userData.IblRoughness				= $hairIBL.x;
+			surf.userData.fresnelLUT				= fresnelLUT;
+			surf.userData.specularNoiseShift		= noiseShift;
+			surf.userData.specularNoiseMask			= noisemask;
+			// lighting context for primary specular
+			surf.userData.primarySpecularPower		= $primarySpecularPower.x;
+			surf.userData.primarySpecularIntensity	= $primarySpecularIntensity.x;
+			surf.userData.primarySpecularShift		= $primarySpecularShift.x;
+			// lighting context for secondary specularspecular
+			surf.userData.secondarySpecularPower	= $secondarySpecularPower.x;
+			surf.userData.secondarySpecularIntensity= $secondarySpecularIntensity.x;
+			surf.userData.secondarySpecularShift	= $secondarySpecularShift.x;
+			// lighting diffuse blurred and transmittance
+			surf.userData.ScatteredIrradiance		= scatteredIrradiance;
+
+			#if $(fuzz/enable) && $(fuzz/hasMask)
+			surf.fuzzMask = fuzzMask;
+			#endif
+
+			HQ_ComputeAO( pixelCtx, surf );
+
+			// Additional infos for indirect lighting
+			FetchIndirectLightingData( pixelCtx, surf );
+
+			// apply material effect
+			effectCtx.ApplyMaterialEffect( pixelCtx, surf );
+
+			// compute BRDF
+			ComputeLightingResult result = IntegrateLighting( surf, HIGH_QUALITY );
+
+			// compute fog
+			result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+			#if $isAlpha && !$isMainPassAlpha
+				writePixel( result.finalizedColor, albedo.rgb, albedo.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+				@sv_target.a = step($hairAlphaTestOpaque,albedo.a) ? 1.0 : albedo.a;
+			#endif
+
+			// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+			#if !$isMainPassAlpha && defined( PC ) && !defined( RETAIL )
+
+				// Debug draw
+				DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+				// Write MRT info for probe rendering
+				#inlinefile <includes/resultOverrideIL.inc>
+				WRITE_IL_MRT( pixelCtx, surf, result )
+
+			#endif //defined( PC )
+
+		#endif
+	}
+}

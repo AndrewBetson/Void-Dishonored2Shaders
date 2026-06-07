@@ -1,0 +1,115 @@
+{
+	newstyle
+	//=============================================================================
+	// HELPERS
+	//=============================================================================
+	hlsl_prefix {
+
+		//-->DEBUG
+		float OLD_ComputeOitWeight(float4 sv_position, in float a)
+		{
+			float w = 1.0;
+			const float colorResistance = $(OIT/Weights).x;
+			const float depthRange = $(OIT/Weights).y;
+			const float orderingStrength = $(OIT/Weights).z;
+			w = pow( 1e-2 + a, colorResistance ) * clamp( $(OIT/Params).z  / (1e-5 + pow( sv_position.w/depthRange, orderingStrength)), 1e-2, 3e3);
+			w *= $(OIT/Weights).w;
+			return w;
+		}
+
+		void OLD_writePixel(float3 finalizedColor, float alpha, float4 sv_position, out float4 outputColor, out float4 outputOpacity ) {
+			const float additiveOpacityCoef = $(OIT/Params).w;
+			const float additiveAlphaTest = $(OIT/Params).y;
+			const float lum = lerp( 1.0, saturate(finalizedColor.g), additiveAlphaTest );
+
+			float alphaLum = alpha * lum;
+			float weight  = OLD_ComputeOitWeight( sv_position, alphaLum );
+			float weighted_opacity = weight * alphaLum;
+
+			outputColor = min( 6000.0, float4( finalizedColor, additiveOpacityCoef ) * weighted_opacity );
+			outputOpacity.r = alphaLum * additiveOpacityCoef;
+			outputOpacity.gba = 0.0;
+		};
+		//<--DEBUG
+
+		float ComputeOitWeight(float4 sv_position, in float4 color ) {
+			//Color resistance - Increase if low-coverage foreground transparent are affecting background transparent color.
+			const float colorResistance = $(OIT/Weights).x;
+			//Depth range - over which significant ordering discrimination is required.
+			//	* Decrease if high-opacity surfaces seem “too transparent”
+			//	* Increase if distant transparent are blending together too much.
+			const float depthRange = $(OIT/Weights).y;
+			//Ordering strength - Increase if background is showing through foreground too much.
+			const float orderingStrength = $(OIT/Weights).z;
+			//Weight Factor - Rescale weight to avoid infinite
+			const float weightFactor = $(OIT/Weights).w;
+			//color Strength - For Particle only - Rescale color to avoid to strong particles on alpha surfaces
+			const float colorStrength = $(OIT/Params).z;
+			//alpha Strength - For Particle only
+			const float alphaStrength = $(OIT/Params).y;
+			//avoid too near color decrease
+			const float distMin = 0.02245;
+
+			//Evaluate color strength
+			float colorLen = length( color );
+			float colorNorm = (colorLen > 0.0) ? 1.0 - dot(color/colorLen, 0.25) : 1.0;
+			colorNorm *= lerp( 1.0, colorStrength, color.a );
+			colorNorm *= lerp( 1.0, color.a, alphaStrength );
+
+			//Evaluate weight
+			float a = pow( 1e-2 + colorNorm, colorResistance);
+			float b = pow( min( distMin, sv_position.z) * depthRange, orderingStrength);
+
+			float w = a * b;
+			w = clamp( w, 1e-2, 3e3);
+			w *= weightFactor;
+
+			return w;
+		}
+
+		void NEW_writePixel(float3 finalizedColor, float3 albedo, float alpha, float4 sv_position, out float4 outputColor, out float4 outputOpacity ) {
+			const float3 LUMINANCE_oit = float3( 0.2126, 0.7152, 0.0722 );
+			const float opacity = $(OIT/Params).w;
+			const float albedoLum = dot( albedo, LUMINANCE_oit );
+			const float additiveLum = ((opacity < 1.0) && (albedoLum < alpha)) ? smoothstep( 0.0, opacity, albedoLum ) : 1.0;
+			const float additiveOpacity = opacity * additiveLum;
+
+			outputOpacity.r = alpha * additiveOpacity;
+			outputOpacity.gba = 0.0;
+
+			float weight  = ComputeOitWeight( sv_position, float4(finalizedColor,alpha) );
+			float weighted_opacity = weight * alpha;
+			outputColor = float4( finalizedColor, additiveOpacity ) * weighted_opacity;
+		};
+
+		void writePixel(float3 finalizedColor, float3 albedo, float alpha, float4 sv_position, out float4 outputColor, out float4 outputOpacity ) {
+			#if defined( RETAIL )
+				NEW_writePixel(finalizedColor, albedo, alpha, sv_position, outputColor, outputOpacity );
+			#else
+				if( $(OIT/Enable) == 0 ) {	//OIT OFF
+					outputColor = float4(finalizedColor, alpha);
+					outputOpacity.r = alpha;
+					outputOpacity.gba = 0.0;
+				} else
+				if( $(OIT/Enable) == 1 ) {	//OIT new weigth function
+					NEW_writePixel(finalizedColor, albedo, alpha, sv_position, outputColor, outputOpacity );
+				} else
+				if( $(OIT/Enable) == 2 ) {	// OIT old weigth function
+					OLD_writePixel(finalizedColor, alpha, sv_position, outputColor, outputOpacity );
+				} else
+				if( $(OIT/Enable) == 3 ) {	// Particle complexity
+					outputColor = float4(1.0,1.0,1.0,0.1);
+					outputOpacity.r = 0.1;
+					outputOpacity.gba = 0.0;
+				} else {					// Particle type (alpha-blend or additive)
+					const float additiveOpacity = $(OIT/Params).w;
+					float3 blending = (additiveOpacity < 1.0) ? float3(1.0,0.0,0.0) : float3(0.0,1.0,0.0);
+					float opacity = (additiveOpacity < 1.0) ? 0.1 : alpha;
+					outputColor = float4( finalizedColor * blending, opacity );
+					outputOpacity.r = opacity;
+					outputOpacity.gba = 0.0;
+				}
+			#endif
+		}
+	}
+}

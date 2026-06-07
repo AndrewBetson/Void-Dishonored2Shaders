@@ -1,0 +1,36 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	options {
+		forcePixelShader 1
+	}
+
+	
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( float3($vertex_position.xyz), 1 );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+		float depth = $(Identity/BufferDepthIn).SampleLevel( $bilinearClamp, $texcoord * $resolutionScale.xy, 0.0f ).r;
+		if(depth < 0.5)
+		{
+			#ifdef PC_MANTLE
+				// ugly workaround.
+				// Mantle pipeline creation fail in this context with only the discard.
+				clip( $alwaysOne - 2 ); 
+			#else
+				discard;
+			#endif
+		}
+	}
+}

@@ -1,0 +1,48 @@
+{
+	newstyle
+
+	parms {
+
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite 0
+		depthfunc	ALWAYS
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+	#if 0
+	// OPTION #1: TO MATCH ORIGINAL SOLUTION - tlf/depthMinMax format RG32ui
+		uint2 _pixelAddr = uint2( $sv_position.xy );
+		uint2 rawViewZsAndMask = $(tlf/depthMinMax)[ _pixelAddr >> $(tlf/tileDimForLighting) ].xy;
+		uint mask = rawViewZsAndMask.y;
+		float viewZFar  = abs(f16tof32( rawViewZsAndMask.x & 0x0000FFFF )); // far
+		float viewZNear = abs(f16tof32( rawViewZsAndMask.x >> 16 )); // near
+	#else
+	// OPTION #2: OPTIMIZED - tlf/depthMinMax format RGBA32f or RGBA32ui
+		uint2 _pixelAddr = uint2( $sv_position.xy );
+		float3 rawViewZsAndMask = $(tlf/depthMinMax)[ _pixelAddr >> $(tlf/tileDimForLighting) ].xzw;
+		uint mask = asuint(rawViewZsAndMask.z);
+		float viewZFar  = abs(rawViewZsAndMask.x); // far
+		float viewZNear = abs(rawViewZsAndMask.y); // near
+	#endif
+
+		float diff = (viewZFar-viewZNear)/viewZFar;
+		float4 color;
+		color.rgb = diff;
+		color.a = 1.00;
+
+		@sv_target = color;
+	}
+}

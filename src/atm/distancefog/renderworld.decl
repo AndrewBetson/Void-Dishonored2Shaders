@@ -1,0 +1,93 @@
+{
+	newstyle
+	state {
+		depthEnable		0
+		depthWrite		0				// No Z write
+ 		depthfunc		ALWAYS			// No Z read
+ 		cull			NONE
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			SRC_ALPHA	ONE_MINUS_SRC_ALPHA
+		alphaBlend		ONE			ONE_MINUS_SRC_ALPHA
+	}
+
+	hlsl_prefix {
+		#include <helper>
+		#include <pixel>
+		#include <fogHelpers>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		// Build the camera ray in world space
+		float3		csView = float3( $globalViewInfos.xy * $vertex_position.xy, -1.0 );	// Remember we look at -Z!
+		float4		View = mul( $inverseViewMatrix, float4( csView, 0.0 ) );	// Now in WORLD space...
+		@vsPosition = View.xyz;
+		@texcoords = float4( $vertex_texcoord.xy*$resolutionScale.xy, 0.f, 0.f );
+	}
+
+	hlsl_fp_main {
+
+		//Don't set fog if 
+		float4 fogMasks = 1.0-$(atm/distanceFog/TexSkyCloudsDensity).GatherRed( $bilinearSampler, $texcoords.xy );
+		float2 fogMin = min(fogMasks.xy, fogMasks.zw);
+		float tmp = min(fogMin.x, fogMin.y);
+		float fogMask = tmp;
+		if( fogMask <= 0.0 ) {
+			@sv_target = float4(0.0,0.0,0.0,0.0);
+			return;
+		}
+		
+		
+		//Compute distance for all kind of fogs
+		float3 wsViewDir = $vsPosition.xyz;
+		float Distance, DistanceVertical, DistanceScene, Zlinear;
+		ComputeDistance($texcoords.xy, wsViewDir, Distance, DistanceVertical, DistanceScene, Zlinear);
+
+		//Compute all fogs
+		float4 FogDistanceColor = ComputeWorldDistanceFog(Distance);
+		float4 FogVerticalColor = ComputeWorldVerticalFog(wsViewDir, DistanceVertical, DistanceScene);
+
+		//Mix Fogs
+		float4 MixedColor = lerp( FogDistanceColor, FogVerticalColor, FogVerticalColor.a );
+
+		#if $(atm/worldFog/EnableShadowOption)
+			//Ray-march in sun shadow
+			float shadowTerm = $(atm/distanceFog/TexShadow).SampleLevel( $linearClamp, $texcoords.xy, 0.0 ).x;
+		#else
+			float shadowTerm = 1.0;
+		#endif
+
+		// Change fog color based on angle with Sun direction
+		#if $(atm/worldFog/EnableScatteringOption)
+			float	PhaseAngle = dot( $(atm/worldFog/ScatteringDirection), wsViewDir );
+			float	Phase = PhaseFunctionMie( PhaseAngle, $(atm/worldFog/ScatteringPhase) );
+			float3	Scattering = ComputeScatteringIntensity( Phase, $(atm/worldFog/ScatteringColor) );
+			float	DepthMask = LinearStep( $(atm/worldFog/ScatteringDepthDist), $globalViewInfos.w, Zlinear );
+			float	ScatteringAlpha = min( 1.0, max( Scattering.r, max( Scattering.g, Scattering.b ) ));
+					Scattering *= ScatteringAlpha * DepthMask;
+			MixedColor.rgb = MixedColor.rgb * lerp( 1.0, shadowTerm, $(atm/worldFog/GodRayShadow) );
+			MixedColor.rgb += shadowTerm * Scattering;
+		#endif
+
+		#if $(atm/worldFogTurbulence/useTurbulenceOption)
+			float dynamicCanvasValue = $dynamicCanvas.SampleLevel( $bilinearSampler, $texcoords.xy, 0.0 ).x;
+			float range = $(atm/worldFogTurbulence/EndDistance).x - $(atm/worldFogTurbulence/StartDistance).x;
+			float dyncanFactor = saturate( (Zlinear - $(atm/worldFogTurbulence/StartDistance).x) / (range) );
+
+			#if $(atm/worldFog/EnableShadowOption)
+				float3 mixedNoise = lerp( $(atm/worldFogTurbulence/Color).rgb, $(atm/worldFogTurbulence/Color).rgb * shadowTerm, $(atm/worldFog/GodRayShadow) );
+			#else
+				float3 mixedNoise = $(atm/worldFogTurbulence/Color).rgb;
+			#endif
+			float3 noisyColor = lerp(MixedColor.rgb, mixedNoise.rgb, dynamicCanvasValue);
+			float3 finalColor = lerp(MixedColor.rgb, noisyColor.rgb, dyncanFactor);
+			MixedColor = float4(finalColor, MixedColor.a );
+		#endif
+
+		//Finalize
+		float3 color = MixedColor.rgb;
+		@sv_target = float4( color , MixedColor.a * fogMask );
+	}
+}

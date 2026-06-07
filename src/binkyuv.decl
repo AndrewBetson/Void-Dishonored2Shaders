@@ -1,0 +1,39 @@
+{
+	newstyle
+
+    parms {
+		stageSort	sortTrans
+    }
+    state {
+		cull none
+		depthWrite 0
+		depthfunc	ALWAYS
+		depthEnable	0
+    }
+	
+    hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0f );
+
+		@texcoord.xy = $vertex_position.xy;
+		@texcoord.y = -@texcoord.y;
+		@texcoord.xy = @texcoord.xy * 0.5f + 0.5f;
+    }
+	
+    hlsl_fp_main {
+		const float3 crc = float3( 1.595794678f, -0.813476563f, 0.0f );
+		const float3 crb = float3( 0.0f, -0.391448975f, 2.017822266f );
+		const float3 adj = float3( -0.87065506f, 0.529705048f, -1.081668854f );
+    
+		float Y =   $binkY.Sample( $bilinearSampler, $texcoord );
+		float Cr = $binkCr.Sample( $bilinearSampler, $texcoord );
+		float Cb = $binkCb.Sample( $bilinearSampler, $texcoord );
+		
+		float3 p = Y.xxx * 1.164123535f;
+		p += ( crc * Cr ) + ( crb * Cb ) + adj;
+		
+		p = pow( p, 2.2f ); //gamma
+		
+        @sv_target.xyz = p;
+        @sv_target.w = 1.0f;        
+    }
+}

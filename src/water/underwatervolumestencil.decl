@@ -1,0 +1,36 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+	}
+
+	options {
+		forcePixelShader 1
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		float4 wsPos = float4( $vertex_position.xyz, 1.0 );
+		wsPos = mul( $waterMatrix, wsPos );
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+		@texCoord = wsPos.zz;
+	}
+
+	hlsl_fp_main {
+		//Compute world space position
+		float2 ndcPos = screenPosToNdc( $sv_position.xy );
+		float3 csPos = float3( ndcPos, 0.01 );	// Remember we look at -Z!
+		float4 wsPos = mul( $inverseViewProjectionMatrix, float4( csPos, 1.0 ) );	// Now in WORLD space...
+		wsPos /= wsPos.w;
+		
+		if( wsPos.z > $texcoord.x ) {
+			discard;
+		}
+	}
+}

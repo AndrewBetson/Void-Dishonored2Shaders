@@ -1,0 +1,250 @@
+{
+	newstyle
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+	options {
+		NUMTHREADX 1
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	
+	hlsl_prefix {
+		#include <PostFX/Luminance/common>
+
+		// These are constants controling the "sticky integral"
+		// The idea is simply to give less weight to luminances that are too far from the currently adapted luminance
+		// The weight is controled by a smooth curve going from 1 to LowValue in N buckets
+		// This way, the integral is less likely to move away from current adapted value because of slightly equal integral values:
+		//	When there's about an equal amount of dark and bright pixels, the integral can flip from dark to bright adaptation easily
+		//	but by giving less weights to luminances too far away from current luminances, we're increasing the luminance
+		//	discrepancy required to trigger the flip...
+		//
+		static const float	WEIGHT_FADE_BUCKET_BIAS = -0.0;		// Weight is at its maximum at maximum luminance minus this bias (in buckets)
+		static const float	WEIGHT_FADE_BUCKETS_COUNT = 20.0;	// Amount of buckets away from goal to reach the minimum weight
+		static const float	WEIGHT_FADE_LOW_VALUE = 0.4;		// Minimum weight value for buckets too far away
+//		static const float	WEIGHT_FADE_LOW_VALUE = 1.0;		// <== Uncomment this to disable sticky integral mode
+
+		float	ComputeStickyIntegralTargetBucket( $(PostFX/Luminance/autoExposure_t) _LastFrameResult ) {
+			return Luminance2HistogramBucketIndex( _LastFrameResult.MaxLuminanceLDR )	// <== This gives the index of the max currently adapted bucket
+				  + WEIGHT_FADE_BUCKET_BIAS * TARGET_MONITOR_BUCKETS_COUNT;				// <== That we offset with a specific bias
+		}
+
+		// _BucketDelta = distance between currently measured bucket and previously adapted target bucket
+		float	ComputeStickyIntegralWeight( float _BucketDelta ) {
+//			return lerp( WEIGHT_FADE_LOW_VALUE, 1.0, smoothstep( WEIGHT_FADE_BUCKETS_COUNT, 0.0, abs(_BucketDelta) ) );
+			return 1.0;
+		}
+	}
+
+	hlsl_cp_main {
+
+		$(PostFX/Luminance/autoExposure_t)	Result;
+
+		$(PostFX/Luminance/autoExposure_t)	LastFrameResult = @(PostFX/Luminance/buffAutoExposure)[$(PostFX/Luminance/exposureIndex).x];
+
+		// Compute luminance range in dB and the amount of buckets covered by the "virtual monitor"
+		// The virtual monitor is the standard monitor capable of adapting say 255 levels of luminance to which we add the
+		//	possibily extended range due to the fact that we tone map the image after exposure.
+		//
+		// Indeed, if the tone mapping's white level is set to 10 for example, that means that, after tone mapping, we constrained
+		//	a range of [0,10] luminance levels into the standard [0,1] range a real monitor is capable of displaying.
+		// So technically, we managed to create a monitor capable of displaying a range of [0,10] luminances then we could ask the 
+		//	auto-exposure to assume it can adapt 2550 virtual luminance levels instead of the typical 255 of a real monitor.
+		//
+		float	MonitorLuminanceRange_dB = Luminance2dB( TARGET_MONITOR_LUMINANCE_RANGE * $(PostFX/Luminance/white_level) );
+		float	MonitorBucketsCount = MonitorLuminanceRange_dB / HISTOGRAM_BUCKET_RANGE_DB;
+
+		// Compute the start & end bucket indices based on shadows/highlights clipping boundaries (it's basically the same as a level in photoshop)
+		// They're computed by specifying the bottom and top % of the 48dB histogram range we want to consider (shadow / highlights)
+		// Once renormalized using MonitorBucketsCount, we get the min/max bucket index...
+		//
+		uint2	ClippedBucketIndex = uint2( saturate( $(env/autoexp/clip_shadows) ) * MonitorBucketsCount, saturate( $(env/autoexp/clip_highlights) ) * MonitorBucketsCount );
+
+		#if 0
+			// =====================================================================================
+			// 1] Compute the initial integral using an "optimized trapezoidal integration"
+			// Typically, we decide that each bucket's width is 1 (dx=1) and we integrate by doing:
+			//	I += 0.5 * (Bucket[0] + Bucket[1]) * dx
+			//	I += 0.5 * (Bucket[1] + Bucket[2]) * dx
+			//	(...)
+			//	I += 0.5 * (Bucket[N-1] + Bucket[N]) * dx
+			//
+			// Which is finally equivalent to:
+			//	I = 0.5 * Bucket[0]
+			//	I += Bucket[1];
+			//	I += Bucket[2];
+			//	(...)
+			//	I += Bucket[N-1]
+			//	I += 0.5 * Bucket[N]
+			//
+			Result.PeakHistogramValue = 0;
+			uint2	TailBucketPosition = uint2( ClippedBucketIndex.x, 0 );												// Start from the specified minimum bucket
+			uint2	HeadBucketPosition = TailBucketPosition;															// We'll make head index grow
+			uint	LastBucketIndex = ClippedBucketIndex.y - 1;															// Stop before the last bucket
+			float	Integral = 0.5 * $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x; HeadBucketPosition.x++;	// Add half of first bucket
+			for ( ; HeadBucketPosition.x < LastBucketIndex; HeadBucketPosition.x++ ) {
+				uint	HistoValue = $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x;
+				Integral += HistoValue;																					// Add each interior bucket once
+				Result.PeakHistogramValue = max( Result.PeakHistogramValue, HistoValue );
+			}
+			Integral += 0.5 * $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x;		 HeadBucketPosition.x++;	// Add half of last bucket
+
+
+			// =====================================================================================
+			// 2] Perform the scrolling integral on the histogram
+			// The idea here is to make the integral "evolve" by subtracting the first bucket on the left
+			//	and add the next bucket on the right. By iterating this way until the right end of the histogram
+			//	we will account for all possible integrals and keep the one that gives the highest result.
+			// This is where we'll place our low dynamic range, thus ensuring we're covering most of the significant pixels...
+			//
+			LastBucketIndex = HISTOGRAM_BUCKETS_COUNT - uint( TARGET_MONITOR_BUCKETS_COUNT - ClippedBucketIndex.y );	// If less than 100% of the monitor's range is accounted for (i.e. bright luminances cut)
+																											//	then we don't need to integrate all the way to the end of the histogram...
+
+			uint	MaxIntegralTailBucketPosition = TailBucketPosition.x;
+			float	MaxIntegral = Integral;
+
+			while ( HeadBucketPosition.x < LastBucketIndex ) {
+
+				// Subtract tail bucket integral
+				uint	HistoValueTail0 = $(PostFX/Luminance/texHistogram)[TailBucketPosition].x; TailBucketPosition.x++;
+				uint	HistoValueTail1 = $(PostFX/Luminance/texHistogram)[TailBucketPosition].x;
+				Integral -= 0.5 * (HistoValueTail0 + HistoValueTail1);
+
+				// Add head bucket integral
+				uint	HistoValueHead0 = $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x; HeadBucketPosition.x++;
+				uint	HistoValueHead1 = $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x;
+				Integral += 0.5 * (HistoValueHead0 + HistoValueHead1);
+
+				// Update max integral & peak value
+				if ( Integral > MaxIntegral ) {
+					MaxIntegral = Integral;
+					MaxIntegralTailBucketPosition = TailBucketPosition.x;
+				}
+
+				Result.PeakHistogramValue = max( Result.PeakHistogramValue, HistoValueHead1 );
+			}
+		#else
+
+			// =====================================================================================
+			// 1] Compute the initial integral using a stupid sum
+			Result.PeakHistogramValue = 0;
+			uint2	TailBucketPosition = uint2( ClippedBucketIndex.x, 0 );							// Start from the specified minimum bucket
+			uint2	HeadBucketPosition = TailBucketPosition;										// We'll make head index grow
+			uint	Integral = 0U;
+			for ( ; HeadBucketPosition.x < ClippedBucketIndex.y; HeadBucketPosition.x++ ) {
+				uint	HistoValue = $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x;
+				Integral += HistoValue;																// Add each interior bucket once
+				Result.PeakHistogramValue = max( Result.PeakHistogramValue, HistoValue );
+			}
+
+			// =====================================================================================
+			// 2] Perform the scrolling integral on the histogram
+			// The idea here is to make the integral "evolve" by subtracting the first bucket to the left
+			//	and add the next bucket to the right. By iterating this way until the right end of the histogram
+			//	we will account for all possible integrals and keep the one that gives the highest result.
+			// This is where we'll place our low dynamic range, thus ensuring we're covering most of the significant pixels...
+			//
+			uint	LastBucketIndex = HISTOGRAM_BUCKETS_COUNT - uint( MonitorBucketsCount - ClippedBucketIndex.y );	// If less than 100% of the monitor's range is accounted for (i.e. bright luminances cut)
+																													//	then we don't need to integrate all the way to the end of the histogram...
+
+			uint	MaxIntegralTailBucketPosition = TailBucketPosition.x;
+			uint	MaxIntegral = Integral;
+
+			while ( HeadBucketPosition.x < LastBucketIndex ) {
+
+				// Subtract tail bucket integral
+				uint	HistoValueTail = $(PostFX/Luminance/texHistogram)[TailBucketPosition].x; TailBucketPosition.x++;
+				Integral -= HistoValueTail;
+
+				// Add head bucket integral
+				uint	HistoValueHead = $(PostFX/Luminance/texHistogram)[HeadBucketPosition].x; HeadBucketPosition.x++;
+				Integral += HistoValueHead;
+
+				// Update max integral & peak value
+				if ( Integral >= MaxIntegral ) {	// Here, using > or >= makes a huge difference for histograms we can completely encompass in our LDR range!
+					MaxIntegral = Integral;
+					MaxIntegralTailBucketPosition = TailBucketPosition.x;
+				}
+
+				Result.PeakHistogramValue = max( Result.PeakHistogramValue, HistoValueHead );
+			}
+		#endif
+
+		// Make a completely black image have a centered window
+		if ( MaxIntegral == 0U ) {
+			MaxIntegralTailBucketPosition = (HISTOGRAM_BUCKETS_COUNT - MonitorBucketsCount) / 2;
+		}
+
+//### Use as debug value
+//Result.PeakHistogramValue = MaxIntegralTailBucketPosition;
+//Result.PeakHistogramValue = HeadBucketPosition.x - TailBucketPosition.x;
+//Result.PeakHistogramValue = LastBucketIndex;
+
+
+		// =====================================================================================
+		// 3] Clamp target position to authorized range
+		float	MinAdaptableLuminance_Bucket = Luminance2HistogramBucketIndex( $(env/autoexp/adapt_min_luminance) );
+		float	MaxAdaptableLuminance_Bucket = Luminance2HistogramBucketIndex( $(env/autoexp/adapt_max_luminance) );
+
+		float	TargetTailBucketPosition = clamp( MaxIntegralTailBucketPosition, MinAdaptableLuminance_Bucket, MaxAdaptableLuminance_Bucket - MonitorBucketsCount );
+
+
+		// =====================================================================================
+		// 4] Compute immediate target exposure value
+		// We now know the index of the "tail bucket" (the left bucket of the LDR histogram) so we can easily retrieve the target luminance factor
+		//
+		float	TargetLuminanceFactor = HistogramBucketIndex2Luminance( TargetTailBucketPosition );
+				TargetLuminanceFactor *= ComputeExposureFactor();		// Override the default EV using our traditional camera EV bias
+
+
+		// =====================================================================================
+		// 5] Perform temporal adaptation based on last frame's parameters
+ 		// The user's adapted luminance level is simulated by closing the gap between adapted luminance and current luminance by some % every frame
+		// This is not an accurate model of human adaptation, which can sometimes take longer than half an hour.
+		const float	DeltaTime = $(PostFX/Luminance/delta_time);
+
+		if ( LastFrameResult.LuminanceFactor < TargetLuminanceFactor ) {
+			Result.LuminanceFactor = lerp( TargetLuminanceFactor, LastFrameResult.LuminanceFactor, pow( abs(1.0 - $(env/autoexp/adapt_speed_up)), DeltaTime ) );
+		} else {
+			float	InvTargetLuminanceFactor = 1.0 / max( 1e-4, TargetLuminanceFactor );
+			float	InvLastFrameLuminanceFactor = 1.0 / max( 1e-4, LastFrameResult.LuminanceFactor );
+			Result.LuminanceFactor = 1.0 / lerp( InvTargetLuminanceFactor, InvLastFrameLuminanceFactor, pow( abs(1.0 - $(env/autoexp/adapt_speed_down)), DeltaTime ) );
+		}
+
+
+		// =====================================================================================
+		// 6] Compute current frame's EV (Exposure Value) and F-stops number based on provided exposure time
+		//
+		//	• The luminance factor multiplied by the minimum adaptable luminance (default 0.01 cd/m²) will map to the luminance L0 of the least luminous pixel (i.e. pixel value = 1)
+		//	• L0 * 255 will yield the maximum luminance displayed by the monitor (i.e. pixel value = 255)
+		//	• The sRGB value used as "reference for the 0 EV" is sRGB 128, which is mapped to (128/256)^2.2 = 0.21 (i.e. pixel value = 55)
+		//			so L_ref = L0 * 55 will be the luminance we'll use as a reference to compute the "absolute EV"
+		// 
+		Result.MinLuminanceLDR = Result.LuminanceFactor;																	// Minimum luminance the screen will display as the value 1
+		Result.MaxLuminanceLDR = Result.MinLuminanceLDR * $(PostFX/Luminance/white_level) * TARGET_MONITOR_LUMINANCE_RANGE;	// Maximum luminance the screen will display as the value 255
+		Result.MiddleGreyLuminanceLDR = Result.MinLuminanceLDR * 55.497598410127913869937213614334;							// Reference EV luminance the screen will display as the value 255*(0.5^2.2) ~= 55
+
+		float	PowEV = Result.MiddleGreyLuminanceLDR / ABSOLUTE_EV_REFERENCE_LUMINANCE;									// Absolute EV exponent based on our measured reference of 0.15 cd/m²
+		Result.EV = log2( PowEV );																							// Absolute Exposure Value
+
+		// Using EV = log2( F² / t ) and knowing both EV and t (given), we retrieve the F-stop number as
+		//	F = sqrt( t * 2^EV )
+		Result.Fstop = sqrt( PowEV / $(env/autoexp/reference_camera_fps) );
+		Result.Fstop += $(env/autoexp/fstop_bias);														// Although it's not physically correct, nevertheless we let the user bias that value...
+
+
+		// =====================================================================================
+		// 7] Build the final engine factor
+		// 
+		float	WhiteLevelLuminance = Result.MinLuminanceLDR * 1.0 * TARGET_MONITOR_LUMINANCE_RANGE;	// Even though we can adapt to larger luminances thanks to tone mapping, keep a _UNIT_ white level so the user is not confused!
+		float	WhiteLevelEngineLuminance = WhiteLevelLuminance * WORLD_TO_ARKANE_LUMINANCE;			// This is the highest adaptable luminance, in arkane units
+		Result.EngineLuminanceFactor = 1.0 / WhiteLevelEngineLuminance;									// So it must map to 1... Simple!
+
+		// Write the result
+		@(PostFX/Luminance/buffAutoExposure)[$(PostFX/Luminance/exposureIndex).y] = Result;
+	}
+}

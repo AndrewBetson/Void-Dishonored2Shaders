@@ -1,0 +1,384 @@
+{
+	newstyle
+
+	hlsl_prefix {
+		#include <fresnel>
+		#include <noise>
+		#include <arkScreenSpaceRayTracing>
+		#define SHADOW_USE_TAPS 1	// So we only use a single shadow tap...
+		#include <shadow> 
+		
+		#ifndef WATER_REFLECTION_ROUTINE
+			#define	WATER_REFLECTION_ROUTINE	ComputeReflection
+		#endif
+		#ifndef WATER_REFRACTION_ROUTINE
+			#define	WATER_REFRACTION_ROUTINE	ComputeRefraction
+		#endif
+		#ifndef SCREEN_SPACE_RAYTRACING_ROUTINE
+			#define	SCREEN_SPACE_RAYTRACING_ROUTINE	ScreenSpaceRayTrace
+		#endif
+
+		#ifndef	IBL_INFO
+			#define IBL_INFO
+			struct IBLInfo {
+			#if $(water/UseIBLProbesOption)
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					uint3	IBLCubeMapIndex;
+					float3	barycentrics;
+				#else
+					uint	IBLCubeMapIndex;
+				#endif
+			#endif
+			};
+		#endif
+
+		#define RAYTRACING_Z_CUTOFF 6599.0 //Invalidate raytracing if it is after this Z
+
+
+		float3 GetSkyColor( float3 _pos, float3 _dir, IBLInfo _IBLInfo ) {
+			#if $(water/UseIBLProbesOption)
+				// Use localized environment cube maps (for rivers)
+				float3	irradiance = $(IBL/texCubeMapArray).SampleLevel( $iblSampler, float4( _dir, _IBLInfo.IBLCubeMapIndex.x ), 0 ).xyz;
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					if ( _IBLInfo.IBLCubeMapIndex.y != _IBLInfo.IBLCubeMapIndex.x || _IBLInfo.IBLCubeMapIndex.z != _IBLInfo.IBLCubeMapIndex.x ) {
+						irradiance *= _IBLInfo.barycentrics.x;
+						irradiance += _IBLInfo.barycentrics.y * $(IBL/texCubeMapArray).SampleLevel( $iblSampler, float4( _dir, _IBLInfo.IBLCubeMapIndex.y ), 0 ).xyz;
+						irradiance += _IBLInfo.barycentrics.z * $(IBL/texCubeMapArray).SampleLevel( $iblSampler, float4( _dir, _IBLInfo.IBLCubeMapIndex.z ), 0 ).xyz;
+					}
+				#endif
+				return irradiance;
+			#else
+				// Use a single large cube map or a uniform color (for ocean)
+				#if $(water/UseSkyCubeMapOption)
+					// bmayaux (2016-05-) Attempt a small parallax correction by computing the intersection with a very large sphere (we always assume the position is inside a sphere centered in 0)
+					float	c = dot( _pos, _pos ) - $(water/SkyCubeMapSphereRadius)*$(water/SkyCubeMapSphereRadius);
+					float	b = dot( _pos, _dir );
+					float	delta = b * b - c;
+					float	t = -b + sqrt( delta );
+					float3	hitPos = _pos + t * _dir;
+					_dir = normalize( hitPos );
+
+					return $(water/SkyCubeMap).SampleLevel( $trilinearSampler, _dir, 0 ).rgb;
+				#else
+					return $(water/SkyColor);
+				#endif
+			#endif
+		}
+
+		float3 ComputeReflection( float3 _wsPos, float3 _vsPos, float3 _wsViewDir, float3 _wsNormal, float3 _sunIntensity, float _jitter, float _screenSpaceReflectionAmount, IBLInfo _IBLInfo ) {
+			float3 wsReflectionDir = reflect( -_wsViewDir, _wsNormal );
+	
+			if ( wsReflectionDir.z < 0.0 ) { //Avoid reflection vectors pointing downward
+				wsReflectionDir.z = 1e-3;
+				wsReflectionDir = normalize( wsReflectionDir );
+			}
+
+			#if $(water/enableSSReflectionOption)
+				if ( ( _screenSpaceReflectionAmount > 0.0 ) && $(water/enableSSReflection2) ) { //ftournade: added dynamic branching because water surfaces other than the ocean can't modify their material options based on player's quality settings
+					float3	wsNormal_Soft = _wsNormal;
+							wsNormal_Soft.z *= $(water/ScreenSpaceReflectionSoften);
+							wsNormal_Soft = normalize( wsNormal_Soft );
+				
+					float3	wsReflectionDir_Soft = reflect( -_wsViewDir, wsNormal_Soft );
+	
+					float3	vsReflectionDir_Soft = mul( $viewMatrix, float4( wsReflectionDir_Soft, 0.0 ) ).xyz;
+				
+					float4	ZThicknessFactors = float4( $(water/ScreenSpaceReflectionZThicknessMulNear), $(water/ScreenSpaceReflectionZThicknessDistanceNear),
+														$(water/ScreenSpaceReflectionZThicknessMulFar), $(water/ScreenSpaceReflectionZThicknessDistanceFar) );
+
+					uint2	linearZTexSizeUnscaled;
+					$(water/OpaqueDepthBuffer).GetDimensions( linearZTexSizeUnscaled.x, linearZTexSizeUnscaled.y );
+					uint2 linearZTexSize = uint2( $resolutionScale.xy * float2(linearZTexSizeUnscaled) );
+
+					float2	hitUV;
+					float	hitZ;
+					float3	DEBUG_stripped;
+					float	hitFade = SCREEN_SPACE_RAYTRACING_ROUTINE(	_vsPos, vsReflectionDir_Soft, $(water/ScreenSpaceReflectionMaxStepsCount),
+																		$(water/OpaqueDepthBuffer), $(water/DownsampledDepthBuffer), linearZTexSize,
+																		ZThicknessFactors, $(water/ScreenSpaceReflectionZThicknessPow).x, $(water/ScreenSpaceReflectionVerticalFade).x, $(water/ScreenSpaceReflectionBorderFade).x,
+																		$projectionMatrix,
+																		hitZ, hitUV, DEBUG_stripped );
+
+					float3	skyReflection = GetSkyColor( _wsPos, wsReflectionDir_Soft, _IBLInfo );
+//return DEBUG_stripped;
+//return lerp( float3( 1, 0, 0 ), DEBUG_stripped, hitFade );
+					hitUV = hitUV * $resolutionScale.xy;
+					float3	SSRReflection = 0.0;
+					if ( hitZ > RAYTRACING_Z_CUTOFF ) {
+						hitFade = 0.0;
+					}
+					if ( hitFade > 0.0 ) {
+						SSRReflection = $(water/HDRBuffer).SampleLevel( $linearClamp, hitUV, 0.0 ).xyz;
+						SSRReflection = RangeExpandColorFromR11G11B10( SSRReflection );
+					}
+
+
+					// Apply extinction/scattering from the fog
+					float4	FogScatteringExtinction = $(atm/distanceFog/TexSourceImage).SampleLevel( $linearClamp, hitUV, 0.0 );
+					float	FogExtinction = 1.0-saturate(FogScatteringExtinction.w);
+					SSRReflection = FogExtinction * SSRReflection + FogScatteringExtinction.xyz;
+
+					return lerp( skyReflection, SSRReflection, hitFade );
+				} else {
+					return GetSkyColor( _wsPos, wsReflectionDir, _IBLInfo );
+				}
+			#else
+				return GetSkyColor( _wsPos, wsReflectionDir, _IBLInfo );
+			#endif
+		}
+
+		float3 ComputeRefraction( float _IOR, float3 _wsPos, float3 _vsPos, float3 _wsViewDir, float3 _wsNormal, float2 _psPos, float _linearDepth, float3 _sunIntensity, float _jitter, float3 _extinctionCoeff, float _waterLevel, out float _waterDepth ) {
+			float causticTime = fmod( $localTime.x * $(water/CausticsSpeed), 32.0f );
+
+		#if 1 //Old school cheap refraction
+			//Refract scene
+			///////////////
+
+			float refractionDisto = $(water/Refraction).x / _linearDepth;
+
+			float2 hdrTexSize;
+			$(water/HDRBuffer).GetDimensions( hdrTexSize.x, hdrTexSize.y );
+			
+			float2 screenUV = _psPos / hdrTexSize;
+			float2 distoUV = screenUV + _wsNormal.xy * refractionDisto * $resolutionScale;
+
+			// Clamp manually for resolution scaling
+			float2 screenLimit = $resolutionScale.xy - $positionToViewTexture.zw * 0.5f;
+			distoUV = clamp( distoUV, float2( 0, 0 ), screenLimit );
+			
+
+			float opaqueRawDepth = $(water/OpaqueDepthBuffer).SampleLevel( $pointClamp, distoUV, 0.0f );
+			float opaqueGeomDepth = ComputeLinearZ( opaqueRawDepth );
+
+			if ( opaqueGeomDepth < _linearDepth ) {
+				//false refractions of objects above waters, do no distortion for this pixel
+				distoUV = clamp( screenUV, float2( 0, 0 ), screenLimit );
+				opaqueRawDepth = $(water/OpaqueDepthBuffer).SampleLevel( $pointClamp, distoUV, 0.0f );
+				opaqueGeomDepth = ComputeLinearZ( opaqueRawDepth );
+			}
+
+			_waterDepth = max( opaqueGeomDepth - _linearDepth, 0.0 ); //Note: viewspace distance, not real radial distance
+			float3 refraction = $(water/HDRBuffer).SampleLevel( $bilinearClamp, distoUV, 0.0f ).rgb;
+			refraction = RangeExpandColorFromR11G11B10( refraction );
+			
+			//Add caustics
+			//////////////
+
+			float3 wsUnderWaterPos = _wsPos - _wsViewDir * _waterDepth; //here we should use the real distance instead of viewspace Z (but it's acceptable as it is)
+			float2 causticsUV = (wsUnderWaterPos.xy + wsUnderWaterPos.z * $(water/wsRefractedLightDir).xy) * $(water/CausticsTiling) + _wsNormal.xy * refractionDisto;
+
+			float3 caustics;
+			caustics.r = $(water/CausticsTex).SampleLevel( $trilinearSampler, float3( causticsUV - $(water/CausticsChromaticAberration), causticTime ), 0.0f ).x;
+			caustics.g = $(water/CausticsTex).SampleLevel( $trilinearSampler, float3( causticsUV,                                         causticTime ), 0.0f ).x;
+			caustics.b = $(water/CausticsTex).SampleLevel( $trilinearSampler, float3( causticsUV + $(water/CausticsChromaticAberration), causticTime ), 0.0f ).x;
+
+			float pointVerticalDepth = max( _waterLevel - wsUnderWaterPos.z, 0.0f );
+
+			float3 extinction = exp( -_extinctionCoeff * pointVerticalDepth );
+
+			#if 1
+				float4x4 worldToShadowMat_unused;
+				float4x4 shadowToWorldMat_unused;
+				float3 wsNormal_unused = float3(0.0, 1.0, 0.0);
+				uint sliceIdx_unused;
+
+				float shadow = ComputeParallelShadow( wsUnderWaterPos, wsNormal_unused, worldToShadowMat_unused, shadowToWorldMat_unused, sliceIdx_unused, LOW_QUALITY );
+			#else
+				float shadow = 1.0f;
+			#endif
+
+			refraction += caustics * _sunIntensity * $(water/CausticsFade) * shadow;
+			refraction *= extinction;
+
+			return refraction;
+
+		#else // Screen space raytraced refractions
+
+			float3	wsRefractionDir = refract( -_wsViewDir, _wsNormal, _IOR );
+
+			float3	vsRefractionDir = mul( $viewMatrix, float4( wsRefractionDir, 0.0f ) ).xyz;
+
+
+			float4	ZThicknessFactors = float4( $(water/ScreenSpaceReflectionZThicknessMulNear), $(water/ScreenSpaceReflectionZThicknessDistanceNear),
+												$(water/ScreenSpaceReflectionZThicknessMulFar), $(water/ScreenSpaceReflectionZThicknessDistanceFar) );
+
+			uint2	linearZTexSize;
+			$(water/OpaqueDepthBuffer).GetDimensions( linearZTexSize.x, linearZTexSize.y );
+
+			float2	hitUV;
+			float	hitZ;
+			float3	DEBUG_stripped;
+			float	hitFade = SCREEN_SPACE_RAYTRACING_ROUTINE(	_vsPos, vsRefractionDir, $(water/ScreenSpaceRefractionMaxStepsCount),
+																$(water/OpaqueDepthBuffer), $(water/DownsampledDepthBuffer), linearZTexSize,
+																ZThicknessFactors, $(water/ScreenSpaceReflectionZThicknessPow).x, $(water/ScreenSpaceReflectionVerticalFade).x, $(water/ScreenSpaceReflectionBorderFade).x,
+																$projectionMatrix,
+																hitZ, hitUV, DEBUG_stripped );
+
+			float3	defaultRefraction = 0.0;
+//			float3	defaultRefraction = float3( 0.0, 30.0, 0.0 );
+			float3	SSRReflection = hitFade > 0.0 ? RangeExpandColorFromR11G11B10( $(water/HDRBuffer).SampleLevel( $linearClamp, hitUV, 0.0 ).xyz ) : 0.0;
+
+			float3	refraction = lerp( defaultRefraction, SSRReflection, hitFade );
+
+			_waterDepth = hitZ;//distance( _vsPos, vsHitPoint );	//TODO: Recompute real distance from world space reprojected position?
+
+			float wavesRefractingSky = smoothstep( -0.5f, -0.1f, wsRefractionDir.y ) * 5.0f;
+//			float wavesRefractingSky = step( -0.5f, wsRefractionDir.y ) * 3.0f;
+			refraction += float3( 0.6f, 1.0f, 0.6f ) * wavesRefractingSky;
+
+			return refraction;
+
+		#endif
+		}
+
+		float3 WaterInscattering( float _camVerticalDepth, float _pointVerticalDepth, float _pointDistToCam, float3 _extinctionCoeff ) {
+			const float phase = 1.0f / (4.0 * PI);
+			float distToCam = _pointDistToCam + 0.0001; //avoid NaN
+			float3 g = _extinctionCoeff * ( 1.0f + (_pointVerticalDepth - _camVerticalDepth) / distToCam );
+			return phase * exp( - _extinctionCoeff * _camVerticalDepth ) * ( 1.0f - exp( - g * _pointDistToCam ) ) / max(0.001, g);
+		}
+
+		float3 ReconstructWorldSpacePositionFromLinearZ( float2 _ndcPixelPos, float _linearDepth ) {
+			float4 wsZFarPos = mul( $inverseViewProjectionMatrix, float4( _ndcPixelPos, 0, 1 ) );  //ARKANE (2015-06-12) - depth inversion
+			wsZFarPos /= wsZFarPos.w;
+
+			float3 wsRayDir = wsZFarPos.xyz - $wsCamPos;
+
+			float zfar = $globalViewInfos.w;
+			return $wsCamPos + wsRayDir * ( _linearDepth / zfar );
+		}
+
+		float4 WaterShading( bool _isOcean, bool _bUnderWater, float _waterLevel, float2 _pixelPos, float3 _wsPosition, float3 _vsPosition, float3 _wsNormal, float3 _wsCamPos, float3 _wsViewDir, float _waterSurfaceDist,
+							float3 _waterColor, float _extinction, float _inscattering,
+							float3 _sunDir, float3 _sunIntensity, float _specularPower, float _additionalShadow,
+							float _refraction,
+							float _foamFFT, float _foam, float _foamDepth,
+							float _waveAmplitudeMask,
+							IBLInfo _IBLInfo )
+		{
+			#if !$(water/UseSunLight) //TODO Improve this
+				_sunIntensity = float3( 1, 1, 1 );
+			#endif
+
+			float jitter = $(noise/Perm2D)[ uint2(_pixelPos) & 0xFF ].x; 
+
+			float4x4	worldToShadowMat_unused;
+			float4x4	shadowToWorldMat_unused;
+			float3		wsNormal_unused = float3(0.0, 1.0, 0.0);
+			uint		sliceIdx_unused;
+			float		shadow = ComputeParallelShadow( _wsPosition, wsNormal_unused, worldToShadowMat_unused, shadowToWorldMat_unused, sliceIdx_unused, LOW_QUALITY );
+
+			shadow *= _additionalShadow;
+
+			float	waterLinearDepth = - _vsPosition.z;
+
+			// Handle underwater cases
+			_wsNormal *= _bUnderWater ? -1.0 : 1.0; // Underwater the normal is inverted
+
+			float	IOR = _bUnderWater ? 1.333 : 1.0f / 1.333;
+			float3	extinctionCoeff = (1.0 - _waterColor) * _extinction;
+					extinctionCoeff *= _bUnderWater ? (1.0 / $(water/UnderwaterVisibilityBoost)) : 1.0;
+
+			//Fresnel
+			/////////
+			float	NdotV = saturate( dot( _wsNormal, _wsViewDir ) );	//In real life (NdotV < 0) shouldn't happen
+			bool	totalInternalReflection;
+			float	fresnel = FresnelAccurate( IOR, NdotV, totalInternalReflection );
+
+			float	waterDepth = 1000.0; //For foam computation
+			float4	finalColor = 0.0;
+
+			[branch]
+			if ( !_bUnderWater ) {
+
+				//Reflection
+				////////////
+
+				#if $(water/disableSSReflectionOnRoughWaterOption)
+					float		screenSpaceReflectionAmount = smoothstep( 0.7, 0.8, 1.0 - _waveAmplitudeMask ); // fade out SSR on big waves, because it's too noisy and doesn't add significant value
+				#else
+					const float	screenSpaceReflectionAmount = 1.0;
+				#endif
+
+				float3	reflection = WATER_REFLECTION_ROUTINE( _wsPosition, _vsPosition, _wsViewDir, _wsNormal, _sunIntensity, jitter, screenSpaceReflectionAmount, _IBLInfo );
+
+				//Sun specular reflection
+				/////////////////////////
+				#if $(water/UseSunLight)
+					float3	H = normalize( _sunDir + _wsViewDir );
+					float	NdotH = saturate( dot( _wsNormal, H ) );
+					float3	sunReflection = _sunIntensity * ( pow( NdotH, _specularPower ) * shadow ); 
+					reflection += sunReflection;
+				#endif
+				//Refraction
+				////////////
+
+				float3	refraction = WATER_REFRACTION_ROUTINE( IOR, _wsPosition, _vsPosition, _wsViewDir, _wsNormal, _pixelPos, waterLinearDepth, _sunIntensity, jitter, extinctionCoeff, _waterLevel, waterDepth );
+
+				//extinction / Inscattering
+				///////////////////////////
+
+				const float camVerticalDepth = 0.0;
+
+				float3	waterExtinction = exp( - extinctionCoeff * waterDepth );
+				float3	waterInscattering = _sunIntensity * WaterInscattering( camVerticalDepth, waterDepth, waterDepth, extinctionCoeff ) * _inscattering;
+
+				refraction.xyz = refraction.xyz * waterExtinction + waterInscattering;
+
+				//Final compositing
+				///////////////////
+
+				finalColor.rgb = lerp( refraction, reflection, fresnel );
+				finalColor.rgb += lerp( _foamFFT, _foam * $(water/ShoreFoamLuminance), _foamDepth ) * _sunIntensity * shadow;	// Shore foam
+
+				finalColor.a = 1.0;
+				
+				//Add alpha test against geometry
+				{
+					float rawDepth = $(water/OpaqueDepthBuffer)[ int2( _pixelPos ) ].x;
+					float geomDepth = ComputeLinearZ( rawDepth );
+					float slice = abs(geomDepth - waterLinearDepth);
+					finalColor.a = smoothstep( 0.0, 0.2, slice );
+				}
+
+			} else {	// UNDERWATER!
+				//Reflection
+				////////////
+				float3	reflection = WATER_REFLECTION_ROUTINE( _wsPosition, _vsPosition, _wsViewDir, _wsNormal, _sunIntensity, jitter, 1.0, _IBLInfo );
+				//const float phase = 1.0f / (4.0f * 3.14159f); //simple isotropic phase function
+				//float3 reflection = _sunIntensity * (phase * _inscattering) / ( extinctionCoeff * 1.5f );
+
+				//Refraction
+				////////////
+				float2 hdrTexSize;
+				$(water/HDRBuffer).GetDimensions( hdrTexSize.x, hdrTexSize.y );
+
+				float2 screenLimit = $resolutionScale.xy - $positionToViewTexture.zw * 0.5;
+				float2 screenUV = _pixelPos / hdrTexSize;
+				float2 finalUV = screenUV  + ( _wsNormal.xy * _refraction * $resolutionScale.xy );
+				finalUV = clamp( finalUV, float2( 0, 0 ), screenLimit );
+				
+				float3 refraction = $(water/HDRBuffer).SampleLevel( $bilinearClamp, finalUV, 0.0f ).rgb;
+				refraction = RangeExpandColorFromR11G11B10( refraction );
+
+				//Sun refraction
+				////////////////
+				#if $(water/UseSunLight)
+					float3 wsRefractionDir = refract( - _wsViewDir, _wsNormal, IOR );
+					float RdotL = max( dot( wsRefractionDir, _sunDir ), 0.0f );
+					float3 sunRefraction = _sunIntensity * ( pow( RdotL, _specularPower ) * shadow );
+					refraction += sunRefraction;
+				#endif
+
+				//Final compositing
+				///////////////////
+				finalColor.rgb = lerp( refraction, reflection, fresnel * _isOcean );
+				finalColor.rgb += lerp( _foamFFT, _foam * $(water/ShoreFoamLuminance), saturate( 0.1 + _foamDepth ) ) * _sunIntensity * shadow;	// Shore foam
+				finalColor.a = 1.0;
+			}
+
+			return finalColor;
+		}
+	}
+
+}

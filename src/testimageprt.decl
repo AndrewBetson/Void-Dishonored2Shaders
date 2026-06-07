@@ -1,0 +1,25 @@
+{
+	newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+	
+	hlsl_vp_main {
+		@sv_position.x = dot( float4($vertex_position.xyz,1), $mvpMatrixX ) * $testImageFlip.x;
+		@sv_position.y = dot( float4($vertex_position.xyz,1), $mvpMatrixY ) * $testImageFlip.y;
+		@sv_position.z = dot( float4($vertex_position.xyz,1), $mvpMatrixZ );
+		@sv_position.w = dot( float4($vertex_position.xyz,1), $mvpMatrixW );
+		
+		@(legacy_texcoord) = $(vertex_texcoord).xyxy;
+
+	}
+	hlsl_fp_main {
+		@sv_target = 1.f.xxxx;
+	}
+}

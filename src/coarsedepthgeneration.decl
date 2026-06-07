@@ -1,0 +1,60 @@
+{
+	newstyle
+	options {
+		numthreadx 1
+		numthready 1
+		numthreadz 1
+	}
+
+	hlsl_prefix {
+		
+	}
+
+	hlsl_cp_main {
+		uint2 dstIdx = $sv_groupID.xy;
+		uint2 startSrcOffset = (uint2)floor( float2(dstIdx) * $(coarseDepthGen/srcTexelPerDestTexel) );
+		
+		float nearest = 99999.f;
+		float farest = 0.f;
+		for( int i = 0; i < (int)ceil( $(coarseDepthGen/srcTexelPerDestTexel).x ); ++i ) {
+			for( int j = 0; j < (int)ceil( $(coarseDepthGen/srcTexelPerDestTexel).y ); ++j ) {
+				//fetch depth from downsampled buffer
+				uint2 uv = min( startSrcOffset + uint2( i, j ), $(coarseDepthGen/srcMaxTexelIdx) );  // clamp texcoords to prevent getting wrong 0 results
+				
+				float viewZNear = $(downsamplingPS/depthBuffer)[uv].x; // we're using the average currently, seems to be the one that give the better results for current coarse depth use (light shadow tightening) - so actually we have a tricky "averaged min"
+				nearest = min( nearest, viewZNear ); // "min" because we are in linear [near..far] range, ie non reversed
+
+				float viewZFar = $(downsamplingPS/depthBuffer)[uv].z; // some algos may prefer the use of the actual and safe max value, output it also
+				farest = max( farest, viewZFar ); // "max" because we are in linear [near..far] range, ie non reversed
+			}
+		}
+			
+		// de-linearize nearest value (inverse computation of the one done in ComputeLinear() )
+		float nearestProjZ =  nearest != 0.f ? ( -$inverseProjectionMatrix[2].w / nearest + $inverseProjectionMatrix[3][3] ) / $inverseProjectionMatrix[3][2] : 1.f;
+		float farestProjZ =  farest != 0.f ? ( -$inverseProjectionMatrix[2].w / farest + $inverseProjectionMatrix[3][3] ) / $inverseProjectionMatrix[3][2] : 1.f;
+		@coarseDepth[dstIdx] = float2( nearestProjZ, farestProjZ );
+
+		///----------- version using the tile minmax as source, in case it is prefered someday...
+
+		/*float nearest = 99999.f;
+		for( int i = 0; i < (int)ceil( $(coarseDepthGen/srcTexelPerDestTexel).x ); ++i ) {
+			for( int j = 0; j < (int)ceil( $(coarseDepthGen/srcTexelPerDestTexel).y ); ++j ) {
+				//fetch min depth from tlf tile minmax image
+				uint2 uv = min( startSrcOffset + uint2( i, j ), $(coarseDepthGen/srcMaxTexelIdx) ); // clamp texcoords to prevent getting wrong 0 results
+				uint rawViewZs = $(tlf/depthMinMax)[ uv ].x;		
+				float viewZNear = f16tof32( rawViewZs >> 16 );		// use only near
+				nearest = min( nearest, viewZNear ); //(min because it is in view space)
+
+				// test code using max instead of min
+				/ *uint2 uv = min( startSrcOffset + uint2( i, j ), $(coarseDepthGen/srcMaxTexelIdx) ); // clamp texcoords to prevent getting wrong 0 results
+				uint rawViewZs = $(tlf/depthMinMax)[ uv ].x;		
+				const float	viewZFar = f16tof32( rawViewZs & 0x0000FFFF );		// use only far
+				nearest = min( nearest, viewZFar );* / //(min because it is in view space)
+			}
+		}
+			
+		// de-linearize nearest value (inverse computation of the one done in gather depth min max to linearize)
+		float projZ = nearest != 0.f ? ( -$projectionMatrix[2][3] - nearest * $projectionMatrix[2][2] ) / nearest : 1.f;
+		@coarseDepth[dstIdx] = ( projZ / *nearest* / );*/
+	}
+}

@@ -1,0 +1,19 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( float3($vertex_position.xy, $(PostFX/DOF/ZPosClipSpace)), 1 );
+	}
+
+	hlsl_fp_main {
+	}
+}

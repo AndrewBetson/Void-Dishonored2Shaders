@@ -1,0 +1,16 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef BRDF_PARTICLES_INCLUDED
+		#define BRDF_PARTICLES_INCLUDED
+
+		#define BRDF_OK	1			// Every BRDF include file must define this so we can easily spot the shaders that forgot to include a BRDF model!
+
+		#define	BRDF_PARTICLES	1
+
+		// We simply include Ward at the moment but we should seriously consider writing a specific BRDF!
+		#include <BRDF_ward>
+
+		#endif	// #ifndef BRDF_PARTICLES_INCLUDED
+	}
+}

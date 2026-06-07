@@ -1,0 +1,94 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	CUBE_MAP_UV_SIZE = 0.03125;		// Size of a single cube map in UV space (we currently have 32 per line)
+		static const float	CUBE_MAP_MIP_INDEX = 0.0;
+		static const int	CUBE_MAPS_PER_LINE = 32;
+
+		// Displays small rotating spheres for each cube map of the array, assuming a size of 32 probes per line in the array
+		//	_mode 0 = single-state
+		//	_mode 1 = dual-state, state A only
+		//	_mode 2 = dual-state, state B only
+		//	_mode 3 = dual-state, both states
+		//
+		void	DEBUG_DisplayDynamicIBLCubeMaps( float2 _UV, inout float3 _Color, uint _mode, float _ExposureFactor=0.01 ) {
+			uint			linesCount = (_mode == 0 || _mode == 3) ? 2 : 1;	// Show 64 probes if "single-state" or "dual-state show all"
+			uint			cubeMapOffset = _mode == 2 ? 1 : 0;					// Only add a 1 offset if viewing state B in dual state (i.e. odd cube maps)
+			uint			cubeMapStride = (_mode == 1 || _mode == 2) ? 2 : 1;	// Only use a stride of 2 if viewing only state A or state B in dual-state mode
+
+			const float2	Size = float2( CUBE_MAP_UV_SIZE, CUBE_MAP_UV_SIZE*16/9 );
+			const float2	InsetRectangle_Min = float2( 0.0, 1.0-linesCount*Size.y );
+			const float2	InsetRectangle_Max = float2( Size.x*CUBE_MAPS_PER_LINE, 1.0 );
+			if ( _UV.y < InsetRectangle_Min.y || _UV.x > InsetRectangle_Max.x )
+				return;	// Outside the inset rectangle where we're drawing...
+
+			bool	mouseOnProbes = $mouseCursorPosition.z < InsetRectangle_Max.x && $mouseCursorPosition.w > InsetRectangle_Min.y;
+
+			_UV = (_UV - InsetRectangle_Min) / Size;
+			uint2	cubeMapPos = (uint2) floor( _UV );
+			_UV = frac( _UV );
+
+			float3	Direction = float3( 2.0 * _UV.x - 1.0, 1.0 - 2.0 * _UV.y, 0.0 );
+			float	L = dot( Direction.xy, Direction.xy );
+			if ( L >= 1.0 )
+				return;	// Outside the circle...
+
+			Direction.z = sqrt( 1.0 - L );
+
+			float2	SC;
+			sincos( $time.x, SC.x, SC.y );
+			float3x3	Rot = float3x3(
+				float3( -SC.x, SC.y, 0 ),
+				float3( 0, 0, 1 ),
+				float3( SC.y, SC.x, 0 )
+			);
+			Direction = mul( Direction, Rot );
+
+			uint	cubeMapIndex = CUBE_MAPS_PER_LINE * cubeMapPos.y + cubeMapPos.x;
+					cubeMapIndex = cubeMapOffset + cubeMapStride * cubeMapIndex;
+
+			_Color = 0.0;
+			if ( !mouseOnProbes ) {
+				// Debug IBL
+				_Color = $(IBL/texCubeMapArray).SampleLevel( $linearClamp, float4( Direction, cubeMapIndex ), CUBE_MAP_MIP_INDEX ).xyz;
+			} else {
+				// Debug SH
+
+				// Retrieve original probe ID
+				if ( _mode > 0 ) {
+					cubeMapIndex >>= 1;	// This is because in dual-state mode, we have 2 cube maps for the same probe!
+				}
+
+				uint	parmIndex = cubeMapIndex >> 2;
+				uint4	probeIDs = 0;
+				if ( parmIndex == 0 )		probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID0);
+				else if ( parmIndex == 1 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID1);
+				else if ( parmIndex == 2 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID2);
+				else if ( parmIndex == 3 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID3);
+				else if ( parmIndex == 4 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID4);
+				else if ( parmIndex == 5 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID5);
+				else if ( parmIndex == 6 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID6);
+				else if ( parmIndex == 7 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID7);
+				else if ( parmIndex == 8 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID8);
+				else if ( parmIndex == 9 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID9);
+				else if ( parmIndex == 10 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID10);
+				else if ( parmIndex == 11 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID11);
+				else if ( parmIndex == 12 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID12);
+				else if ( parmIndex == 13 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID13);
+				else if ( parmIndex == 14 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID14);
+				else if ( parmIndex == 15 )	probeIDs = $(PostFX/ToneMapping/debug/remappedIBLProbeID15);
+
+				uint	probeID = probeIDs[cubeMapIndex & 3];
+				if ( probeID != ~0 ) {
+					$(indirectLighting/SH3)	Probe = LoadProbeSH( probeID );
+					_Color = max( 0.0, EvaluateSHIrradiance( Direction, Probe.SH ) );
+//					_Color = max( 0.0, EvaluateSH( Direction, Probe.SH ) );	// Direct radiance
+				}
+			}
+
+			_Color *= _ExposureFactor;
+		}
+	}
+}

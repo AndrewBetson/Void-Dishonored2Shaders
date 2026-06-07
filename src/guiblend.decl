@@ -1,0 +1,33 @@
+{
+	newstyle
+
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		depthWrite 0
+		depthfunc ALWAYS
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_vp_main {
+		@sv_position.x = dot( float4($vertex_position.xyz,1), $mvpMatrixX );
+		@sv_position.y = dot( float4($vertex_position.xyz,1), $mvpMatrixY );
+		@sv_position.z = dot( float4($vertex_position.xyz,1), $mvpMatrixZ );
+		@sv_position.w = dot( float4($vertex_position.xyz,1), $mvpMatrixW );
+		@legacy_texcoord = float4( $vertex_texcoord.xy, 0, 0 );
+		@legacy_color = swizzleColor( $vertex_color );
+		@legacy_texcoord1 = ($vertex_tangent + 1.0f)*0.5f;
+	}
+	hlsl_fp_main {
+
+		// black level adjustment
+		float scale = 1.0 - $cbBlackLevel.x;
+		float bias = $cbBlackLevel.x;
+
+		float4 c = $transMap.Sample( $linearClamp, $legacy_texcoord.xy ) * $legacy_color + $legacy_texcoord1;
+		@sv_target.xyz = saturate( c.xyz * scale + bias ) * c.w;
+		@sv_target.w = c.w;
+	}
+}

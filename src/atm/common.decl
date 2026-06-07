@@ -1,0 +1,84 @@
+{
+	newstyle
+	hlsl_prefix {
+
+#ifndef ATM_COMMON_INCLUDED
+#define ATM_COMMON_INCLUDED
+
+		static const float	ATMOSPHERE_THICKNESS_KM = 60.0;
+		static const float	GROUND_RADIUS_KM = 6360.0;
+		static const float	ATMOSPHERE_RADIUS_KM = GROUND_RADIUS_KM + ATMOSPHERE_THICKNESS_KM;
+
+		static const float3	EARTH_CENTER_KM = float3( 0.0, -GROUND_RADIUS_KM, 0.0 );			// Far below us!
+
+		static const float	MAX_CAMERA_ALTITUDE_KM = 4.0;										// In the finalized tables, the camera/scene is only supposed to go that high
+		static const float	MAX_CAMERA_RADIUS_KM = GROUND_RADIUS_KM + MAX_CAMERA_ALTITUDE_KM;
+		static const float	MIN_COS_THETA_CAMERA = -sqrt( 1.0 - (GROUND_RADIUS_KM*GROUND_RADIUS_KM / (MAX_CAMERA_RADIUS_KM*MAX_CAMERA_RADIUS_KM)) );	// = -0.03544962577549610056581337865552 for a 4km maximum altitude (about 92° from zenith)
+
+ 		static const float3	SIGMA_SCATTERING_RAYLEIGH = float3( 0.0058, 0.0135, 0.0331 );		// For lambdas (680,550,440) nm
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Phase functions
+
+		// Standard Rayleigh "cacahuète"
+		float	PhaseFunctionRayleigh( float _CosPhaseAngle )
+		{
+			return (3.0 / (16.0 * PI)) * (1.0 + _CosPhaseAngle * _CosPhaseAngle);
+		}
+
+		// Henyey-Greenstein
+		float	PhaseFunctionMie( float _CosPhaseAngle, float g )
+		{
+			return (1.5 * INVFOURPI) * (1.0 - g*g) * pow( max( 0.00001, 1.0 + (g*g) - 2.0*g*_CosPhaseAngle ), -1.5 ) * (1.0 + _CosPhaseAngle * _CosPhaseAngle) / (2.0 + g*g);
+		}
+
+		// Simplified Henyey-Greenstein
+		float	PhaseFunctionSchlick( float _CosPhaseAngle, float g )
+		{
+			float	Den = (1.0 - g * _CosPhaseAngle);
+			return INVFOURPI * (1.0 - g*g) / (Den * Den);
+		}
+
+		// An interesting variation and more general phase function taking 2 parameters (from: http://arxiv.org/pdf/astro-ph/0304060.pdf)
+		//	g is the same as usual, i.e. Henyey-Greenstein scattering anisotropy
+		//	a is new and interestingly gives:
+		//		a=0, g!=0 reverts back to Henyey-Greenstein
+		//		a=0, g=0 reverts back to Rayleigh scattering
+		//		a=1, g!=0 reverts back to Cornette-Shanks
+		//
+		float	PhaseFunctionDraine( float _CosPhaseAngle, float g, float a )
+		{
+			return (1.0 - g*g) * (1.0 + a * _CosPhaseAngle*_CosPhaseAngle) / (
+					FOURPI * (1.0 + a * (1.0 + 2.0*g*g)/3.0) * pow( max( 0.0, 1.0 + (g*g) - 2.0*g*_CosPhaseAngle ), 1.5 )
+				);
+		}
+
+		// Gets the full Mie RGB components from full Rayleigh RGB and only Mie Red
+		// This is possible because both values are proportionally related (cf. Bruneton paper, chapter 4 on Angular Precision)
+		// _RayleighMieRed : XYZ = Crayleigh, W=Cmie.red
+		float3	GetMieFromRayleighAndMieRed( float4 _RayleighMieRed )
+		{
+			_RayleighMieRed.w = max( 1e-3, _RayleighMieRed.w );
+			return _RayleighMieRed.xyz * (_RayleighMieRed.w * (SIGMA_SCATTERING_RAYLEIGH.x / SIGMA_SCATTERING_RAYLEIGH) / max( _RayleighMieRed.x, 1e-3 ));
+		}
+
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Planetary Helpers
+		//
+
+		// Computes shadowing by the Earth
+		// Return 1 if Sun is visible from specified altitude, 0 otherwise
+		float	ComputeEarthShadowing( float _AltitudeKm, float _CosSun )
+		{
+			float	RadiusKm = GROUND_RADIUS_KM + _AltitudeKm;
+			float	MinSin = GROUND_RADIUS_KM / RadiusKm;
+			float	MinCos = sqrt( 1.0 - MinSin*MinSin );
+			return smoothstep( MinCos-2e-2, MinCos+2e-2, _CosSun );
+		}
+
+#endif	// #ifndef ATM_COMMON_INCLUDED
+	}
+}

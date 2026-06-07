@@ -1,0 +1,23 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float4 color = $(Identity/BufferIn).SampleLevel( $bilinearClamp, $texcoord, 0.0f );
+		@sv_target = color;
+	}
+}

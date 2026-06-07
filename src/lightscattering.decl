@@ -1,0 +1,267 @@
+{
+	newstyle
+	hlsl_prefix {
+	#ifndef LIGHT_SCATTERING_HELPERS
+	#define LIGHT_SCATTERING_HELPERS
+	#define NO_SHADOW (9999)
+	#include <helper>
+
+		// =======================================================================
+		//  _  _ ___ _    ___ ___ ___  ___
+		// | || | __| |  | _ \ __| _ \/ __|
+		// | __ | _|| |__|  _/ _||   /\__ \
+		// |_||_|___|____|_| |___|_|_\|___/
+		//
+		// =======================================================================
+
+		float ComputeScatteringAttenuation( const uint _lightType, LightContext _light, float3 rayDir,  float minT, float t ) {
+			float attenuation = 1.0;
+
+			//Point Attenuation
+			float3 middleRayToLight = _light.m_wsLightPos - ($wsCamPos + rayDir*( minT + t*0.5 ));
+			float sqrDist = dot( middleRayToLight, middleRayToLight );
+			attenuation *= smoothstep( _light.m_RadiusCutoff* _light.m_RadiusCutoff, _light.m_RadiusFalloff * _light.m_RadiusFalloff, sqrDist );
+
+			//Spot Attenuation
+			if ( _lightType == LIGHT_TYPE_SPOT ) {
+				float angularAttenuation = 1.0 - saturate( lerp( 0.5, 1.0, dot( normalize(middleRayToLight), _light.m_SpotDir ) ) * _light.m_SpotParms.x + _light.m_SpotParms.y );
+				attenuation *= angularAttenuation;
+			}
+
+			//Scatter Attenuation
+			return attenuation * _light.m_ScatterValue;
+		}
+
+		void CreateShadowContext( const uint _lightType, LightContext _light, float3 _wsToLight, out float4x4 _matWorldToShadow, out uint _index ) {
+			uint shadowIndex;
+			if ( _lightType == LIGHT_TYPE_POINT || _lightType == LIGHT_TYPE_HALF_POINT ) {
+				shadowIndex = _light.m_ShadowSetup + OmniShadowMapSliceOffset( _wsToLight );
+			}
+			else {
+				shadowIndex = _light.m_ShadowSetup;
+			}
+
+			_index = SHADOW_SLICE_INDEX( $(tlf/shadows)[ shadowIndex ].mInfo );
+			_matWorldToShadow = $(tlf/shadows)[ shadowIndex ].mWorldToShadowMat;
+		}
+
+		float InScatter(float3 start, float3 dir, float3 lightPos, float d)	{
+			// light to ray origin
+			float3	q = start - lightPos;
+
+			// coefficients
+			float	b = dot(dir, q);
+			float	c = dot(q, q);
+
+			// evaluate integral
+			float	s = 1.0 / sqrt(max(0.0001,c-b*b));
+
+			// bmayaux (2015-01-19) Since we know that atan(x) - atan(y) = atan( (x - y) / (1 + xy) ), we can optimize the line below...
+			// I'll skip the calculation's detail but after simplification we get this...
+			return s * atan( d / max(0.0001,s * (c + b * d)) );
+			//return s * (atan((d + b) * s) - atan( b*s ));
+		}
+
+		float3 FakeRayleigh(float theta) {
+			const float3 Br = float3(0.2, 0.5, 0.8);
+			const float pi316 = 3.0/(16.0*PI);
+			float phase = 1.0 + (theta*theta);
+			float3 ret = pi316*phase*Br;
+			return ret;
+		}
+		
+		float ComputeTurbulence( LightContext _light, uint2 pixelCoords ) {
+			float2	screenTexCoords = screenPosToTexcoord( pixelCoords, $positionToViewTexture, $resolutionScale.xy );
+			float dynamic1stCanvasValue = $dynamicCanvas.SampleLevel( $bilinearSampler, screenTexCoords, 0.0 ).x;
+			float dynamic2ndCanvasValue = $dynamicCanvasLightScattering.SampleLevel( $bilinearSampler, screenTexCoords, 0.0 ).x;
+			float canvasValue = (_light.m_scatter2ndTurbulence ? dynamic2ndCanvasValue : dynamic1stCanvasValue);
+			return lerp( 1.0, canvasValue, _light.m_ScatterTurbulence );
+		}
+
+		float ComputeShadowTerm( const uint _lightType, uint2 pixelCoords, LightContext _light, float3 rayDir, float minT, float t, const uint _quality ) {
+			//Compute camera position
+			uint tapCount = 8;
+			switch ( _quality ) {
+				case HIGH_QUALITY: tapCount = 16; break;
+				case AVERAGE_QUALITY: tapCount = 8; break;
+				case LOW_QUALITY: tapCount = 3; break; 
+			}
+
+			float stepSize = t / float(tapCount);
+			float3 rayStep = rayDir * stepSize;
+
+			//Interleaved Offset
+			float rayOffset = 0.0;
+			if( _quality > LOW_QUALITY ) {
+				const uint interleavedSize = 8;
+				const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+				uint2 interleavedPos = pixelCoords % interleavedSize;
+				#if $(atm/worldFog/useTemporal)
+//					rayOffset = (float)B8( uint2( interleavedPos /* + rand24b( interleavedPos + $viewRandom.xy ) */ ) ) * stepSize * interleavedSquareRcp;
+					rayOffset = (float)B8( uint2( interleavedPos + 0.5 + $jitterVectors.xy ) ) * stepSize * interleavedSquareRcp;
+				#else
+					rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+				#endif
+			}
+
+			//Raymarch
+			float shadowTerm = 0.0;
+			float scatterInShadow = 0.0;
+			float3 wsRayPos = $wsCamPos + rayDir * (minT + rayOffset);
+			float3 wsScatterPos = $wsCamPos + rayDir * (minT);
+			float3 lightPos = _light.m_wsLightPos - _light.m_SpotDir * _light.m_ScatterOffset;
+			
+			for(uint i = 0 ; i < tapCount; ++i) {
+
+				//Shadow Matrix
+				uint sliceIndex;
+				float4x4 worldToShadow;
+				float3 wsToLight = _light.m_wsLightPos - wsRayPos;
+				CreateShadowContext(_lightType, _light, wsToLight, worldToShadow, sliceIndex);
+
+				float4 shadowMapPos = mul( float4(wsRayPos,1.0), worldToShadow );
+				shadowMapPos /= shadowMapPos.w;
+
+				shadowTerm = $(shadowMapAtlas).SampleCmpLevelZero( $(shadowHardwarePCFSampler), float3( shadowMapPos.xy, sliceIndex ), shadowMapPos.z );
+				scatterInShadow += InScatter(wsScatterPos, rayDir, lightPos, stepSize) * shadowTerm;
+				wsRayPos += rayStep;
+				wsScatterPos += rayStep;
+			}
+
+			return scatterInShadow;
+		}
+
+		float4 ComputeLightScattering( const uint _lightType, uint2 sv_position, float3 _wsView, float _distance, LightContext _light, const uint _quality ) {
+			float3 rayDir = -_wsView;
+			float d =  _distance;
+			float minT = 0.0, maxT = d;
+			IntersectRaySphere( $wsCamPos, rayDir, _light.m_wsLightPos, _light.m_RadiusCutoff, minT, maxT);
+
+			if( _light.m_scatterCustomShape && (_lightType == LIGHT_TYPE_POINT || _lightType == LIGHT_TYPE_HALF_POINT) ) {
+				IntersectRayCube( $wsCamPos, rayDir, _light.m_wsLightPos, _light.m_SpotDir, _light.m_AreaLightX, _light.m_RadiusCutoff, _light.m_originOffset, _light.m_ScatterScale, minT, maxT);
+			}
+
+			if ( _lightType == LIGHT_TYPE_SPOT ) {
+				float minT2, maxT2 = d;
+				if( _light.m_scatterCustomShape ) {
+					InstersectRayFrustum( $wsCamPos, rayDir, _light.m_wsLightPos, _light.m_SpotDir, _light.m_SpotParms.z, _light.m_originOffset, _light.m_RadiusCutoff, _light.m_AreaLightX, _light.m_ScatterScale, minT2, maxT2);
+				} else {
+					IntersectRayTruncatedCone($wsCamPos, rayDir, _light.m_wsLightPos, _light.m_SpotDir, _light.m_SpotParms.z, _light.m_originOffset, _light.m_RadiusCutoff, minT2, maxT2);
+				}
+				minT = max(minT,minT2);
+				maxT = min(maxT,maxT2);
+			}
+
+			maxT = clamp(maxT, minT, d);
+			float t = max(0.0, maxT - minT);
+
+			//Ray intersect, we need to compute light-scattering
+			if(t > 0.0)	{
+				if( _quality < NO_SHADOW ) {
+					if ( _light.m_useVolumetricShadow && _light.m_ShadowSetup != 0xFFFFFFFF ) {
+						_light.m_scatter = ComputeShadowTerm( _lightType, sv_position, _light, rayDir, minT, t, _quality );
+						_light.m_scatter *= ComputeTurbulence( _light, sv_position );
+					} else
+					{
+						float3 lightPos = _light.m_wsLightPos - _light.m_SpotDir * _light.m_ScatterOffset;
+						_light.m_scatter = InScatter($wsCamPos + rayDir*minT, rayDir, lightPos, t);
+						_light.m_scatter *= ComputeTurbulence( _light, sv_position );
+					}
+				} else {
+					float3 lightPos = _light.m_wsLightPos - _light.m_SpotDir * _light.m_ScatterOffset;
+					_light.m_scatter = InScatter($wsCamPos + rayDir*minT, rayDir, lightPos, t);
+				}
+				_light.m_scatter *= ComputeScatteringAttenuation( _lightType, _light, rayDir, minT, t );
+			}
+			else {
+				_light.m_scatter = 0.00;
+			}
+
+			// =================================================================
+			// Finalize
+			float4	MixedColor = float4( _light.m_color * _light.m_scatter, _light.m_scatter );
+			return MixedColor;
+		}
+
+		float4 ComputeLightScattering( SurfaceContext _Surface, LightContext _light,  const uint _lightType ) {
+			float4 scatter = ComputeLightScattering( _lightType, _Surface.pixelIndex, _Surface.wsView, _Surface.distance, _light, NO_SHADOW );
+			return scatter;
+		}
+
+		LightContext	CreateLightScatteringContext( SurfaceContext _Surface, const uint _lightType ) {
+			float3 _wsPosition = _Surface.wsPosition;
+			uint2 _pixelAddr = _Surface.pixelIndex;
+
+			LightContext	context = (LightContext) 0;
+			context.m_currentLightIndex = $(tls/ll/heads)[ (_pixelAddr >> $(tlf/tileDimForLighting).xx) + _lightType*uint2( $(tlf/invTileDimensions).z, 0 ) ] ;	// Read entry index from the linked list for the specified light type (1 linked list per type)
+			context.m_lightsCount = 0;
+			context.m_wsPosition = _wsPosition;
+
+			return context;
+		}
+
+		float4	IntegrateScatter( in SurfaceContext _Surface, const uint _quality ) {
+			float4 accumScattering = 0.0;
+
+			#if $isAlpha && !isMainPassAlpha
+				uint maxLights = 32;
+				switch ( _quality ) {
+					case HIGH_QUALITY: maxLights = 32; break;
+					case AVERAGE_QUALITY: maxLights = 16; break;
+					case LOW_QUALITY: maxLights = 8; break;
+				}
+
+				float4 accumPoint = 0.0;
+				float4 accumHalfPoint = 0.0;
+				float4 accumSpot = 0.0;
+
+				LightContext	light = CreateLightScatteringContext( _Surface, LIGHT_TYPE_POINT );
+				while( light.NextLightData( maxLights ) ) {
+					int lightIndex;
+					if (light.LightIndex(lightIndex)) {
+						light.FetchLightData(lightIndex);
+						float4 accum = COMPUTE_LIGHT_SCATTERING( _Surface, light, LIGHT_TYPE_POINT );
+						float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+						accumPoint.rgb += accum.rgb;
+						accumPoint.a += accum.a * lightLum;
+					}
+				}
+				light = CreateLightScatteringContext( _Surface, LIGHT_TYPE_HALF_POINT );
+				while( light.NextLightData( maxLights ) ) {
+					int lightIndex;
+					if (light.LightIndex(lightIndex)) {
+						light.FetchLightData(lightIndex);
+						float4 accum = COMPUTE_LIGHT_SCATTERING( _Surface, light, LIGHT_TYPE_HALF_POINT );
+						float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+						accumHalfPoint.rgb += accum.rgb;
+						accumHalfPoint.a += accum.a * lightLum;
+					}
+				}
+				light = CreateLightScatteringContext( _Surface, LIGHT_TYPE_SPOT );
+				while( light.NextLightData( maxLights ) ) {
+					int lightIndex;
+					if (light.LightIndex(lightIndex)) {
+						light.FetchLightData(lightIndex);
+						float4 accum = COMPUTE_LIGHT_SCATTERING( _Surface, light, LIGHT_TYPE_SPOT );
+						float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+						accumSpot.rgb += accum.rgb;
+						accumSpot.a += accum.a * lightLum;
+					}
+				}
+				//accumulate all lights
+				//and compute light-scattering density
+				accumScattering.rgb = accumPoint.rgb + accumHalfPoint.rgb + accumSpot.rgb;
+				accumScattering.a = min( 1.0, max(accumScattering.r, max( accumScattering.g, accumScattering.b ) ) );
+				float density = saturate(accumPoint.a + accumHalfPoint.a + accumSpot.a);
+				
+				//premultiply with alpha
+				//give better result even if, we should not do this
+				accumScattering.rgb *= accumScattering.a;
+				accumScattering = float4( accumScattering.rgb, density );
+			#endif
+			return accumScattering;
+		}
+
+	#endif //LIGHT_SCATTERING_HELPERS
+	}
+}

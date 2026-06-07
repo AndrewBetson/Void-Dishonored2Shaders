@@ -1,0 +1,24 @@
+{
+	newstyle
+
+	parms {
+	}
+	
+	state {
+		depthWrite	0
+		depthEnable	1
+		depthfunc	NOTEQUAL
+		cull none
+	}
+
+	hlsl_vp_main {
+		//draw quad on far plane
+		@sv_position = float4( $vertex_position.xy, 0.0, 1.0 );
+	}
+	
+	hlsl_fp_main {
+		float Z0 = ComputeLinearZ( $(SSAO/Zbuffer)[(uint2)$sv_position.xy] );
+		float2 CompressedDepth = pack_2byte( Z0 );
+		@sv_target = float4( 1.0/*nVidia hbao*/, 1.00 /*shadow*/, CompressedDepth );
+	}
+}

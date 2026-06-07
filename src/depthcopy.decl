@@ -1,0 +1,13 @@
+{
+	newstyle
+		
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.f );
+		@legacy_texcoord = float4( $vertex_texcoord.xy * $vertexXYZScale.xy + $vertexXYZBias.xy, 0.f, 0.f );
+	}
+	
+	hlsl_fp_main {
+		float depthSrc = $depthSrcTex.SampleLevel( $pointSampler, float3( $legacy_texcoord.xy, $texArraySlice.x ), 0 ).x;
+		@sv_depth = depthSrc;
+	}
+}

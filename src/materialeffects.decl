@@ -1,0 +1,327 @@
+{
+	newstyle
+	hlsl_prefix {
+
+		#ifndef MATERIALEFFECTS_INCLUDED
+		#define	MATERIALEFFECTS_INCLUDED
+		
+		#include <surfaceContext>
+		#include <pixel>
+		
+		#define SST_NONE			0
+		#define SST_IMMOLATION		1
+		#define SST_BURNT			2
+		#define SST_LAYERCHANGE		3
+		#define SST_DISAPEAR		4
+		
+		
+		float2 scale_pan_uv ( float2 uv, float4 scale_pan, float time) {
+		   return uv * scale_pan.xy + time.xx * scale_pan.zw;
+		}
+		
+		float2 rolling_uv_dist ( Texture2D  bc5normal, float2 uv, float speed, float2 strength, float time ){
+			float2 uv_normals = bc5normal.Sample( $trilinearSampler, uv ).xy * strength;
+			float2 uv_remap = cos ( uv * TWOPI + time * speed );
+			return uv_normals * uv_remap; 
+		}
+
+		
+		struct	arkMtrEffectContext_t {
+
+			float fadeValue;
+			float3 emmissiveColor;
+			float4 rawFxColor;
+
+			void InitDisapearSurfaceShader( inout arkPixelContext_t pixelCtx ) {
+				// for body eaten
+				if ( $(materialEffects/disapear/alphaSteps).x > 0) {
+					fadeValue = floor ( fadeValue * $(materialEffects/disapear/alphaSteps).x ) / $(materialEffects/disapear/alphaSteps).x; 
+				}
+				
+				float2 uv = pixelCtx.m_texCoords.zw;
+				// get the UV distortion
+				float2 uv_distortion = $(materialEffects/disapear/uvDistoMap).Sample( $trilinearSampler, scale_pan_uv( uv, $(materialEffects/disapear/uvDistoScalePan), $localtime.x ) ).xy * $(materialEffects/disapear/uvDistoStrength).xy;
+
+				// get the U value to fetch in the lookup and determine the alpha
+				float2 uv_lookup;
+				uv_lookup.x  = $(materialEffects/disapear/noiseMap1).Sample( $trilinearSampler,  scale_pan_uv( uv, $(materialEffects/disapear/noise1_scale_pan), $localtime.x ) + uv_distortion ).x;
+				uv_lookup.x *= $(materialEffects/disapear/noiseMap2).Sample( $trilinearSampler,  scale_pan_uv( uv, $(materialEffects/disapear/noise2_scale_pan), $localtime.x ) - uv_distortion ).x;
+
+				uv_lookup.x = saturate (  uv_lookup.x + $(materialEffects/disapear/horizontalLookup).x - fadeValue );
+
+				//get the FX color
+				uv_lookup.y =  $(materialEffects/disapear/verticalLookup).x; 
+				float4 fx_color = $(materialEffects/disapear/lookupColorMap).SampleLevel( $bilinearClamp,  uv_lookup, 0.0 );
+
+				fx_color.w -= $(materialEffects/disapear/alphaThreshold).x;
+				
+				#if $alphaTest
+					clip( fx_color.w );
+				#endif				
+
+				fx_color.w = 1.0 - fx_color.w;
+
+				rawFxColor = fx_color;
+				emmissiveColor = fx_color.xyz * $(materialEffects/disapear/emmissiveIntensity).xxx;
+			}
+
+			void InitLayerChangeSurfaceShader( inout arkPixelContext_t pixelCtx ) {
+				#if( $(materialeffects/layerchange/enable) )
+					if ( $(materialEffects/layerchange/alphaSteps).x > 0) {
+						fadeValue = floor ( fadeValue * ($(materialEffects/layerchange/alphaSteps).x+0.5) ) / $(materialEffects/layerchange/alphaSteps).x; 
+					}
+
+					float2 gradientMapUV = float2( pixelCtx.m_texCoords[0+$(materialEffects/layerchange/gradientMapUVset)*2], pixelCtx.m_texCoords[1+$(materialEffects/layerchange/gradientMapUVset)*2] );
+					
+					float gradient = $(materialEffects/layerchange/gradientMap).Sample( $trilinearSampler, gradientMapUV ).x;
+					
+					float transitionHalfWidth = $(materialEffects/layerchange/transitionWidth).x * 0.5;
+					
+					float transitionValue = ( ( 1.0 + $(materialEffects/layerchange/transitionWidth).x ) * fadeValue ) - transitionHalfWidth;
+					
+					float minVal = transitionValue-transitionHalfWidth;
+					float maxVal = transitionValue+transitionHalfWidth;
+					float mask = 1.0-smoothstep( minVal, maxVal, gradient );
+					
+					//in this case i use rawFxColor.w to store mask value
+					rawFxColor = 0.0;
+					rawFxColor.w = mask;
+					
+					emmissiveColor = 0.0;
+				#endif
+			}
+			
+			void ApplyLayerChangeSurfaceShader( in arkPixelContext_t pixelCtx, inout SurfaceContext surf, bool ssspass ) {
+				#if( $(materialeffects/layerchange/enable) )
+
+					float2 uv = pixelCtx.m_texCoords.xy;
+					float2 uv2 = pixelCtx.m_texCoords.zw;
+
+					float mask = rawFxColor.w;
+
+					if(!ssspass) {
+						float4 diffuse = $(materialEffects/layerchange/altDiffuseMap).Sample( $trilinearSampler, uv );
+						#if $hasDynamicDecals
+							diffuse.rgb = lerp( diffuse.rgb, pixelCtx.m_dynamicDecal.rgb, pixelCtx.m_dynamicDecal.a );
+						#endif
+						surf.diffuseAlbedo = lerp( surf.diffuseAlbedo, diffuse.rgb, mask );
+					}
+					
+					#if $(materialeffects/layerchange/hasGlossMap)
+						float gloss = $(materialEffects/layerchange/altGlossMap).Sample( $trilinearSampler, uv ).x;
+						
+						#if $hasDynamicDecals
+							gloss = lerp( gloss, $dynamicDecalGloss.x, 1.0-( pow( 1.0-pixelCtx.m_dynamicDecal.a, $dynamicDecalGlossPower.x ) ) );
+						#endif
+						
+						float roughness = 1.0-lerp( $wardRoughness.x, $wardRoughness.y, gloss );
+						surf.roughness = lerp( surf.roughness, roughness, mask );
+					#endif
+
+					#if( $(materialeffects/layerchange/hasOcclusionMap) )
+						float occlusion = $(materialEffects/layerchange/altOccluisonMap).Sample( $trilinearSampler, uv ).x;
+						surf.AO.x = lerp( surf.AO.x, occlusion, mask );
+					#endif
+
+					#if $(materialeffects/layerchange/hasAnimatedEmissive)
+						float gradientValue = $(materialeffects/layerchange/emissiveGradientMap).Sample( $anisotropicSampler, uv ).x;
+						float threshold = $(materialeffects/layerchange/emissiveRevealParams).x;
+						float transitionWidth = $(materialeffects/layerchange/emissiveRevealParams).y;
+						float transitionHalfWidth = transitionWidth * 0.5;
+						float transitionValue = ( ( 1.0 + transitionWidth ) * threshold ) - transitionHalfWidth;
+						float minVal = transitionValue-transitionHalfWidth;
+						float maxVal = transitionValue+transitionHalfWidth;
+						float emissiveMask = mask * smoothstep( minVal, maxVal, gradientValue );
+
+						#if $(materialEffects/layerchange/emissiveAsGoo)
+							float3 gooColor = $(materialEffects/layerchange/emissiveGooColor).xyz * $(materialEffects/layerchange/emissiveGooColor).www;
+							if(!ssspass) {
+								surf.diffuseAlbedo = lerp( surf.diffuseAlbedo, gooColor, emissiveMask);
+							}
+							surf.roughness = lerp( surf.roughness, 1.0-$(materialEffects/layerchange/emissiveGooGloss).x, emissiveMask);
+						#else
+							float2 noise1UV = $(materialeffects/layerchange/emissiveNoise1ScalePan).xy * uv2 + $localtime.xx * $(materialeffects/layerchange/emissiveNoise1ScalePan).zw;
+							float noise1Value = $(materialeffects/layerchange/emissiveNoise1Map).Sample( $anisotropicSampler, noise1UV ).x;
+							float2 noise2UV = $(materialeffects/layerchange/emissiveNoise2ScalePan).xy * uv2 + $localtime.xx * $(materialeffects/layerchange/emissiveNoise2ScalePan).zw;
+							float noise2Value = $(materialeffects/layerchange/emissiveNoise2Map).Sample( $anisotropicSampler, noise2UV ).x;
+							float noise = noise1Value * noise2Value;
+							float3 emissive = $(materialEffects/layerchange/emmissiveIntensity).x * $(materialeffects/layerchange/emissiveLookup).Sample( $anisotropicSampler, float2(noise, 0.5) ).xyz;
+							surf.emissive = lerp( surf.emissive, emissive, emissiveMask );
+						#endif
+					#endif
+
+					#if $(materialeffects/layerchange/hasBumpMap) && $hairPass != 2 //not during hair light prepass
+						float2 rawTsNormal = $(materialEffects/layerchange/altNormalMap).Sample( $trilinearSampler, uv ).xy;
+						float3	tsNormal = UnpackBC5NormalMap( rawTsNormal ); 
+						
+						#if $hasDynamicDecals
+							tsNormal = lerp( tsNormal, float3(0,0,1), saturate( (1.0-( pow( 1.0-pixelCtx.m_dynamicDecal.a, $dynamicDecalNormalSmoothingPower.x ) ))-(1.0-$dynamicDecalNormalSmoothing.x) ));
+						#endif
+						
+						#if $(materialeffects/layerchange/hasAnimatedEmissive)
+							#if $(materialEffects/layerchange/emissiveAsGoo)
+								tsNormal = lerp( tsNormal, float3(0,0,1), saturate( emissiveMask-(1.0-$(materialEffects/layerchange/emissiveGooNormalSmoothing).x) ));
+							#endif
+						#endif
+						
+						float3 wsNormal = normalize( tsNormal.x * pixelCtx.m_wsVertexTangent + tsNormal.y * pixelCtx.m_wsVertexBiTangent + tsNormal.z * pixelCtx.m_wsVertexNormal );
+						surf.wsNormal = lerp( surf.wsNormal, wsNormal, mask );
+					#endif
+
+				#endif
+			}
+			
+			void InitImmolationSurfaceShader( inout arkPixelContext_t pixelCtx ) {
+
+				float2 uv = pixelCtx.m_texCoords.zw;
+
+				// roll the first normal
+				float2 uv_dist = rolling_uv_dist( $(materialEffects/immolation/normalMap1), scale_pan_uv( uv, $(materialEffects/immolation/normal1_scale_pan), $localtime.x), $(materialEffects/immolation/normalRollingSpeed1).x, $(materialEffects/immolation/normalStrength1).xy, $localtime.x );
+				// roll the second normal                                                                                                                                                                                         
+				uv_dist       += rolling_uv_dist( $(materialEffects/immolation/normalMap2), scale_pan_uv( uv, $(materialEffects/immolation/normal2_scale_pan), $localtime.x), $(materialEffects/immolation/normalRollingSpeed2).x, $(materialEffects/immolation/normalStrength2).xy, $localtime.x );
+				
+				// set the grey value to read the lookup
+				float4 masterPanSpeed = float4( 1.0, 1.0, $(materialEffects/immolation/masterPanSpeed).x, $(materialEffects/immolation/masterPanSpeed).x );
+				float greyValue = $(materialEffects/immolation/noiseMap).Sample( $trilinearSampler, scale_pan_uv( uv, $(materialEffects/immolation/noise1_scale_pan) * masterPanSpeed, $localtime.x) + uv_dist ).x;
+				greyValue      *= $(materialEffects/immolation/noiseMap).Sample( $trilinearSampler, scale_pan_uv( uv, $(materialEffects/immolation/noise2_scale_pan) * masterPanSpeed, $localtime.x) - uv_dist ).x;
+
+				//read the color in the color lookup 
+				float4 fx_color = $(materialEffects/immolation/lookupColorMap).SampleLevel( $bilinearClamp, float2( greyValue, fadeValue ), 0.0 );
+				
+				#if $alphaTest && $(materialEffects/immolation/enableDiscard)
+					clip( 0.9-fx_color.w );
+				#endif				
+
+				
+				rawFxColor = fx_color;
+				emmissiveColor = fx_color.xyz * $(materialEffects/immolation/emmissiveIntensity).xxx;
+			}
+
+			
+			void InitMaterialEffect( inout arkPixelContext_t pixelCtx ) {
+				fadeValue = $(materialEffects/fadeValue).x;
+				emmissiveColor = 0.0;
+				rawFxColor = 0.0;
+					
+	#if 1	//DEBUG LAND
+				if( fadeValue<0.0f ) {
+					float fakeTime = frac(-fadeValue * $localtime.x) * 1.1;
+					if( fakeTime>1.0 ) {
+						fadeValue = 0.0;
+					} else {
+						fadeValue = frac(fakeTime);
+					}
+				}
+	#endif			
+
+				#if $(materialEffects/surfaceShaderIndex) == SST_IMMOLATION
+					InitImmolationSurfaceShader( pixelCtx );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_BURNT
+					#if $alphaTest && $(materialEffects/immolation/enableDiscard)
+						clip( -1 );
+					#endif				
+
+				#elif $(materialEffects/surfaceShaderIndex) == SST_LAYERCHANGE
+					InitLayerChangeSurfaceShader( pixelCtx );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_DISAPEAR
+					InitDisapearSurfaceShader( pixelCtx );
+				#endif
+			}
+			
+
+			void ApplyMaterialEffect( in arkPixelContext_t pixelCtx, inout SurfaceContext surf ) {
+				#if $(materialEffects/surfaceShaderIndex) == SST_IMMOLATION
+					surf.emissive += emmissiveColor;
+					surf.roughness = lerp( surf.roughness, saturate(surf.roughness*2.0), max(rawFxColor.w, fadeValue) );
+					surf.diffuseAlbedo *= lerp( 1.0, $(materialEffects/immolation/diffuseFactor).x, rawFxColor.w );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_BURNT
+					surf.roughness = saturate(surf.roughness*2.0);
+					surf.diffuseAlbedo *= $(materialEffects/immolation/diffuseFactor).x;
+				#elif $(materialEffects/surfaceShaderIndex) == SST_LAYERCHANGE
+					ApplyLayerChangeSurfaceShader( pixelCtx, surf, false );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_DISAPEAR
+					if( $(materialEffects/disapear/disapearFromBrunt).x == 1 ) {
+						surf.roughness = saturate(surf.roughness*2.0);
+						surf.diffuseAlbedo *= $(materialEffects/immolation/diffuseFactor).x;
+					}
+					surf.emissive += emmissiveColor;
+					surf.roughness = lerp( surf.roughness, min( surf.roughness, (1.0-rawFxColor.w) ), $(materialEffects/disapear/glossFactor).x );
+					surf.diffuseAlbedo =  surf.diffuseAlbedo * (1.0-rawFxColor.w) + rawFxColor.xyz * rawFxColor.w;
+				#endif
+			}
+			
+			void ApplyMaterialEffect_SSS( in arkPixelContext_t pixelCtx, inout SurfaceContext surf ) {
+				#if $(materialEffects/surfaceShaderIndex) == SST_IMMOLATION
+					surf.emissive += emmissiveColor;
+					surf.roughness = lerp( surf.roughness, saturate(surf.roughness*2.0), max(rawFxColor.w, fadeValue) );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_BURNT
+					surf.roughness = saturate(surf.roughness*2.0);
+				#elif $(materialEffects/surfaceShaderIndex) == SST_LAYERCHANGE
+					ApplyLayerChangeSurfaceShader( pixelCtx, surf, true );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_DISAPEAR
+					if( $(materialEffects/disapear/disapearFromBrunt).x == 1 ) {
+						surf.roughness = saturate(surf.roughness*2.0);
+					}
+					surf.emissive += emmissiveColor;
+					surf.roughness = lerp( surf.roughness, min( surf.roughness, (1.0-rawFxColor.w) ), $(materialEffects/disapear/glossFactor).x );
+				#endif
+			}
+
+			
+			void ApplyMaterialEffect_SSSBlur( in arkPixelContext_t pixelCtx, inout float3 emissive, inout float3 albedo ) {
+				#if $(materialEffects/surfaceShaderIndex) == SST_IMMOLATION
+					emissive += emmissiveColor;
+					albedo *= lerp( 1.0, $(materialEffects/immolation/diffuseFactor).x, rawFxColor.w );
+				#elif $(materialEffects/surfaceShaderIndex) == SST_BURNT
+					albedo *= $(materialEffects/immolation/diffuseFactor).x;
+				#elif $(materialEffects/surfaceShaderIndex) == SST_LAYERCHANGE
+					//ApplyLayerChangeSurfaceShader( pixelCtx, surf, true );
+					float2 uv = pixelCtx.m_texCoords.xy;
+					float2 uv2 = pixelCtx.m_texCoords.zw;
+
+					float mask = rawFxColor.w;
+
+					float4 diffuse = $(materialEffects/layerchange/altDiffuseMap).Sample( $trilinearSampler, uv );
+					#if $hasDynamicDecals
+						diffuse.rgb = lerp( diffuse.rgb, pixelCtx.m_dynamicDecal.rgb, pixelCtx.m_dynamicDecal.a );
+					#endif
+					
+					albedo = lerp( albedo, diffuse.rgb, mask );
+
+					#if $(materialeffects/layerchange/hasAnimatedEmissive)
+						float gradientValue = $(materialeffects/layerchange/emissiveGradientMap).Sample( $anisotropicSampler, uv ).x;
+						float threshold = $(materialeffects/layerchange/emissiveRevealParams).x;
+						float transitionWidth = $(materialeffects/layerchange/emissiveRevealParams).y;
+						float transitionHalfWidth = transitionWidth * 0.5;
+						float transitionValue = ( ( 1.0 + transitionWidth ) * threshold ) - transitionHalfWidth;
+						float minVal = transitionValue-transitionHalfWidth;
+						float maxVal = transitionValue+transitionHalfWidth;
+						float emissiveMask = mask * smoothstep( minVal, maxVal, gradientValue );
+
+						#if $(materialEffects/layerchange/emissiveAsGoo)
+							float3 gooColor = $(materialEffects/layerchange/emissiveGooColor).xyz * $(materialEffects/layerchange/emissiveGooColor).www;
+							albedo = lerp( albedo, gooColor, emissiveMask);
+						#else
+							float2 noise1UV = $(materialeffects/layerchange/emissiveNoise1ScalePan).xy * uv2 + $localtime.xx * $(materialeffects/layerchange/emissiveNoise1ScalePan).zw;
+							float noise1Value = $(materialeffects/layerchange/emissiveNoise1Map).Sample( $anisotropicSampler, noise1UV ).x;
+							float2 noise2UV = $(materialeffects/layerchange/emissiveNoise2ScalePan).xy * uv2 + $localtime.xx * $(materialeffects/layerchange/emissiveNoise2ScalePan).zw;
+							float noise2Value = $(materialeffects/layerchange/emissiveNoise2Map).Sample( $anisotropicSampler, noise2UV ).x;
+							float noise = noise1Value * noise2Value;
+							float3 newemissive = $(materialEffects/layerchange/emmissiveIntensity).x * $(materialeffects/layerchange/emissiveLookup).Sample( $anisotropicSampler, float2(noise, 0.5) ).xyz;
+							emissive = lerp( emissive, newemissive, emissiveMask );
+						#endif
+					#endif
+				#elif $(materialEffects/surfaceShaderIndex) == SST_DISAPEAR
+					if( $(materialEffects/disapear/disapearFromBrunt).x == 1 ) {
+						albedo *= $(materialEffects/immolation/diffuseFactor).x;
+					}
+					emissive += emmissiveColor;
+					albedo =  albedo * (1.0-rawFxColor.w) + rawFxColor.xyz * rawFxColor.w;
+				#endif
+			}
+			
+		};
+		
+	#endif //MATERIALEFFECTS_INCLUDED
+	}
+}

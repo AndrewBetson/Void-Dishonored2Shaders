@@ -1,0 +1,264 @@
+{
+	newstyle
+
+	options {
+		useSelfShadowedBumpMap 0		// Not a SSBump map but a transmittance map here!
+		translucency_hq/enable 1		// So shadowing provides us with the correct transforms
+		noScreenShadows 1
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		cull none //TODO remove this should be defined per material
+	}
+	
+	hlsl_prefix {
+
+		#include <vertex>
+		#include <BRDF_vegetation>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <fogHelpers>
+
+		#if DURANGO 
+			#if $alphaTest
+				#define __XBOX_FORCE_PS_ZORDER_RE_Z 1
+			#endif
+		#endif
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		const float detailPhase = 1.0f;
+		
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		
+		float3 initial_localPosition = victx._localPosition;
+		
+		float4 localWind = float4( 0.0, 0.01, 0.0, 0.0 );
+
+		#if $useMultiInstancing && $needsWind
+			uint instanceWindID = $windBufferOffset + victx._instanceID;	// This gives the index in the array of visible instances
+			$windStruct windInfo = $windBuffer[ instanceWindID ];			// This remaps the visible instance ID to the index in the global array of all instances (visible or not)
+
+			VertexOutContext vout = TransformVertex( victx ); // HACK HACK HACK HACK to get the world matrix
+			localWind.x = dot( normalize( vout._worldMat[0].xyz ), windInfo.wind.xyz );
+			localWind.y = dot( normalize( vout._worldMat[1].xyz ), windInfo.wind.xyz );
+			localWind.z = dot( normalize( vout._worldMat[2].xyz ), windInfo.wind.xyz );
+			localWind.w = 1.0;
+			localWind *= windInfo.wind.w;
+		#else	
+			VertexOutContext vout;
+		#endif
+
+		float leafAmplitudeFactor = $(vegetAnim/LeafAmplitude).x * max( $(vegetAnim/LeafMinWindStrength).x, localWind.w );
+
+		AnimateVegetation( 	victx._localPosition, 
+							victx._normal.xyz, 
+							$vertex_color.rgb,
+							float3(0,0,0), //objPos,
+							$localTime.x,
+							localWind.xyz,
+							detailPhase,
+							$(vegetAnim/LeafFreq).x,
+							$(vegetAnim/MainBendingAmplitude).x,
+							$(vegetAnim/MainBendingVar).x,
+							$(vegetAnim/MainBendingFreq).x,
+							$(vegetAnim/BranchAmplitude).x,
+							leafAmplitudeFactor );
+
+		vout = TransformVertex( victx );
+	
+		#if !$isShadow && !$isZPrePass && !$isMasking && !$(tool/unlit)
+			@wsPosition = vout._worldPosition;
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+		
+		#if $isZPrePass && !$isShadow && !$isAlpha && !$isZPrePassAlpha
+		    VertexOutContext previousFrameVout;
+			#if $needsWind
+			    //The motion vector generation for motion blur & temporalAA is done here
+			    float4 prevLocalWind = float4( 0.0, 0.01, 0.0, 0.0 );
+			    #if $useMultiInstancing
+				    previousFrameVout = TransformVertex( victx, true ); // HACK HACK HACK HACK to get the world matrix
+				    prevLocalWind.x = dot( normalize( previousFrameVout._worldMat[0].xyz ), windInfo.previousWind.xyz );
+				    prevLocalWind.y = dot( normalize( previousFrameVout._worldMat[1].xyz ), windInfo.previousWind.xyz );
+				    prevLocalWind.z = dot( normalize( previousFrameVout._worldMat[2].xyz ), windInfo.previousWind.xyz );
+				    prevLocalWind.w = 1.0;
+				    prevLocalWind *= windInfo.previousWind.w;
+			    #endif
+			    float previousLeafAmplitudeFactor = $(vegetAnim/LeafAmplitude).x * max( $(vegetAnim/LeafMinWindStrength).x, prevLocalWind.w );
+    
+			    victx._localPosition = initial_localPosition;
+			    AnimateVegetation( 	victx._localPosition, 
+								    victx._normal.xyz, 
+								    $vertex_color.rgb,
+								    float3(0,0,0), //objPos,
+								    $localTime.x-$localTime.y, //absolute time of previous frame
+								    prevLocalWind.xyz,
+								    detailPhase,
+								    $(vegetAnim/LeafFreq).x,
+								    $(vegetAnim/MainBendingAmplitude).x,
+								    $(vegetAnim/MainBendingVar).x,
+								    $(vegetAnim/MainBendingFreq).x,
+								    $(vegetAnim/BranchAmplitude).x,
+								    previousLeafAmplitudeFactor );
+			#endif
+			previousFrameVout = TransformVertex( victx, true );
+			
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+
+		@sv_position = vout._projPosition;
+		
+		#if $alphaTest || !( $isShadow || $isZPrePass )
+			@texcoords = vout._texcoords;
+		#endif
+	}
+	
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+	
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if $isShadow
+			ClipZorShadowPass( pixelCtx );
+			return;
+		#elif $isZPrePass
+			ClipZorShadowPass( pixelCtx );
+			//Motion vector
+			#if !$isAlpha && !$isZPrePassAlpha
+				float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+				psMotionVector -= $jitterRelativeToPreviousFrame;
+				psMotionVector *= 0.5f;
+				psMotionVector.y *= -1.0f;
+				@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+			#endif
+			return;
+		#elif $(tool/unlit)
+			float  faceColor = pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+			float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, pixelCtx.m_diffuseAlbedo.a) ) * faceColor, pixelCtx.m_diffuseAlbedo, $wireFrameBlend);				
+			#if $alphatest
+				clip( color.a - $wireFrameBlend * 0.5 );
+			#endif
+			@sv_target = color;
+		#elif $isMasking
+			float4	diffuseAlbedo = $diffusemap.Sample( $anisotropicSampler, pixelCtx.m_layerTexCoords[0] );
+			#if $alphatest
+				clip( diffuseAlbedo.a - 0.5 );
+			#endif
+			@sv_target = diffuseAlbedo.a * $(rendering/masking/bendTimeFactor).x;
+		#elif $isOutline
+			// Don't do anything...
+
+		// =======================================================================
+		// Standard Pass
+		#else
+			pixelCtx.m_diffuseAlbedo = $diffusemap.Sample( $anisotropicSampler, pixelCtx.m_layerTexCoords[0] );
+
+			#if $alphatest
+				clip( pixelCtx.m_diffuseAlbedo.a - 0.5 );
+			#endif
+
+			HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					pixelCtx.m_diffuseAlbedo.xyz = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			// Init surface
+			SurfaceContext	surf;
+			surf.Clear();
+			HQ_ComputeLightingParams( pixelCtx, surf );
+			HQ_FetchMetallicSpecularFresnelAndIOR( pixelCtx, surf );
+
+			// ======================================================
+			// Translucency
+			#if $(translucency/enable)
+
+				// bmayaux (2015-07-22) Can't use vertex colors as they're reserved for animation so we're simply applying translucency everywhere...
+				#if $(translucencyUseVertexColor)
+					surf.translucency = 1.0;	// Applies everywhere
+				#else
+					surf.translucency = $translucencyMap.Sample( $anisotropicSampler, pixelCtx.m_layerTexCoords[0] ).x;	// Use a texture to control translucency
+				#endif
+
+				// Saturate and brighten original albedo to obtain transmittance map
+				float	saturationStrength = $(vegetation/transmittanceParms).x;
+
+				float3	albedoHSV = RGB2HSV( pixelCtx.m_diffuseAlbedo.xyz );
+						
+				albedoHSV.x += $(vegetation/transmittanceParms).y;	// Hue shifting
+				albedoHSV.y *= saturationStrength;					// Saturate
+				albedoHSV.z += 0.25 * saturationStrength;			// Increase value
+								
+				albedoHSV.y = min( albedoHSV.y, 1.0f );
+				albedoHSV.z = min( albedoHSV.z, 1.0f );
+								
+				surf.userData.transmittance = HSV2RGB( albedoHSV );			// Now a nice, saturated transmittance-looking color
+
+				// Fetch transmittance map generated using the "GenerateTranslucencyMap" tool in base/tools
+				#if $(vegetation/useTransmittanceMap)
+					surf.userData.transmittanceHL2 = $(vegetation/transmittanceMapIntensity) * $(vegetation/transmittanceMap).Sample( $anisotropicSampler, pixelCtx.m_layerTexCoords[0] ).xyz;
+
+					// Build HL2 basis for backface lighting
+					const float3 tsHL2Basis_R = float3(  sqrt(2.0/3.0),            0.0, -sqrt(1.0/3.0) );	// Z is reversed so the basis is correctly oriented for the back of the surface
+					const float3 tsHL2Basis_G = float3( -sqrt(1.0/6.0),  sqrt(1.0/2.0), -sqrt(1.0/3.0) );
+					const float3 tsHL2Basis_B = float3( -sqrt(1.0/6.0), -sqrt(1.0/2.0), -sqrt(1.0/3.0) );
+
+					// Transformation to world space must use the original geometric TBN since HL2 basis is expressed in that original tangent space
+					surf.userData.wsHL2Basis_R = tsHL2Basis_R.x * pixelCtx.m_wsVertexTangent + tsHL2Basis_R.y * pixelCtx.m_wsVertexBiTangent + tsHL2Basis_R.z * pixelCtx.m_wsVertexNormal;
+					surf.userData.wsHL2Basis_G = tsHL2Basis_G.x * pixelCtx.m_wsVertexTangent + tsHL2Basis_G.y * pixelCtx.m_wsVertexBiTangent + tsHL2Basis_G.z * pixelCtx.m_wsVertexNormal;
+					surf.userData.wsHL2Basis_B = tsHL2Basis_B.x * pixelCtx.m_wsVertexTangent + tsHL2Basis_B.y * pixelCtx.m_wsVertexBiTangent + tsHL2Basis_B.z * pixelCtx.m_wsVertexNormal;
+				#endif
+
+			#endif
+
+			// =================================================================
+			// Compute lighting
+			ComputeLightingResult result = IntegrateLighting( surf, HIGH_QUALITY );
+
+			// compute fog
+			result.finalizedColor.xyz = ComputeFogWithLightScattering( result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+			// write final pixel, manage OIT blend weight for alpha
+			#if $isAlpha && !$isMainPassAlpha
+				writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+				@sv_target.w = pixelCtx.m_diffuseAlbedo.a;
+			#endif
+
+
+			#if defined( PC ) && !defined( RETAIL )
+				// Debug draw
+				DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+				// Write MRT info for probe rendering
+				#inlinefile <includes/resultOverrideIL.inc>
+				WRITE_IL_MRT( pixelCtx, surf, result )
+			#endif
+
+		#endif	// #if $isShadow || $isZPrePass
+	}
+}

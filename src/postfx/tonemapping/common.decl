@@ -1,0 +1,81 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef POSTFX_TONE_MAPPING_COMMON_INCLUDED
+		#define POSTFX_TONE_MAPPING_COMMON_INCLUDED
+
+		// ===========================================================
+		#if 1
+
+			// Optimized, monochromatic version of the tone mapping
+			float	ToneMap( float x ) {
+				float	c = $(PostFX/ToneMapping/toneMappingParms).x;															// Junction point (corrected)
+				float4	coeffs = x < c ? $(PostFX/ToneMapping/toneMappingCoeffs0) : $(PostFX/ToneMapping/toneMappingCoeffs1);	// Use either toe or shoulder coeffs
+				float2	fraction = coeffs.xy * x + coeffs.zw;
+				return fraction.x / fraction.y;
+			}
+			// RGB tone mapping operator is simply applied to each color component independently
+			float3	ToneMap( float3 _colorHDR ) {
+				return float3( ToneMap( _colorHDR.x ), ToneMap( _colorHDR.y ), ToneMap( _colorHDR.z ) );
+			}
+
+			// NOTE: Don't forget to divide the value returned by this function by the exposure factor to obtain the original HDR color!
+			float	InverseToneMap( float x ) {
+				// We know we need to inverse the toe part when x < k and the shoulder part when x > k :
+				float	k = $(PostFX/ToneMapping/toneMappingParms).y;																		// Inverse junction point
+				float4	coeffs = x < k ? $(PostFX/ToneMapping/toneMappingCoeffsInverse0) : $(PostFX/ToneMapping/toneMappingCoeffsInverse1);	// Use either toe or shoulder coeffs
+				float2	fraction = coeffs.xy * x + coeffs.zw;
+				return fraction.x / fraction.y;
+			}
+
+			// RGB inversetone mapping operator is simply applied to each color component independently
+			float3	InverseToneMap( float3 _colorHDR ) {
+				return float3( InverseToneMap( _colorHDR.x ), InverseToneMap( _colorHDR.y ), InverseToneMap( _colorHDR.z ) );
+			}
+
+		#else
+			// bmayaux (2013-10-07) Filmic Curve directly stolen from http://filmicgames.com/archives/75
+			//
+			static const float Filmic_A = 0.15;
+			static const float Filmic_B = 0.50;
+			static const float Filmic_C = 0.10;
+			static const float Filmic_D = 0.20;
+			static const float Filmic_E = 0.02;
+			static const float Filmic_F = 0.30;
+			static const float Filmic_W = 11.2;
+
+			float	Filmic( float x ) {
+			   return ((x*(Filmic_A*x+Filmic_C*Filmic_B)+Filmic_D*Filmic_E)/(x*(Filmic_A*x+Filmic_B)+Filmic_D*Filmic_F))-Filmic_E/Filmic_F;
+			}
+
+			float3	Filmic3( float3 x ) {
+			   return ((x*(Filmic_A*x+Filmic_C*Filmic_B)+Filmic_D*Filmic_E)/(x*(Filmic_A*x+Filmic_B)+Filmic_D*Filmic_F))-Filmic_E/Filmic_F;
+			}	
+
+			float3	ToneMap( float3 _colorHDR ) {
+
+				// Test filmic
+				//float	whiteLuminance = Filmic( $(env/tonemapping/white_level) );
+				//color = Filmic3( color ) / whiteLuminance;
+				//color = Filmic3( color );
+
+				// Log space version, more range compression
+				const float	FACT = 1.0;
+
+				//const float	LOG_OFFSET = 0.0;
+				//color = pow( 10.0, Filmic3( FACT * max( 0.0, LOG_OFFSET + log10( color ) ) ) / FACT - LOG_OFFSET );
+
+				float	whiteLuminance = Filmic( FACT * log10( 1.0 + $(env/tonemapping/white_level) ) );
+				color = max( 0.0, pow( 10.0, Filmic3( FACT * log10( 1.0 + color ) ) / whiteLuminance ) - 1.0 );
+
+				// Over-bright occurs after tone mapping
+				color *= $(env/tonemapping/overbright_level);
+			}
+			float	InverseToneMap( float x ) {
+				return x;	// @TODO!
+			}
+		#endif
+
+		#endif // #ifndef POSTFX_TONE_MAPPING_COMMON_INCLUDED
+	}
+}

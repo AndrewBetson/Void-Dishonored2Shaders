@@ -1,0 +1,115 @@
+{
+	newstyle
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull		none
+		blend		ONE	ZERO
+	}
+
+	hlsl_prefix {
+		#include <helper>
+
+		float	ComputeParallelShadow( const float4 _wsPosition ) {
+			#if $parallelLightHasShadow
+				// select slice
+				float	viewZ = -dot( _wsPosition, $viewMatrix[2] );
+				float4	slicesFar = $parallelLightSliceFars;
+				float4	slicesMask = step( slicesFar, viewZ );
+				uint	sliceIndex = uint( slicesMask.x + slicesMask.y + slicesMask.z + slicesMask.w );
+				float3 shadowCoords = mul( (float3x4)$shadowProjections[sliceIndex], _wsPosition );
+
+				return $(lightDepthCompareMap).SampleCmpLevelZero( $(shadowHardwarePCFSampler), float3( shadowCoords.xy, sliceIndex ), shadowCoords.z );
+			#else
+				return 1.0;
+			#endif
+		}
+
+
+		float ComputeShadowTerm( uint2 _pixelCoords, float2 _texcoords, const uint _quality ) {
+			int tapCount = 8;
+			switch ( _quality ) {
+				case HIGH_QUALITY: tapCount = 16; break;
+				case AVERAGE_QUALITY: tapCount = 8; break;
+				case LOW_QUALITY: tapCount = 3; break;
+			}
+
+			//Fetch Depth
+			float depth = $(atm/distanceFog/TexDepth).SampleLevel( $linearClamp, _texcoords.xy * $resolutionScale.xy, 0.0 ).x;
+			#if $(atm/distanceFog/useProjectedShadowHeightMap)
+				float depthClamped = depth;
+			#else
+				float depthClamped = saturate(depth + 0.001); //avoid weird artefact when depth is on far.
+			#endif
+
+			//Rebuild world space position
+			float4 ndcPos = float4( screenPosToNdc( _pixelCoords ), depthClamped, 1.0 );
+			float4 wsPos = mul( $inverseViewProjectionMatrix, ndcPos );
+			wsPos.xyz /= wsPos.w;
+
+			//Compute camera position
+			float3 rayDir = wsPos.xyz - $wsCamPos;
+			float d = length(rayDir);
+			rayDir /= d;
+			#if $(atm/distanceFog/useProjectedShadowHeightMap)
+				float	distMax = min( 7000.0, d );
+			#else
+				float distMax = min( dot($parallelLightSliceFars,1.0), d );
+			#endif
+
+			float	stepSize = distMax/tapCount;
+			float3	rayStep = rayDir * stepSize;
+
+			//Interleaved Offset
+			const uint interleavedSize = 8;
+			const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+			uint2 interleavedPos = _pixelCoords % interleavedSize;
+			#if $(atm/worldFog/useTemporal)
+//				float rayOffset = (float)B8( uint2( interleavedPos + rand24b( interleavedPos + $viewRandom.xy ) ) ) * stepSize * interleavedSquareRcp;
+				float rayOffset = (float)B8( uint2( interleavedPos +  + 0.5 + $jitterVectors.xy ) ) * stepSize * interleavedSquareRcp;
+			#else
+				float rayOffset = (float)B8( uint2( interleavedPos ) ) * stepSize * interleavedSquareRcp;
+			#endif
+
+			//Raymarch
+			float shadowTerm = 0.0;
+			float4 wsRayPos = float4($wsCamPos.xyz + rayDir * rayOffset, 1.0);
+			for( int i = 0; i < tapCount; ++i ) {
+				float	shadow = ComputeParallelShadow( wsRayPos );
+
+				#if $(atm/distanceFog/useProjectedShadowHeightMap)
+					// bmayaux (2016-05-22) 
+					float2	projectedShadowHeightMapUV = 0.5 + wsRayPos.xy / $(ocean/ProjectedShadowHeightMapExtent).x;
+					float	projectedShadowHeight = $(ocean/ProjectedShadowHeightMap).SampleLevel( $linearClamp, projectedShadowHeightMapUV, 0 );
+					float	projectedShadow = smoothstep( 0.0, 1.0, wsRayPos.z - projectedShadowHeight );
+					shadowTerm += shadow + projectedShadow;
+				#else
+					shadowTerm += shadow;
+				#endif
+
+				wsRayPos.xyz += rayStep;
+			}
+
+// Poor attempt at computing a single intersection value
+// float2	projectedShadowHeightMapStartUV = 0.5 + $wsCamPos.xy / $(ocean/ProjectedShadowHeightMapExtent).x;
+// float	projectedShadowHeightStart = $(ocean/ProjectedShadowHeightMap).SampleLevel( $linearClamp, projectedShadowHeightMapStartUV, 0 );
+// float2	projectedShadowHeightMapEndUV = 0.5 + wsPos.xy / $(ocean/ProjectedShadowHeightMapExtent).x;
+// float	projectedShadowHeightEnd = $(ocean/ProjectedShadowHeightMap).SampleLevel( $linearClamp, projectedShadowHeightMapEndUV, 0 );
+// 
+// float	intersection = saturate( ($wsCamPos.z - projectedShadowHeightStart) / ( (wsPos.z - $wsCamPos.z) - (projectedShadowHeightEnd - projectedShadowHeightStart) ) );
+// shadowTerm *= intersection;
+
+			return shadowTerm / tapCount;
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoords = float4( $vertex_texcoord.xy, 0.f, 0.f );
+	}
+
+	hlsl_fp_main {
+		@sv_target = ComputeShadowTerm( (uint2)$sv_position.xy, $texcoords.xy, AVERAGE_QUALITY);
+	}
+}

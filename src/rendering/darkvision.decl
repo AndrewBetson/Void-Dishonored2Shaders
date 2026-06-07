@@ -1,0 +1,139 @@
+{
+	newstyle
+
+	options {
+		rendering/darkVisionLayer 1
+	}
+	parms {
+		stageSort	sortDarkVision
+	}
+	state {
+		//blend ONE ONE
+		//blendOp MAX
+		blend SRC_ALPHA ONE
+		blendOp ADD
+		cull none
+		depthfunc EQUAL
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <BRDF_ward>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+		#include <darkVisionGlobals>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@wsNormal = vout.m_wsNormal;
+		@wsPosition = vout._worldPosition;
+
+		@sv_position = vout._projPosition;
+		
+		#if ( $alphaTest )
+			@texcoords = vout._texcoords;
+		#endif
+	}
+
+	hlsl_fp_main {
+		#if ( $alphaTest )
+			#inlinefile <includes/arkPixel.inc>
+			arkPixelContext_t pixelCtx;
+			INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+			arkMtrEffectContext_t effectCtx;
+			effectCtx.InitMaterialEffect( pixelCtx );
+
+			#if $isShadow || $isZPrePass
+				ClipZorShadowPass( pixelCtx );
+			#else
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+			#endif
+		#endif
+
+		float distToWaveCenter = length($(rendering/darkVisionWaveCenter) - $wsPosition.xyz);
+		clip( $(rendering/darkVisionDepthClip) - distToWaveCenter );
+		
+		float innerRadius = $(rendering/darkVisionRevealWaveRadius).x;
+		float outerRadius = $(rendering/darkVisionRevealWaveRadius).y;
+
+		float depthPower = (1.0-smoothstep( innerRadius, outerRadius, distToWaveCenter ));
+		depthPower *= $(rendering/darkVisionRevealWavePower).x;
+		clip( depthPower - 0.001 );
+		
+		float3 viewDir = normalize( $wsCamPos - $wsPosition );
+		float pseudofresnel = dot( normalize($wsNormal), viewDir );
+
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+		float3 color = RangeExpandColorFromR11G11B10( $(rendering/ColorIn).SampleLevel( $bilinearSampler, UV, 0.0 ).xyz );
+		
+		
+		#if( $(rendering/darkVisionLayer) == 1 )
+			float depth = $(rendering/DepthBufferIn).SampleLevel( $pointClamp, UV, 0.0 ).x;
+			float occluded = saturate(sign(depth-$sv_position.z-ComputeProjZ( $(rendering/darkVisionDepthBias).x )));
+			
+			float3 occludedPart = occluded * $(rendering/darkVisionDeviceTint).xyz * (1.2-pseudofresnel)*3.5;
+			float3 visiblePart = (1.0-occluded)*((color*2.0)*pseudofresnel + $(rendering/darkVisionDeviceTint).xyz*(1.0-pseudofresnel));
+			
+			$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+			
+			@sv_target.xyz = (occludedPart + visiblePart) * depthPower / Adaptation.EngineLuminanceFactor;
+			@sv_target.w = $(rendering/darkVisionDeviceOpacity).x;
+			
+		#elif( $(rendering/darkVisionLayer) == 2 )
+
+			float silhouetteFactor = smoothstep(0.0,0.7,pseudofresnel);
+			
+			//float interiorFactor = smoothstep(0.55,0.6,pseudofresnel);
+			//float occludedColor = MAX_INTENSITY + MAX_INTENSITY*interiorFactor*6.0;				//shot28
+			//float occludedColor = MAX_INTENSITY*interiorFactor*6.0;								//shot25
+			//float occludedColor = MAX_INTENSITY*(1.0-silhouetteFactor)*3.0;						//shot26
+			float occludedColor = 0.02*pseudofresnel + MAX_INTENSITY*(1.0-silhouetteFactor)*3.0;	//shot29
+			//float occludedColor = 2.0*MAX_INTENSITY*pow(pseudofresnel,4);							//shot27
+
+			float4 redrawOverColor;
+			redrawOverColor.xyz = lerp( MAX_INTENSITY*2.5, color*5.0, silhouetteFactor );
+			/////// test
+			//redrawOverColor.xyz = 1.0-smoothstep(0.0,0.5,pseudofresnel);
+			//redrawOverColor.xyz = lerp( MAX_INTENSITY*5.0, color*5.0, pow(pseudofresnel,3) );
+				
+			/////// previous version without depth
+			//float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+			//float depth = $(rendering/DepthBufferIn).SampleLevel( $pointClamp, UV, 0.0 ).x;
+			//
+			//clip( depth + 0.01 - $sv_position.z);
+			//
+			//float3 viewDir = normalize( $wsCamPos - $wsPosition );
+			//float pseudofresnel = dot( normalize($wsNormal), viewDir );
+			//
+			//float3 color = $(rendering/ColorIn).SampleLevel( $bilinearSampler, UV, 0.0 ).xyz;
+			//
+			//redrawOverColor.xyz = lerp( .5, color, pseudofresnel );
+						
+			redrawOverColor.w = $(rendering/darkVisionLivingOpacity).x;
+			
+			@sv_target = lerp( occludedColor.xxxx, redrawOverColor, step( 0.5, $(rendering/darkVisionPass) ) ) * depthPower;
+
+
+		#else//( $(rendering/darkVisionLayer) == 3 )
+			float depth = $(rendering/DepthBufferIn).SampleLevel( $pointClamp, UV, 0.0 ).x;
+			float occluded = saturate(sign(depth-$sv_position.z-ComputeProjZ( $(rendering/darkVisionDepthBias).x )));
+			
+			float3 occludedPart = occluded*$(rendering/darkVisionPickUpTint).xyz*(1.2-pseudofresnel)*3.5;
+			float3 visiblePart = (1.0-occluded)*((color*2.0)*pseudofresnel + $(rendering/darkVisionPickUpTint).xyz*(1.0-pseudofresnel));
+			
+			$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+			
+			@sv_target.xyz = (occludedPart + visiblePart) * depthPower / Adaptation.EngineLuminanceFactor;
+			@sv_target.w = $(rendering/darkVisionPickUpOpacity).x;
+		#endif
+	}
+}

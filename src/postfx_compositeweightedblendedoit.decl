@@ -1,0 +1,44 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+		blend ONE SRC_ALPHA
+		blendOp ADD
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		// dst' =  (accum.rgb / accum.a) * (1 - revealage) + dst * revealage
+		uint2 pixelCoords = (uint2) $sv_position;
+		
+		float alphaOpacity = $(OIT/Opacity)[pixelCoords].x;
+		float hairOpacity = $(OIT/HairOpacity)[pixelCoords].x;
+		float4 alphaAccum = $(OIT/Accumulation)[pixelCoords];
+		float4 hairAccum = $(OIT/HairAccumulation)[pixelCoords];
+
+		//if ( ( alphaOpacity * hairOpacity ) >= 1.0 ) {
+		//	discard;
+	//	}
+
+ 		alphaAccum.rgb *= alphaAccum.a > 0.0 ? 1.0 / alphaAccum.a : 1.0;
+ 		hairAccum.rgb *= hairAccum.a > 0.0 ? 1.0 / hairAccum.a : 1.0;
+
+		float3 finalColor = hairAccum.rgb * alphaOpacity * (1.0 - hairOpacity) + alphaAccum.rgb * (1.0 - alphaOpacity);
+
+		// bmayaux (2016-07-04) Avoid infinites by clamping to max 16 bits float value: 65503
+		finalColor = clamp( finalColor, 0.0, 65000.0 );
+
+		@sv_target.xyz = RangeCompressColorToR11G11B10( finalColor );
+		@sv_target.w = alphaOpacity * hairOpacity;
+	}
+}

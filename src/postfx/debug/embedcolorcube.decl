@@ -1,0 +1,43 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		#include <colorimetry>	// Defines COLOR_CUBE_SIZE
+
+		static const uint	SLICES_COUNT_X = COLOR_CUBE_SIZE >> 1;			// Amount of slices per line (We store color cube slices on 2 lines)
+		static const uint	LINES_COUNT = COLOR_CUBE_SIZE / SLICES_COUNT_X;	// Amount of lines (obviously 2)
+		static const uint	LINE_SIZE = SLICES_COUNT_X * COLOR_CUBE_SIZE;	// Size in pixels
+
+		// Embeds the color cube in the lower left corner of the image as 2 lines of 16 slices of 32x32 pixels
+		//	_DebugColorCube, shows the currently interpolated color cube from the current environment
+		//
+		void	DEBUG_EmbedColorCube( Texture2D<float4> _TexSourceColor, uint2 _PixelPosition, inout float3 _Color, bool _DebugColorCube=false )
+		{
+			uint	W, H, MipsCount;
+			_TexSourceColor.GetDimensions( 0, W, H, MipsCount );
+
+			uint	X = _PixelPosition.x;
+			uint	Y = _PixelPosition.y;
+
+			if ( X < LINE_SIZE && Y >= (H-LINES_COUNT*COLOR_CUBE_SIZE) )
+			{
+				Y = Y - (H-LINES_COUNT*COLOR_CUBE_SIZE);
+				uint	LineIndex = Y / COLOR_CUBE_SIZE;
+				X += LineIndex * LINE_SIZE;
+				uint	Z = X >> COLOR_CUBE_POT;
+				X = X & (COLOR_CUBE_SIZE-1);
+				Y = Y & (COLOR_CUBE_SIZE-1);
+
+				if ( _DebugColorCube )
+				{
+// 					_Color = $(toneMapping/blendColorCube/sourceColorCube)[uint3( X, Y, Z )].xyz;	// Show source cube
+// 					_Color = $(toneMapping/blendColorCube/targetColorCube)[uint3( X, Y, Z )].xyz;	// Show target cube
+					_Color = $(toneMapping/finalColorCube)[uint3( X, Y, Z )].xyz;					// Show actual blended cube
+				}
+				else
+					_Color = float3( X, Y, Z ) / (COLOR_CUBE_SIZE-1);
+			}
+		}
+	}
+}

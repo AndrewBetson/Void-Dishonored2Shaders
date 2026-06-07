@@ -1,0 +1,223 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef BRDF_EYE_INCLUDED
+		#define BRDF_EYE_INCLUDED
+
+		#define BRDF_OK	1					// Every BRDF include file must define this so we can easily spot the shaders that forgot to include a BRDF model!
+		#define	BRDF_EYE	1
+		#define	BRDF_SURFACE_INFO_OK	1	// We need additional info for the surface
+
+		//////////////////////////////////////////////////////////////
+		// Retrieves the values of the pre-integrated BRDF (cf. http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)
+		//	_VdotN, dot( View, Normal )
+		//	_SurfaceRoughness, the surface roughness in [0,1]
+		//
+		// Returns a scale (X) and bias (Y) value to use in the following manner:
+		//
+		//	float3	PreFilteredIrradiance = SampleIBL( Direction, Roughness );	// Or any other source of irradiance
+		//	float3	CorrectedPreFilteredIrradiance = PreFilteredIrradiance * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y);
+		//
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness ) {
+			return $texPreIntegratedBRDF_Ward.SampleLevel( $bilinearClamp, float2( _VdotN, _SurfaceRoughness ), 0.0 ).xy;
+		}
+
+		// ================================================================================================
+		// Eye additional surface info
+		struct BRDFSurfaceInfo {
+			float		irisMask;				// Smooth mask defining iris zone
+			float2		irisUV;					// UVs of the iris, computed by ray-tracing the view ray refracted through the cornea + scaled around center by pupil dilation
+			float2		causticUV;				// UVs of the iris, computed by ray-tracing the view ray refracted through the cornea
+			float3		wsEyeDir;				// Forward direction where the eye is looking
+			float		specularFactor;			// Attenuation factor for the exterior layer specular term, depends on whether we're on the cornea or screal
+			float3		wsIrisTangent;
+			float3		wsIrisBiTangent;
+
+			void	Clear() {
+				irisMask = 0.0;
+				irisUV = 0.0;
+				causticUV = 0.0;
+				wsEyeDir = 0.0;
+				specularFactor = 0.0;
+				wsIrisTangent = 0.0;
+				wsIrisBiTangent = 0.0;
+			}
+		};
+
+		#include <surfaceContext>	// Contains information about the surface
+		
+		#define TRANSLUCENCY_2SIDED 1 //SHOULD BE RENAMED : DO_NOT_INTEGRATE_SSBUMP_SHADOW_TERM
+
+		#include <lightContext>		// Contains information about the light
+		#include <areaLight>
+		#include <ward>				// Ward specular model
+		#include <fresnel>
+		#include <colorimetry>
+		//#include <PostFX/Luminance/common>		//uncomment to enable auto exposure compensation
+
+
+		// ================================================================================================
+		// Any BRDF structure must provide the following methods so it's compatible with the IntergrateLighting() function found in lighting.mrpr:
+		//		void	Init( in SurfaceContext _surface );
+		//		void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light );
+		//		void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light );	// bmayaux (2015-07-30) Special for area lights
+		//		void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality );
+		//
+		struct BRDF {
+
+			WardContext			m_ward;				// Contains all the information to compute the Ward specular model
+
+			//////////////////////////////////////////////////////////////
+			// BRDF Initialization
+			void	Init( in SurfaceContext _Surface ) {
+
+				// Create the ward context for our BRDF
+				CreateWardContext( m_ward, _Surface.roughness );
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Diffuse Part
+			float3	ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light, float _VtxNdotL, float3 _scleraNdotL_withsss ) {
+
+				// Compute directional occlusion using SSBump
+				float	DirectionalOcclusion = ComputeDirectionalOcclusion( _Light.m_wsToLight, _Surface.AO.yzw, _Surface.AO.x, _Surface.wsHL2Basis_R, _Surface.wsHL2Basis_G, _Surface.wsHL2Basis_B, _Surface.wsHL2Basis_N );
+
+				float	diffuseIris = saturate( _VtxNdotL ) * DirectionalOcclusion;	// bmayaux (2015-02-03) Before my refactor, we were NOT multiplying by N.L so if you find the eye is too dark or unnatural, you can try and remove it again...
+
+				#if $(eye/internalCaustic)
+					// Compute caustic
+					//float3		wsEye2Light = normalize( _Light.m_wsLightPos - _Surface.wsPosition);// as a approximation of _Light.m_wsLightPos - _Surface.userData.wsEyePos;
+					float3		wsEye2Light = _Light.m_wsToLight;
+
+					float		lightdoteye = dot( wsEye2Light, _Surface.userData.wsEyeDir );
+					float3		planarVector = normalize( wsEye2Light - (_Surface.userData.wsEyeDir * lightdoteye) );
+
+					float		cosAlpha = dot( planarVector, _Surface.userData.wsIrisTangent );
+					float		sinAlpha = dot( planarVector, _Surface.userData.wsIrisBiTangent );
+					float2x2	uvrotation = {cosAlpha, sinAlpha, -sinAlpha, cosAlpha};
+
+					float2		uvDeltaToCenter = _Surface.userData.causticUV - 0.5;
+
+					float2		rotatedUvDeltaToCenter = 0.5 + mul( uvrotation, uvDeltaToCenter );
+
+					diffuseIris += smoothstep(0.7, 0.8, _Surface.userData.irisMask) * $(eye/causticStrength).x * $(eye/causticMap).SampleLevel( $linearClamp, float3( rotatedUvDeltaToCenter.x, rotatedUvDeltaToCenter.y, lightdoteye ), 0.0 ); 
+				#endif
+
+				// Lerp between sclera and iris depending on mask
+				return INVPI * lerp( _scleraNdotL_withsss, diffuseIris.xxx, _Surface.userData.irisMask );
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Main lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the light
+			//
+			void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light )
+			{
+				float3	View = _Surface.wsView;
+				float3	Light = _Light.m_wsToLight;
+				float3	Normal = _Surface.wsNormal;	// Specular normal
+				float3	Half_unorm = View + Light;
+				float3	Half = normalize( Half_unorm );
+
+				float	LdotN = saturate( dot( Light, Normal ) );
+				float	VdotN = saturate( dot( View, Normal ) );
+				float	LdotH = dot( Light, Half );
+
+				float	vtxNdotL = dot( _Surface.wsVertexNormal, _Light.m_wsToLight );
+				float3	scleraNdotL_withsss = $(eye/sssLut).SampleLevel( $bilinearClamp, float2( vtxNdotL*0.5+0.5, 0.0 ), 0  );
+				
+				float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+				float3	Irradiance_shadowed = _Light.m_shadow * Irradiance;
+
+				// =================================================================
+				// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+				float3	FresnelSpecular = FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength );
+				FresnelSpecular *= _Light.m_SpecularAttn; // Apply attenuation factor from artist settings. (cf. dlaurent for more infos)
+				float3	FresnelDiffuse = 1.0 - FresnelSpecular;	// Diffuse Fresnel is always left with what has not been specularly reflected...
+
+				// ====== Diffuse lighting ======
+				float3	DiffuseTerm = _Surface.diffuseAlbedo * ComputeDiffuseTerm( _Surface, _Light, vtxNdotL, scleraNdotL_withsss );	// BRDF * (L.N)
+				_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * DiffuseTerm;
+
+				// ====== Specular lighting ======
+				float	SpecularTerm = m_ward.ComputeWardTerm( Normal, Light, View ) * LdotN;	// BRDF * (L.N)						
+						SpecularTerm *= _Surface.userData.specularFactor;						// Apply varying factor depending on where we're standing
+				_Result.accumSpecular += FresnelSpecular * Irradiance_shadowed * SpecularTerm;
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Area light lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the area light
+			//	_BaseLight, standard information about the original light
+			//
+			void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight ) {
+
+				// Standard lighting
+				COMPUTE_AREA_LIGHT_LIGHTING( _Result, _Surface, _Light );
+
+				// =================================================================
+				// Translucency
+				#if $(translucency/enable)
+					// @mcunzi: TODO! Check BRDFWard for the basic translucency and apply your more complex model with the light's parameters...
+				#endif
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Indirect/Ambient lighting computation
+			void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality ) {
+				// =================================================================
+				// Add ambient terms
+				float AO = ComputeAmbientOcclusion( _Surface, _Surface.AO.x, _ssao );
+				_Result.accumAmbient += COMPUTE_AMBIENT_LIGHTING( _Surface, AO, _quality );
+				
+				#if !$buildingEnvironmentProbe
+					float3	IBLterm = COMPUTE_IBL( _Surface, _quality );
+					_Result.accumSpecular += AO * IBLterm;
+				#else
+					float3	IBLterm = 0.0;
+				#endif
+
+				// =================================================================
+				/////////////////////// ====== Artificial Specular lighting ======
+				//$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();		//uncomment to enable auto exposure compensation
+				float3	IBLChrominance = IBLterm / (0.00001+(max(max(IBLterm.x,IBLterm.y),IBLterm.z)));
+				float3	wsFakeLightPos[2];
+				wsFakeLightPos[0] = $wsCamPos	+ $(eye/FakeLight_1).x*$wsCamForwardDir
+												+ $(eye/FakeLight_1).y*$wsCamLeftDir
+												+ $(eye/FakeLight_1).z*$wsCamUpDir;
+				wsFakeLightPos[1] = $wsCamPos	+ $(eye/FakeLight_2).x*$wsCamForwardDir
+												+ $(eye/FakeLight_2).y*$wsCamLeftDir
+												+ $(eye/FakeLight_2).z*$wsCamUpDir;
+				float FakeLightIntensity[2];
+				FakeLightIntensity[0] = $(eye/FakeLight_1).w;
+				FakeLightIntensity[1] = $(eye/FakeLight_2).w;
+												
+												
+				float	VdotN = saturate( dot( _Surface.wsView, _Surface.wsNormal ) );
+				float3	FresnelSpecular = FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength );
+				
+				for(int i = 0; i<2; ++i) {
+					float3	Light = wsFakeLightPos[i] - _Surface.wsPosition.xyz;//fragment to light
+					
+					float LightDistance = length(Light);
+					Light /= LightDistance;
+
+					float	LdotN = saturate( dot( Light, _Surface.wsNormal ) );
+					float	SpecularTerm = m_ward.ComputeWardTerm( _Surface.wsNormal, Light, _Surface.wsView ) * LdotN;	// BRDF * (L.N)
+							SpecularTerm *= _Surface.userData.specularFactor;						// Apply varying factor depending on where we're standing
+
+					float3	Irradiance = LightDistance * LightDistance * IBLChrominance * FakeLightIntensity[i];
+					//Irradiance /= Adaptation.EngineLuminanceFactor;		//uncomment to enable auto exposure compensation
+					_Result.accumSpecular += FresnelSpecular * Irradiance * SpecularTerm;
+				}
+				// =================================================================
+			}			
+		};
+
+		#endif	// #ifndef BRDF_EYE_INCLUDED
+	}
+}

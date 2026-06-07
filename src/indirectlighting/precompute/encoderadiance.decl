@@ -1,0 +1,162 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 16
+		NUMTHREADY 16
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+	#ifndef __PSSL__
+		#include <indirectLighting/precompute/common>
+		#include <sphericalHarmonics>
+		#include <colorimetry>
+
+		groupshared float3	gs_SH[NUMTHREADX*NUMTHREADY * SH_COEFFS_COUNT];
+
+		uint	OffsetFrom( uint2 _Position ) {
+			return SH_COEFFS_COUNT * ( NUMTHREADX*_Position.y + _Position.x );
+		}
+
+	#endif // #ifndef __PSSL__
+	}
+
+	hlsl_cp_main {
+	#ifndef __PSSL__
+		uint2		Resolution;
+		uint		ElementsCount, MipLevelsCount;
+		$(indirectLighting/precompute/cubeMapMRT).GetDimensions( 0, Resolution.x, Resolution.y, ElementsCount, MipLevelsCount );
+
+		uint		Stride = ElementsCount / 6;
+
+		// =========================== Generate the SH coefficients for the current distance ===========================
+		uint		CubeSize = Resolution.x;
+		uint		CubeFaceIndex = $sv_groupID.z;
+		float3x3	Face2World = GetCubeFaceTransform( CubeFaceIndex );
+
+		uint2		Position = $sv_DispatchThreadID.xy;
+		uint3		UVW = uint3( Position, CubeFaceIndex * Stride + 0 );
+
+		// Read & optionally clamp luminance
+		float3		Radiance = $(indirectLighting/precompute/cubeMapMRT).Load( uint4( UVW, 0 ) ).xyz;
+
+		float		Luminance = dot( Radiance, LUMINANCE );
+		float		ClampedLuminance = min( Luminance, $(indirectLighting/precompute/parms).x );
+					Radiance *= ClampedLuminance / (1e-6 + Luminance);
+
+		float2		UV = 2.0 * (0.5 + Position) / CubeSize - 1.0;
+		float3		csView = float3( UV.x, -UV.y, - 1.0 );
+
+		// Retrieve the cube map texel's solid angle (from http://people.cs.kuleuven.be/~philip.dutre/GI/TotalCompendium.pdf)
+		// dw = cos(Theta).dA / r²
+		// cos(Theta) = Adjacent/Hypothenuse = 1/r
+		//
+		float		sqDistance2Texel = dot( csView, csView );
+		float		distance2Texel = sqrt( sqDistance2Texel );
+
+		const float	dA = 4.0 / (CubeSize * CubeSize);	// Cube face is supposed to be in [-1,+1], yielding a 2x2 square units that we divide equally among texels
+
+		float		solidAngle = dA / (distance2Texel * sqDistance2Texel);
+
+		// Transform view into world space
+		float3		wsView = mul( csView, Face2World );		// We normally multiply on the right but since we need the World=>Face transform we can multiply by the left instead of using the transpose
+					wsView /= distance2Texel;				// Normalize
+
+		// Compute SH (Analytic method from http://www1.cs.columbia.edu/~ravir/papers/envmap/envmap.pdf eq. 3)
+		const float	f0 = 0.28209479177387814347403972578039;		// 0.5 / sqrt(PI);
+		const float	f1 = 0.48860251190291992158638462283835;		// 0.5 * sqrt(3/PI);
+		const float	f2 = 1.0925484305920790705433857058027;			// 0.5 * sqrt(15/PI);
+		const float	f3 = 0.31539156525252000603089369029571;		// 0.25 * sqrt(5.PI);
+
+		float	SH[9];
+		SH[0] = f0;														// Y00
+		SH[1] = f1 * wsView.y;											// Y1-1
+		SH[2] = f1 * wsView.z;											// Y10
+		SH[3] = f1 * wsView.x;											// Y1+1
+		SH[4] = f2 * wsView.x * wsView.y;								// Y2-2
+		SH[5] = f2 * wsView.y * wsView.z;								// Y2-1
+		SH[6] = f3 * (3.0 * wsView.z*wsView.z - 1.0);					// Y20
+		SH[7] = f2 * wsView.x * wsView.z;								// Y2+1
+		SH[8] = f2 * 0.5 * (wsView.x*wsView.x - wsView.y*wsView.y);		// Y2+2
+
+		[loop]
+		[fastopt]
+		for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+			gs_SH[SH_COEFFS_COUNT*$sv_groupIndex+i] = (solidAngle * SH[i]) * Radiance;
+		}
+
+		GroupMemoryBarrierWithGroupSync();	// We wait until all SH from the group are available
+
+		// =========================== Perform a reduction and accumulation of the buffer ===========================
+// 		#if NUMTHREADY > 16
+// 			// Collapse second half the array into first half
+// 			if ( all( $sv_groupThreadID.xy < 16 ) ) {
+// 				[loop]
+// 				[fastopt]
+// 				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+// 					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 16x16 block
+// 					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 16x16 block
+// 					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(16*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 16x16 block
+// 				}
+// 			}
+// 			GroupMemoryBarrierWithGroupSync();
+// 		#endif
+
+		#if NUMTHREADY > 8
+			// Collapse second quarter the array into first quarter
+			if ( all( $sv_groupThreadID.xy < 8 ) ) {
+				[loop]
+				[fastopt]
+				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 8x8 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 8x8 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(8*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 8x8 block
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		#if NUMTHREADY > 4
+			// etc.
+			if ( all( $sv_groupThreadID.xy < 4 ) ) {
+				[loop]
+				[fastopt]
+				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 4x4 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 4x4 block
+					gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(4*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 4x4 block
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		// etc.
+		if ( all( $sv_groupThreadID.xy < 2 ) ) {
+			[loop]
+			[fastopt]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(1,0)+$sv_groupThreadID.xy)+i];	// Add right 2x2 block
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(0,1)+$sv_groupThreadID.xy)+i];	// Add bottom 2x2 block
+				gs_SH[OffsetFrom($sv_groupThreadID.xy)+i] += gs_SH[OffsetFrom(2*uint2(1,1)+$sv_groupThreadID.xy)+i];	// Add bottom-right 2x2 block
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Final acumulation
+		if ( all( $sv_groupThreadID.xy == 0 ) ) {
+			uint	groupsCount = $(indirectLighting/precompute/parms2).x;
+
+ 			[loop]
+ 			[fastopt]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				float3	Coeff  = gs_SH[i];
+						Coeff += gs_SH[OffsetFrom(uint2(1,0))+i];	// Add right coeff
+						Coeff += gs_SH[OffsetFrom(uint2(0,1))+i];	// Add bottom coeff
+						Coeff += gs_SH[OffsetFrom(uint2(1,1))+i];	// Add bottom-right coeff
+				@(indirectLighting/precompute/bufferSHRadiance)[3*(SH_COEFFS_COUNT*($sv_GroupID.x+groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex))+i)+0] = Coeff.x;
+				@(indirectLighting/precompute/bufferSHRadiance)[3*(SH_COEFFS_COUNT*($sv_GroupID.x+groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex))+i)+1] = Coeff.y;
+				@(indirectLighting/precompute/bufferSHRadiance)[3*(SH_COEFFS_COUNT*($sv_GroupID.x+groupsCount*($sv_GroupID.y+groupsCount*CubeFaceIndex))+i)+2] = Coeff.z;
+			}
+		}
+	#endif	// #ifndef __PSSL__
+	}
+}

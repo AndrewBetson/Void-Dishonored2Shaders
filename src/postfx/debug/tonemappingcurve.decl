@@ -1,0 +1,83 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	TONE_MAPPING_CURVE_INSET_WIDTH = 0.3;	// Width of the inset in UV space (1 means the entire screen!)
+		static const float	TONE_MAPPING_CURVE_INSET_HEIGHT = 0.25;	// Height of the inset in UV space (1 means the entire screen!)
+
+		#include <PostFX/ToneMapping/common>
+		#include <PostFX/Debug/DrawDigits>
+		
+		float	DrawCurveValueText( float _Value, float2 _UV, float2 _textUV ) {
+			float2	Resolution_pixels = float2( TONE_MAPPING_CURVE_INSET_WIDTH, TONE_MAPPING_CURVE_INSET_HEIGHT ) / $positionToViewTexture.zw;
+			int2	Pos_pixels = (int2)(_UV * Resolution_pixels);
+
+			int2	TextPos_pixels = (int2)(_textUV * Resolution_pixels);
+
+			return drawNumber( _Value, Pos_pixels - TextPos_pixels, 2.0 );
+		}
+
+		// Displays the tone mapping curve
+		// You can hover the mouse cursor on the screen to highlight a specific luminance on screen that will be displayed on the curve
+		//
+		void	DEBUG_DisplayToneMappingCurve( float2 _UV, inout float3 _Color, float3 _originalColor, float _exposureFactor, float _debugLuminanceLevel ) {
+
+			uint2	pixelPos = uint2( floor( _UV.x / $positionToViewTexture.z ), floor( (1.0-_UV.y) / $positionToViewTexture.w ) );
+
+			// Show debug luminance value
+			if ( _debugLuminanceLevel > 0.0 ) {
+				float	ScreenWorldLuminance = ARKANE_TO_WORLD_LUMINANCE * dot( LUMINANCE, _originalColor );
+				float	Color_dB = Luminance2dB( ScreenWorldLuminance );
+				float	Debug_dB = Luminance2dB( _debugLuminanceLevel );
+				if ( abs( Color_dB - Debug_dB ) < 0.4 ) {
+					uint2	PixelPos = uint2( floor( _UV / $positionToViewTexture.zw + 20.0 * $time.x ) );
+							PixelPos >>= 2;
+					_Color = lerp( float3( 1, 0, 0 ), float3( 0, 0, 1 ), (PixelPos.x ^ PixelPos.y) & 1 );
+				}
+			}
+
+			// Compute pixel position where to show custom debug luminances
+			float	debugLuminanceHDR = _debugLuminanceLevel * WORLD_TO_ARKANE_LUMINANCE * _exposureFactor;
+			float	mouseLuminanceHDR = $mouseCursorPosition.z > TONE_MAPPING_CURVE_INSET_WIDTH || $mouseCursorPosition.w < 1.0-TONE_MAPPING_CURVE_INSET_HEIGHT
+											? _exposureFactor * dot( $viewColorMap.SampleLevel( $linearClamp, $mouseCursorPosition.zw, 0.0 ).xyz, LUMINANCE )
+											: 0.0;
+			uint	debugLuminanceHDR_pixel = floor( TONE_MAPPING_CURVE_INSET_WIDTH * debugLuminanceHDR / ($positionToViewTexture.z * $(env/tonemapping/white_level)) );
+			uint	mouseLuminanceHDR_pixel = floor( TONE_MAPPING_CURVE_INSET_WIDTH * mouseLuminanceHDR / ($positionToViewTexture.z * $(env/tonemapping/white_level)) );
+	
+			// Show curve
+			float2	UV = float2( _UV.x / TONE_MAPPING_CURVE_INSET_WIDTH, (_UV.y - 1.0+TONE_MAPPING_CURVE_INSET_HEIGHT) / TONE_MAPPING_CURVE_INSET_HEIGHT );
+			if ( _UV.x < TONE_MAPPING_CURVE_INSET_WIDTH && _UV.y > 1.0-TONE_MAPPING_CURVE_INSET_HEIGHT ) {
+				// Compute curve color based on pixel
+				float3	curveColor = 0.0;
+				if ( pixelPos.x == debugLuminanceHDR_pixel )
+					curveColor = float3( 1.0, 0.8, 0.2 );	// Show orange for debug value
+				else if ( pixelPos.x == mouseLuminanceHDR_pixel )
+					curveColor = float3( 1.0, 0.0, 0.0 );	// Show red for value pointed by mouse
+				else if ( mouseLuminanceHDR < 0.0 || mouseLuminanceHDR > $(env/tonemapping/white_level) ) {
+					// Show out of range color when mouse is pointing to an invalid value
+					pixelPos = uint2( floor( _UV / $positionToViewTexture.zw + 20.0 * $time.x ) );
+					pixelPos >>= 2;
+					curveColor = lerp( float3( 0, 0, 0 ), float3( 1, 1, 0 ), (pixelPos.x ^ pixelPos.y) & 1 );
+				}
+
+				// Show curve on a white background
+				float	LuminanceHDR = UV.x * $(env/tonemapping/white_level);	// From [0,white]
+				float	LuminanceLDR = ToneMap( LuminanceHDR );					// From [0,overbright]
+
+				float	PixelLuminanceLDR = $(env/tonemapping/overbright_level) * (1.0 - UV.y);	// Current LDR luminance for the displayed pixel
+				_Color = PixelLuminanceLDR < LuminanceLDR ? curveColor : 1.0;
+			}
+
+			// Show tone mapped values as text
+			float	mouseLuminanceLDR = ToneMap( mouseLuminanceHDR );
+
+			float2	textPos = float2( mouseLuminanceHDR / $(env/tonemapping/white_level), min( 0.9, 1.0 - mouseLuminanceLDR / $(env/tonemapping/overbright_level) ) );
+			float	isText = DrawCurveValueText( mouseLuminanceLDR, UV, textPos );
+					isText += DrawCurveValueText( mouseLuminanceHDR, UV, float2( textPos.x, 0.95 ) );
+			float3	textColor = float3( 1, 0, 0 );
+
+			_Color = lerp( _Color, textColor, saturate( isText ) );
+		}
+	}
+}

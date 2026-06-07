@@ -1,0 +1,123 @@
+{
+	newstyle
+
+	state {
+		cull none
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+		#include <arkWaterHelpers>
+		#include <arkOceanHelpers>
+ 	}
+	
+	hlsl_vp_main {
+	
+		float3	lsPosition = float3( $vertex_position.xy * $(ocean/PatchTransform).w, 0.0 );
+		
+		float3	wsPosition = lsPosition;
+				wsPosition += $(ocean/PatchTransform).xyz;
+
+		float2	wsPosXYNoDisplacement = wsPosition.xy;
+		
+		float	camDist = distance( $wsCamPos, wsPosition );
+
+		float	perlinBlendFactor = smoothstep( $(ocean/PerlinBlendStart).x, $(ocean/PerlinBlendEnd).x, camDist );		
+		
+		float2	globalMapsUV = wsPosXYNoDisplacement / $(ocean/MasksExtent).x;
+				globalMapsUV += 0.5;
+				globalMapsUV.x = 1.0 - globalMapsUV.x;
+		
+		float	waveAmplitudeMask = $(ocean/WaveAmplitudeMask).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+		
+		float	foam; //unused
+		float	foamTex = 0.0f; //unused
+		float3	displacement = ComputeOceanSurfaceDisplacement( wsPosXYNoDisplacement, camDist, perlinBlendFactor, waveAmplitudeMask, false, foamTex, foam );
+		
+		#if !$isZPrePass
+			wsPosition += displacement;
+			@wsPosition = wsPosition;
+
+			float4	wsPosition4 = float4( wsPosition, 1.0 );
+			float	linearDepth = - dot( wsPosition4, $viewMatrix[2] );
+			@legacy_texcoord = float4( wsPosXYNoDisplacement, perlinBlendFactor, linearDepth );
+			@sv_position = mul( $viewProjectionMatrix, wsPosition4 );
+		#else
+			// bmayaux (2016-05-08) TAA support
+			float3	previousDisplacement = ComputeOceanPreviousSurfaceDisplacement( wsPosXYNoDisplacement, camDist, perlinBlendFactor, waveAmplitudeMask );
+			float4	wsPreviousPos = float4( wsPosition + previousDisplacement, 1.0 );
+			@psPreviousPosition = mul( $previousViewProjectionMatrix, wsPreviousPos );
+			wsPosition += displacement;
+			@sv_position = mul( $viewProjectionMatrix, float4( wsPosition, 1.0 ) );
+			#if !$isZPrePassAlpha
+				@psPosition = @sv_position;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#if $isZPrePass
+			#if !$isZPrePassAlpha
+				// bmayaux (2016-05-08) TAA support
+				float2	psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+						psMotionVector -= $jitterRelativeToPreviousFrame;
+						psMotionVector *= 0.5;
+						psMotionVector.y *= -1.0;
+				@sv_target = float4( psMotionVector, 1.0, 0.0 );
+			#endif
+		#else
+
+			float perlinBlendFactor = $legacy_texcoord.z;
+			float waterLinearDepth = $legacy_texcoord.w;
+
+			float2 globalMapsUV = $legacy_texcoord.xy / $(ocean/MasksExtent).x;
+			globalMapsUV += 0.5f;
+			globalMapsUV.x = 1.0f - globalMapsUV.x;
+
+			float	waveAmplitudeMask = $(ocean/WaveAmplitudeMask).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+
+			// bmayaux (2016-05-21) Sample projected shadow map
+			float2	projectedShadowHeightMapUV = 0.5 + $legacy_texcoord.xy / $(ocean/ProjectedShadowHeightMapExtent).x;
+			float	projectedShadowHeight = $(ocean/ProjectedShadowHeightMap).SampleLevel( $linearClamp, projectedShadowHeightMapUV, 0 );
+			float	projectedShadow = smoothstep( $(ocean/ProjectedShadowStartHeight), $(ocean/ProjectedShadowEndHeight), $wsPosition.z - projectedShadowHeight );	// bmayaux (2016-05-21) If the pixel is standing below the projected shadow's occluder then its in the shadow...
+
+			bool bUnderWater = !$sv_isFrontFace;
+
+			float3 vsPosition = mul( $viewMatrix, float4( $wsPosition, 1.0f ) ).xyz;
+
+			float3 wsViewDir = $wsCamPos - $wsPosition;
+
+			float waterSurfaceDist = length( wsViewDir );
+			wsViewDir /= waterSurfaceDist; //normalize
+
+			const float foamTiling = 0.04;
+			float foamFFT;
+			float foamTex = $(ocean/FoamTex).Sample( $bilinearSampler, $legacy_texcoord.xy * foamTiling + sin($localTime.x) * 0.01 ).x;
+			float3 wsNormal = ComputeOceanSurfaceNormal( $legacy_texcoord.xy, waterLinearDepth, perlinBlendFactor, waveAmplitudeMask, foamTex, foamFFT );
+			float2 uv = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture );
+			float foamDepth = saturate( $(ocean/FoamDepth).Sample( $bilinearSampler, uv ).x );
+
+			IBLInfo unused_IBLInfo;
+
+			float4 waterResult = WaterShading( true/*isOcean*/,	bUnderWater, $(ocean/WaterLevel), $sv_position.xy, $wsPosition, vsPosition, wsNormal, $wsCamPos, wsViewDir, waterSurfaceDist,
+											$(water/WaterColor), $(water/Extinction), $(water/Inscattering),
+											$parallelLightDir.xyz, $parallelLightColor.rgb, $(water/SpecularPower), projectedShadow,
+											$(water/Refraction),
+											foamFFT, foamTex, foamDepth,
+											waveAmplitudeMask, unused_IBLInfo );
+							
+			@sv_target.xyz = RangeCompressColorToR11G11B10( waterResult.xyz );
+			@sv_target.w = waterResult.w;
+
+//// DEBUG !!											
+//		if( $alwaysTweak.x != 1.0 ) {
+//			@sv_target = float4(10,10,10,1);
+//		}
+
+	#endif
+
+	}
+}

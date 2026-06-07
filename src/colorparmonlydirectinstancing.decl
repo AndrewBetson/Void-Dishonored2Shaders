@@ -1,0 +1,28 @@
+{ newstyle
+	options {
+		useDirectInstancing 1
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		alphaWrite 0
+	}
+	hlsl_prefix {
+		#include <vertex>
+	}
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+	}
+	hlsl_fp_main {
+		#if !$isShadow && !$isZPrePass
+			@sv_target = $color;
+		#endif
+	}
+}

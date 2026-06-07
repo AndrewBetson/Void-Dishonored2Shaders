@@ -1,0 +1,33 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		blend SRC_ALPHA ONE
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#define MAX_VALUE 10.0
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	hlsl_fp_main {
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+
+		float4 color = $(rendering/BufferIn).SampleLevel( $bilinearClamp, UV, 0.0f );
+		
+		color.xyz = min( float3( MAX_VALUE, MAX_VALUE, MAX_VALUE ), color.xyz );
+
+		
+		$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+		
+		@sv_target.xyz = RangeCompressColorToR11G11B10( color.xyz * $(rendering/darkVisionLivingTint).xyz * $(rendering/darkVisionRevealWavePower).xxx / Adaptation.EngineLuminanceFactor );
+		@sv_target.w = saturate( color.w * $(rendering/darkVisionRevealWavePower).x ) * $(rendering/darkVisionLivingOpacity).x;
+	}
+}

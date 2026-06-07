@@ -1,0 +1,24 @@
+{ newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		alphaWrite 0
+	}
+	hlsl_prefix {
+		#include <vertex>
+	}
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+		@legacy_color = $vertex_color;
+	}
+	hlsl_fp_main {
+		@sv_target = $legacy_color;
+	}
+}

@@ -1,0 +1,109 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef SHADOW_PARABOLOID_INCLUDED
+		#define SHADOW_PARABOLOID_INCLUDED
+		
+		#define SHADOW_SLICE_INDEX( info ) ((info) & 0x0000001F)
+
+		void ComputeNormalOffsetParaboloid( const float3 wsNormal, const float3 lightDir, out float cosLightAngle, out float NormalOffsetScale ) {
+			NormalOffsetScale = 1.0;		
+			cosLightAngle = 0.0;				
+			#if $(shadow/useSlopeScale)
+				cosLightAngle = dot(normalize(lightDir), wsNormal);
+				NormalOffsetScale = saturate(1 - cosLightAngle);
+			#endif
+		}
+
+		// The following paraboloïd data are set in 2 matrices matrix0 and matrix1: 
+		//
+		//		matrix0[0] = float4( wsAxisX, 0 )
+		//		matrix0[1] = float4( wsAxisY, 0 )
+		//		matrix0[2] = float4( wsAxisZ, 0 )
+		//		matrix0[3] = float4( wsPosition, 0 )
+		//
+		//		matrix1[0] = float4( shadowHardening, Zn, Zf, Q )	where Q is Zv / (Zf - Zn) (cf. https://msdn.microsoft.com/en-us/library/windows/desktop/bb147302%28v=vs.85%29.aspx)
+		//		matrix1[1] = float4( UV0, UV1 - UV0 )				where UV0 is the top left corner and UV1 is the bottom right corner of the sub-rectangle where our shadow map is stored (slice index is given by $(tlf/shadow_t).mInfo)
+		//		matrix1[2] = float4( projectionDirXY.xy, Zbias, 0 )
+		//		matrix1[3] = float4( 0, 0, 0, 0 )
+		//
+		// When rendering the shadow map, matrix0 and matrix1 are stored in viewProjectionMatrix and inverseViewProjectionMatrix.
+		// When using the shadow map, matrix0 and matrix1 are stored in $(tlf/shadow_t).mWorldToShadowMat and $(tlf/shadow_t).mShadowToWorldMat;
+		//
+
+		// Projects the world space position into paraboloïd space (shadow rendering mode)
+		float4	ParaboloidProjectWorldPosition( float3 _wsPosition ) {
+			float3	wsLightAxisX = $viewProjectionMatrix[0].xyz;
+			float3	wsLightAxisY = $viewProjectionMatrix[1].xyz;
+			float3	wsLightAxisZ = $viewProjectionMatrix[2].xyz;
+			float3	wsLightPosition = $viewProjectionMatrix[3].xyz;
+
+			// Compute light space direction
+			_wsPosition -= wsLightPosition;
+			float3	lsDirection = float3( dot( _wsPosition, wsLightAxisX ), dot( _wsPosition, wsLightAxisY ), dot( _wsPosition, wsLightAxisZ ) );
+			float	Distance = length( lsDirection );
+			lsDirection = Distance > 1e-8 ? lsDirection / Distance : float3( 0, 0, 0.01 );
+
+			// Project into paraboloïd space
+			const float	Zn = $inverseViewProjectionMatrix[0].y;
+			const float	Zf = $inverseViewProjectionMatrix[0].z;
+			const float	Q = $inverseViewProjectionMatrix[0].w;
+
+//			return float4( Distance * lsDirection.xy / max( 1e-4, 1.0 + lsDirection.z), Q * (Distance - Zn), Distance );
+			return float4( lsDirection.xy / max( 1e-4, 1.0 + lsDirection.z), Distance / Zf, sign( lsDirection.z ) );
+		}
+		
+		// Samples the paraboloïd shadow map
+		float SampleParaboloidShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, const int _quality ) {
+
+			float3	wsLightAxisX = _shadowMapInfo.mWorldToShadowMat[0].xyz;
+			float3	wsLightAxisY = _shadowMapInfo.mWorldToShadowMat[1].xyz;
+			float3	wsLightAxisZ = _shadowMapInfo.mWorldToShadowMat[2].xyz;
+			float3	wsLightPosition = _shadowMapInfo.mWorldToShadowMat[3].xyz;
+
+			// Compute normal offset
+			#if $(shadow/useNormalOffset)
+				float	CosLightAngle;
+				float	NormalOffsetScale;				
+				float3	wsToLight = normalize( wsLightPosition - _wsPosition );
+				ComputeNormalOffsetParaboloid( _wsNormal, wsToLight, CosLightAngle, NormalOffsetScale );			
+				float3	ShadowOffset = ($(shadow/normalOffset) * NormalOffsetScale) * _wsNormal;
+				_wsPosition += ShadowOffset;
+			#endif
+
+			// Compute light space direction
+			_wsPosition -= wsLightPosition;
+			float3	lsDirection = float3( dot( _wsPosition, wsLightAxisX ), dot( _wsPosition, wsLightAxisY ), dot( _wsPosition, wsLightAxisZ ) );
+			float	Distance = length( lsDirection );
+			lsDirection = Distance > 1e-8 ? lsDirection / Distance : float3( 0, 0, 0.01 );
+
+			Distance += _shadowMapInfo.mShadowToWorldMat[2].z;	// Z bias
+
+			// Project into paraboloïd space
+			const float	HardeningFactor = _shadowMapInfo.mShadowToWorldMat[0].x;
+			const float	Zn = _shadowMapInfo.mShadowToWorldMat[0].y;
+			const float	Zf = _shadowMapInfo.mShadowToWorldMat[0].z;
+			const float	Q = _shadowMapInfo.mShadowToWorldMat[0].w;
+//			float3	pbPosition = float3( lsDirection.xy / max( 1e-4, 1.0 + lsDirection.z ), Q * (1.0 - Zn/Distance) );	// cf. https://msdn.microsoft.com/en-us/library/windows/desktop/bb147302%28v=vs.85%29.aspx
+			float3	pbPosition = float3( lsDirection.xy / max( 1e-4, 1.0 + lsDirection.z ), Distance / Zf );
+
+			// Sample exponential shadow map
+			float2	UV = saturate( 0.5 * (1.0 + pbPosition.xy) );
+			float4	UVScaleBias = _shadowMapInfo.mShadowToWorldMat[1];
+			UV = UVScaleBias.xy + UV * UVScaleBias.zw;	// Now pointing to the correct place in the atlas
+
+			float	Exp_Blocker = $shadowMapAtlas.SampleLevel( $bilinearSampler, float3( UV, SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo) ), 0.0 );	// gaussian_filtered( exp( -C * Zblocker ) )
+			float	Exp_Receiver = exp( HardeningFactor * pbPosition.z );																		// exp( C * Zreceiver )
+
+			// Perform the step function
+			float	Shadow = 1.0 - saturate( Exp_Receiver * Exp_Blocker );	// Standard ESM
+//			float	Shadow = 1.0 / (1.0 + Exp_Receiver * Exp_Blocker);		// Sigmoïd
+
+			// Apply brightness/contrast
+//			return smoothstep( _shadowMapInfo.mShadowToWorldMat[2].x, _shadowMapInfo.mShadowToWorldMat[2].y, Shadow );
+			return Shadow;
+		}
+
+		#endif // #ifndef SHADOW_PARABOLOID_INCLUDED
+	}
+}

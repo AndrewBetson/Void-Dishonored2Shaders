@@ -1,0 +1,341 @@
+{
+	newstyle
+	hlsl_prefix {
+	
+#ifndef PARALLAX_INCLUDED
+#define	PARALLAX_INCLUDED
+
+// Ray-Marches through the height map to find the exact intersection with the volume so we obtain a parallax effect
+//	_HeightMap, the height map to sample displacement values from
+//	_Displacement_mm, maximum displacement encoded by the height map (in millimeters)
+//	_Texels_per_meter (512), the density of texels per meter (for Blacksparrow, I heard it was 512 texels/m)
+//	_MaxStepsCount (16), the maximum amount of steps we can take to ray-march the height field
+//	_wsPosition, world space position that will get modified by the parallax
+//	_UV, the texture coordinates that will get displaced by the function
+//
+// Returns the current position in UV space in (X,Y,Z) and a boolean in W to tell if there was a hit (1) or if the ray-marching failed to intersect (0)
+//
+float4	ComputeParallaxDisplacement( Texture2D<float> _HeightMap, float _Displacement_mm, float _Texels_per_meter, uint _MaxStepsCount, float3 _wsView, float3 _wsTangent, float3 _wsBiTangent, float3 _wsNormal, inout float3 _wsPosition, inout float2 _UV ) {
+	float2	TextureDimensions = $parallaxHeightMapSize;	// bmayaux (2016-10-24) Height map size must now be specified by the user
+//	_HeightMap.GetDimensions( TextureDimensions.x, TextureDimensions.y );
+
+	// Transform view into tangent space
+	float3	tsView = float3(	 dot( _wsView, _wsTangent ),
+								-dot( _wsView, _wsBiTangent ),	// Bi-tangent is not in the expected direction
+								 dot( _wsView, _wsNormal )
+							);
+
+	float	VdotN = -tsView.z;
+
+	float	TexelSize_mm = 1000.0 / _Texels_per_meter;
+
+	// Compute the required size of a step
+	float	BottomHitDistance_mm = 1e-3 + _Displacement_mm / VdotN;						// Simply the intersection of the view vector with the bottom plane (in meters) (the 1e-3 epsilon is there just to ensure we always trace a little further than the plane to avoid noise)
+			BottomHitDistance_mm = min( BottomHitDistance_mm, 8.0 * _Displacement_mm );	// We don't want to trace more than N times the height
+
+	float	StepSize_mm = BottomHitDistance_mm / _MaxStepsCount;						// Minimum step size if we use all our allowed steps
+
+	// Ensure step size is at least a single texel in the height map
+	float	TangentStepSize_mm = sqrt( 1.0001 - VdotN*VdotN );							// (Using sin( theta ), which is equivalent to length( tsView.xy ))
+																						// This is the size of the step we need to take to advance exactly one texel in the texture
+																						// It's useless to have steps smaller than this because it will only sample several times
+																						//	the height map at nearly the same place, which is easily deduced from a manual linear
+																						//	interpolation rather than letting the card perform a costly bilinear sampling...
+
+	float	MinimumStepSize_mm = TexelSize_mm / TangentStepSize_mm;
+			MinimumStepSize_mm = min( BottomHitDistance_mm, MinimumStepSize_mm );
+	StepSize_mm = max( MinimumStepSize_mm, StepSize_mm );
+
+	float3	Step_mm = StepSize_mm * tsView;												// This is the step vector in millimeters
+
+	// Now, compute the step vector in UV space
+	float2	Step_texels = Step_mm.xy / TexelSize_mm;									// Step size in texels
+	float2	Step_UV = Step_texels / TextureDimensions;									// Step size in UV space
+	float4	Step = float4( Step_UV, Step_mm.z / _Displacement_mm, 0.001 * StepSize_mm );// The Z component is renormalized in height map space (i.e. [0,1] where 0 is bottom and 1 is top), W component is step size in meters
+
+	// Compute final steps count
+	float	TotalStepsCount = BottomHitDistance_mm / (1e-6 + StepSize_mm);				// Total required amount of steps to reach the bottom of the plane
+	float	StepsCount = min( _MaxStepsCount, TotalStepsCount );						// Actual amount of steps that we can afford (if we still have no hit after that many steps then we should clip the pixel as it's probably a silhouette)
+
+	// Compute necessary gradients to use anisotropic sampler within the loop
+	float2	dx = ddx( _UV );
+	float2	dy = ddy( _UV );
+
+
+#if 1
+	// Apply "magic bias" depending on view direction (helps reduce staircasing *a lot*!)
+	const float		BIAS_FACTOR = 40;
+
+// 	dx *= BIAS_FACTOR;
+// 	dy *= BIAS_FACTOR;
+// 	dx *= lerp( 1.0, BIAS_FACTOR, abs(tsView.x) );
+// 	dy *= lerp( 1.0, BIAS_FACTOR, abs(tsView.y) );
+
+	// Simulating elevation to power 64
+	float	BiasFactor = length(tsView.xy) * TangentStepSize_mm;
+			BiasFactor *= BiasFactor;	// ^2
+			BiasFactor *= BiasFactor;	// ^4
+			BiasFactor *= BiasFactor;	// ^8
+			BiasFactor *= BiasFactor;	// ^16
+			BiasFactor *= BiasFactor;	// ^32
+			BiasFactor *= BiasFactor;	// ^64
+
+	dx *= lerp( 1.0, BIAS_FACTOR, BiasFactor );
+	dy *= lerp( 1.0, BIAS_FACTOR, BiasFactor );
+
+#endif
+
+
+	// Mip level computation from http://www.opengl.org/discussion_boards/showthread.php/171485-Texture-LOD-calculation-(useful-for-atlasing)
+	// float d = max( dot( dx, dx ), dot( dy, dy ) );
+	//  
+	// // Clamp the value to the max mip level counts
+	// const float rangeClamp = pow(2, (SUB_TEXTURE_MIPCOUNT - 1) * 2);
+	// d = clamp(d, 1.0, rangeClamp);
+	//  
+	// float mipLevel = 0.5 * log2(d);
+	// mipLevel = floor(mipLevel);   
+
+	// Ray-march...
+	float4	CurrentPosition = float4( _UV, 1, 0 );	// Start at current UV, from the top, from distance 0m
+	float4	PreviousPosition;
+	float4	SampledHeights = _HeightMap.SampleGrad( $trilinearSampler, CurrentPosition.xy, dx, dy ).x;
+	float	Hit = 0.0;
+	uint	nStepsCount = uint( ceil( StepsCount ) );	// Ceil so we get at least one step!
+
+	for ( uint StepIndex=0; StepIndex < nStepsCount; StepIndex++ )
+	{
+		// March one step
+		PreviousPosition = CurrentPosition;
+		CurrentPosition += Step;
+
+		// Sample height at new position
+		SampledHeights.x = SampledHeights.y;
+		SampledHeights.y = SampledHeights.z;
+		SampledHeights.z = _HeightMap.SampleGrad( $trilinearSampler, CurrentPosition.xy, dx, dy ).x;
+
+		if ( SampledHeights.z >= CurrentPosition.z )
+		{	// We got a hit!
+
+#if 1	// Linear interpolation
+ 			float	t = (CurrentPosition.z - SampledHeights.z) / (1e-4 + SampledHeights.y + CurrentPosition.z - SampledHeights.z - PreviousPosition.z);	// Intersection of 2 segments
+
+#elif 0	// Quadratic interpolation
+
+			float	a = SampledHeights.z - 2.0 * SampledHeights.y + SampledHeights.x;
+			float	b = 2.0 * (SampledHeights.y - SampledHeights.x);
+			float	c = SampledHeights.x;
+
+			float	Delta = b*b - 4.0 * a * c;
+					Delta = sqrt( max( 0.0, Delta ) );
+			float	t0 = (-b - Delta) / (2.0 * a );
+			float	t1 = (-b + Delta) / (2.0 * a );
+
+			float	t = 1.0 - ( t0 >= 0.0 && t0 <= 1.0 ? t0 : t1 );
+
+#else	// Cubic interpolation
+			SampledHeights.w = _HeightMap.SampleGrad( $trilinearSampler, CurrentPosition.xy + Step.xy, dx, dy ).x;	// Sample one last time one step ahead
+
+// SampledHeights = float4( 0.05, 0.075, 0.3, 0.32 );
+// PreviousPosition.z = 0.3;
+// CurrentPosition.z = 0.0;
+
+			// Cubic hermite spline from http://en.wikipedia.org/wiki/Cubic_Hermite_spline
+			float	p0 = SampledHeights.y;
+			float	p1 = SampledHeights.z;
+			float	m0 = 0.5 * (SampledHeights.z - SampledHeights.x);
+			float	m1 = 0.5 * (SampledHeights.w - SampledHeights.y);
+
+			// Line equation
+			float	h0 = PreviousPosition.z;
+			float	slope = Step.z;
+
+//return -slope;
+
+			// Returns the array of 3 real roots of a cubic polynomial  a + b x + c x^2 + d x^3 = 0
+			// NOTE: If roots are imaginary, the returned value in the array will be "undefined"
+			// Code from http://www.codeguru.com/forum/archive/index.php/t-265551.html (pretty much the same as http://mathworld.wolfram.com/CubicFormula.html)
+			//
+			float	a = p0 - h0;
+			float	b = m0 - slope;
+			float	c = -3.0 * p0 - 2.0 * m0 + 3.0 * p1 - m1;
+			float	d = 2.0 * p0 + m0 - 2.0 * p1 + m1;
+
+//					d += 1e-4;
+
+			// Adjust coefficients
+			float	a1 = c / d;
+			float	a2 = b / d;
+			float	a3 = a / d;
+
+			float	Q = (a1 * a1 - 3 * a2) * (1.0 / 9.0);
+			float	R = (2.0 * a1 * a1 * a1 - 9.0 * a1 * a2 + 27.0 * a3) * (1.0 / 54.0);
+			float	Qcubed = Q * Q * Q;
+
+return -a3;
+return 0.1 * Q;
+return abs(Qcubed - R * R);
+//					d = Qcubed - R * R;
+//Assume			if ( d >= 0 )
+//					{	// Three real roots
+// 						if ( Q < 0.0 )
+// 							return [undefined, undefined, undefined];
+
+//					Qcubed = max( 0.0, Qcubed );
+
+			float	theta = safeAcos( R / sqrt(Qcubed) );
+			float	theta_3 = theta * (1.0 / 3.0);
+			float	sqrtQ = sqrt( Q );
+			float	minus_a1_3 = - a1 / 3;
+			float	t0 = -2 * sqrtQ * cos( theta_3 ) + minus_a1_3;
+			float	t1 = -2 * sqrtQ * cos( theta_3 + (2.0 / 3.0) * PI ) + minus_a1_3;
+			float	t2 = -2 * sqrtQ * cos( theta_3 + (4.0 / 3.0) * PI ) + minus_a1_3;
+// 					}
+// 					else
+// 					{	// One real root
+// 						var e = Math.pow( Math.sqrt( -d ) + Math.abs( R ), 1.0 / 3.0 );
+// 						if ( R > 0 )
+// 							e = -e;
+// 
+// 						Result[0] = Result[1] = Result[2] = (e + Q / e) - a1 / 3.0;
+// 					}
+
+// 					float	t = saturate( t0 );
+// 					if ( t1 >= 0.0 && t1 <= 1.0 ) t = t1;
+// 					if ( t2 >= 0.0 && t2 <= 1.0 ) t = t2;
+
+			float	UseT0 = step( abs( t0 - 0.5 ), 0.5 );
+			float	UseT1 = step( abs( t1 - 0.5 ), 0.5 );
+			float	UseT2 = step( abs( t2 - 0.5 ), 0.5 );
+			float	t = lerp( lerp( t2, t1, UseT1 ), t0, UseT0 );
+
+// return UseT2;
+// return abs( t1 );
+//return Qcubed - R * R;
+return t;
+//					t = 1.0 - t;
+
+
+//					float	t = saturate( 1.0 - t2 );
+//return float4( t0, t1, t2, 0 );
+
+#endif
+			CurrentPosition -= t * Step;	// Go back a little to the proper intersection
+			Hit = 1.0;
+			break;
+		}
+	}
+
+	// Displace UVs and recompute new world space position
+	_UV = CurrentPosition.xy;
+	_wsPosition += CurrentPosition.w * _wsView;
+
+	return float4( CurrentPosition.xyz, Hit );
+}
+
+// Recomputes the new local normal and tangent space based on current UV position in the height map
+//	_HeightMap, the height map to sample displacement values from
+//	_Displacement_mm, maximum displacement encoded by the height map (in millimeters)
+//	_Texels_per_meter (512), the density of texels per meter (for Blacksparrow, I heard it was 512 texels/m)
+//	_UV, the texture coordinates that will get displaced by the function
+//	_NormalSmoothing (4), a factor to smooth the normals when we reconstruct them from the height map at the displaced position
+//	Tangent, BiTangent, the geometric tangent space (normalized) in world space. Note that this tangent space is recomputed by the function so it fits the height field's local orientation at hit position!
+//
+float3	ReComputeNormalFromHeightMap( Texture2D<float> _HeightMap, float _Displacement_mm, float _Texels_per_meter, float2 _UV, float _NormalSmoothing, inout float3 _wsTangent, inout float3 _wsBiTangent, inout float3 _wsNormal ) {
+	float2	TextureDimensions = $parallaxHeightMapSize;	// bmayaux (2016-10-24) Height map size must now be specified by the user
+//	_HeightMap.GetDimensions( TextureDimensions.x, TextureDimensions.y );
+
+	float	TexelSize_mm = 1000.0 / _Texels_per_meter;
+
+	// Sample along +U and +V to compute height gradients and retrieve tangent space normal at this position
+// 	const float		BIAS_FACTOR = 16.0;
+// 	dx *= BIAS_FACTOR;
+// 	dy *= BIAS_FACTOR;
+
+	const float3	dUV = float3( _NormalSmoothing / TextureDimensions.xy, 0 );	// Tiny displacement in UV space
+	const float		dXY = 2.0 * _NormalSmoothing * TexelSize_mm;				// Tiny displacement in tangent space
+
+#if 0
+	// Less expensive but also less precise method that uses only 2 texture taps
+	float	H = CurrentPosition.z;
+	float	Hu = _HeightMap.Sample( $anisotropicSampler, _UV + dUV.xz ).x;
+	float	Hv = _HeightMap.Sample( $anisotropicSampler, _UV - dUV.zy ).x;		// Here, V's go along -BiTangent!
+	float3	dH_tangent = float3( _NormalSmoothing * TexelSize_mm, 0.0, _Displacement_mm * (Hu - H) );
+	float3	dH_biTangent = float3( 0.0, _NormalSmoothing * TexelSize_mm, _Displacement_mm * (Hv - H) );
+	float3	tsNormal = normalize( cross( dH_tangent, dH_biTangent ) );
+#else
+	// More expensive but also much smoother version that uses 4 texture taps
+	float	Hu0 = _HeightMap.Sample( $anisotropicSampler, _UV - dUV.xz ).x;
+	float	Hu1 = _HeightMap.Sample( $anisotropicSampler, _UV + dUV.xz ).x;
+	float	Hv0 = _HeightMap.Sample( $anisotropicSampler, _UV + dUV.zy ).x;		// Here, V's go along -BiTangent!
+	float	Hv1 = _HeightMap.Sample( $anisotropicSampler, _UV - dUV.zy ).x;		// Here, V's go along -BiTangent!
+	float3	dH_tangent = float3( dXY, 0.0, _Displacement_mm * (Hu1 - Hu0) );
+	float3	dH_biTangent = float3( 0.0, dXY, _Displacement_mm * (Hv1 - Hv0) );
+	float3	tsNormal = normalize( cross( dH_tangent, dH_biTangent ) );
+#endif
+
+	// Rebuild local tangent space
+	_wsNormal = tsNormal.x * _wsTangent + tsNormal.y * _wsBiTangent + tsNormal.z * _wsNormal;
+	_wsTangent = normalize( cross( _wsBiTangent, _wsNormal ) );
+	_wsBiTangent = cross( _wsNormal, _wsTangent );
+	
+	return tsNormal;
+}
+
+// Computes the directional occlusion in the specified direction given 3 HL2 basis vectors weighted by a SSBumpMap + a 4th vector that is the original vertex normal (i.e. (0,0,1) transformed into world space)
+//	_wsDirection, the direction to sample the occlusion
+//	_SSBumpOcclusion, the directional occlusion values along each one of the 3 HL2 basis vectors
+//	_AO, the ambient occlusion factor (either from a map, or use length(_SSBumpOcclusion) if not available otherwise)
+//	_wsHL2Basis_R, G, B, the 3 HL2 basis vectors transformed into world space (note that these vectors are given in the ORIGINAL tangent space, don't use the tangent space after it's been modified by the ComputeParallaxDisplacement() method!)
+//	_wsHL2Basis_N, the 
+//
+float	ComputeDirectionalOcclusion( float3 _wsDirection, float3 _SSBumpOcclusion, float _AO, float3 _wsHL2Basis_R, float3 _wsHL2Basis_G, float3 _wsHL2Basis_B, float3 _wsHL2Basis_N )
+{
+	float3	BasisWeights = float3( saturate( dot( _wsDirection, _wsHL2Basis_R ) ), saturate( dot( _wsDirection, _wsHL2Basis_G ) ), saturate( dot( _wsDirection, _wsHL2Basis_B ) ) );	// Compute the weight of each direction of occlusion depending on the provided direction
+	float	Occlusion = dot( _SSBumpOcclusion, BasisWeights );	// Sum each weight, itself weighted by the values from the SSBumpMap
+
+	// Additionally, I thought it would be nice to account for an additional direction which is the vertical of the surface where we implicitly know the visibility is 1, no matter the height map
+	// It's important to account for that because a completely vertical light direction will never yield 1 when weighted by the HL2 basis vectors if there is the slightest occlusion along the
+	//	vectors whereas a completely vertical light should always light at its fullest.
+	// If we don't do that then it's almost like weighting the diffuse/specular lighting by the ambient occlusion, which is fundamentally incorrect.
+	//
+	// The idea is simply to dot the direction with the original geometric normal to know how much "vertical" we are and blend the previous occlusion with the total visibility
+	//	when the direction is directly atop the surface.
+	//
+	// We also use the AO value ~= sum(_SSBumpOcclusion) to know how much of the horizon is blocked by micro-geometry from the height map
+	// This way we can deduce how the dot product with the vertical direction should be important: the aperture of the "verticality lobe" should
+	//	be reduced depending on the AO. So it basically boils down to raising the Verticality to a power depending on AO.
+	// Examples:
+	//	_ The obvious case of AO=1 should yield Verticality = pow( Verticality, 0 ) = 1
+	//
+	// _ Another case where we could determine the A0 is, say, 0.5, means half the solid angle is covered by geometry so it basically means the "horizon"
+	//		is at 45° and the "verticality lobe" should be reduced to fit a 45° angle based on some criterion.
+	//
+	// The best choice is yet to take an arbitrary scale of say exponent=1000 for a completely occluded (AO=0) geometry and to logarithmicaly interpolate the 
+	//	exponent based on AO
+	//
+	float	Verticality = saturate( dot( _wsDirection, _wsHL2Basis_N ) );
+
+#if 0	// HARDCODED EXPONENT
+	Verticality *= Verticality;
+	Verticality *= Verticality;	// ^4 seems to be appropriate to reduce the aperture of the lobe where verticality stops being relevant
+#else	// AO-DRIVEN EXPONENT
+	const float	MAX_EXPONENT = 8;		// Totally arbitrary!
+//	const float	MAX_EXPONENT = _Bisou2;	// User-tweakable
+// 	float	Exponent = exp2( lerp( 0.0, log2(MAX_EXPONENT), _AO ) );
+ 	float	Exponent = lerp( 1.0, MAX_EXPONENT, _AO*_AO );
+ 	Verticality = pow( Verticality, Exponent );
+//	Verticality = exp2( Exponent * log2( 1e-4 + Verticality ) );
+#endif
+
+	Occlusion = lerp( Occlusion, 1.0, Verticality );
+// Occlusion = _AO*_AO;
+// Occlusion = Verticality;
+
+	return Occlusion;
+}
+
+#endif	// PARALLAX_INCLUDED
+
+}	// newstyle
+}

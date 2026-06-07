@@ -1,0 +1,47 @@
+{
+	newstyle
+	state {
+		depthWrite	0
+ 		depthfunc	NOTEQUAL
+		depthEnable	0
+ 		cull		NONE
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xy, 0.0, 1.0 );
+	}
+
+	hlsl_fp_main {
+		const float		falloff = $(screenShadows/bilateralBlur/parms0).x;
+		const float		sharpness   = $(screenShadows/bilateralBlur/parms0).y;
+
+		const int2		targetSize = int2( $(screenShadows/bilateralBlur/parms1).xy );
+		const int		blurRadius  = $(screenShadows/bilateralBlur/parms1).z;
+
+		const float	avoidNaN = 0.001;
+
+		int2	pixelPosition = int2( floor( $sv_position.xy ) );
+		float	centerRawDepth = $(screenShadows/bilateralBlur/depthBuffer)[pixelPosition];
+		float	centerDepth = ComputeLinearZ( centerRawDepth );
+
+		int		startIndex = max( 0, pixelPosition.y - blurRadius ) - pixelPosition.y;
+		int		endIndex = min( pixelPosition.y + blurRadius + 1, targetSize.y ) - pixelPosition.y;
+		pixelPosition.y += startIndex;
+
+		float	weightedSum = 0.0;
+		float	sumWeights = 0.0;
+		for ( int i=startIndex; i < endIndex; i++, pixelPosition.y++ ) {
+			float	rawDepth = $(screenShadows/bilateralBlur/depthBuffer)[pixelPosition];
+			float	linearDepth = ComputeLinearZ( rawDepth );
+			float	value = $(screenShadows/bilateralBlur/sourceImage)[pixelPosition].y;
+
+			float	ddiff = linearDepth - centerDepth;
+			float	weight = exp( i*i*falloff + ddiff*ddiff*sharpness ) + avoidNaN;	// better quality, less performance
+			weightedSum += weight * value;
+			sumWeights +=  weight;
+		}
+
+		@sv_target = weightedSum / sumWeights;
+//@sv_target = $(screenShadows/bilateralBlur/sourceImage)[$sv_position.xy];
+	}
+}

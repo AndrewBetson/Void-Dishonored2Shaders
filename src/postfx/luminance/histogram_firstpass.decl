@@ -1,0 +1,125 @@
+{
+	newstyle
+	options {
+		// According to Nico:
+		// AMD max 256 threads (wavefront 64 => multiples of 64)
+		// NVidia max 192 threads (wavefront 32 => multiples of 32)
+		// Ideal => a maximum of 128 threads
+		//
+		NUMTHREADX 32		// Tiles of 32x4 pixels
+		NUMTHREADY 4
+		NUMTHREADZ 1
+	}
+	
+	hlsl_prefix {
+
+		#include <PostFX/Luminance/common>
+
+		static const uint	PassesCount = HISTOGRAM_BUCKETS_COUNT / NUMTHREADX;	// To address the entire histogram, we need to make each thread in the group process several buckets
+																				// A typical histogram size of 128 and 32 threads per group will require 4 passes to address all 4*32=128 buckets...
+
+		groupshared uint	Histogram[NUMTHREADY][HISTOGRAM_BUCKETS_COUNT];		// Here we have as many histograms as processed scanlines
+																				// The NUMTHREADY histograms are added together into a single one that we store at the end of the shader
+	}
+
+	hlsl_cp_main {
+
+		uint2	Dimensions = uint2( ceil( 1.0 / $positionToViewTexture.zw ) );
+		uint	Width = Dimensions.x;
+		uint	Height = Dimensions.y;
+
+		// Clear the histogram
+		[unroll]
+		for ( uint i=0; i < PassesCount; i++ ) {
+			int	BucketIndex = NUMTHREADX * i + $sv_groupThreadID.x;
+			Histogram[$sv_groupThreadID.y][BucketIndex] = 0;
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Accumulate an entire scanline of the source image
+		// NUMTHREADY scanlines of the source image are processed at the same time
+		uint2	PixelIndex;
+		PixelIndex.y = NUMTHREADY * $sv_groupID.y + $sv_groupThreadID.y;	// The source image's scanline we're reading from
+
+		for ( uint X=0; X < Width; X+=NUMTHREADX )	// Jump in blocks of NUMTHREADX which is our granularity of horizontal blocks (so a 1920 image will require each thread to read 1920/32=60 pixels)
+		{
+			PixelIndex.x = X + $sv_groupThreadID.x;
+			if ( PixelIndex.x >= Width || PixelIndex.y >= Height )
+				continue;	// Don't accumulate pixels outside the screen otherwise we have a bias toward blacks!
+
+			float	Luminance = $(PostFX/Luminance/texDownsampledHDR)[PixelIndex].w;		// Remember we're reading from the previously downsampled HDR buffer where alpha contains the luminance
+
+			// range expand luminance from r11g11b10 to linear
+			Luminance = RangeExpandColorFromR11G11B10( Luminance );
+			Luminance *= ARKANE_TO_WORLD_LUMINANCE;	// ARKANE TO WORLD (?? units => cd/m²)
+
+#if 1
+			// Reject black pixels that are clearly an error!
+			if ( Luminance < MIN_ADAPTABLE_SCENE_LUMINANCE )
+				continue;
+#else
+			// Don't reject black pixels but clamp => This results in bias toward frequent invalid pixels
+			Luminance = max( MIN_ADAPTABLE_SCENE_LUMINANCE, Luminance );	// Avoid log( 0 )
+#endif
+
+			uint	BucketIndex = uint( floor( Luminance2HistogramBucketIndex( Luminance ) ) );	// 20 * log10( Luminance ) => Histo bucket
+					BucketIndex = clamp( BucketIndex, 0, HISTOGRAM_BUCKETS_COUNT-1 );			// Writing outside the target's range [0,127] crashes the driver!
+
+			uint old;
+			InterlockedAdd( Histogram[$sv_groupThreadID.y][BucketIndex], 1, old );
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		#if NUMTHREADY > 8
+			// Collapse second half of 8 lines into first half
+			// (only working if threads count is at least 16)
+			if ( $sv_groupThreadID.y < 8 ) {
+				[unroll]
+				for ( uint i=0; i < PassesCount; i++ ) {
+					int	BucketIndex = NUMTHREADX * i + $sv_groupThreadID.x;
+					Histogram[$sv_groupThreadID.y][BucketIndex] += Histogram[8+$sv_groupThreadID.y][BucketIndex];
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		#if NUMTHREADY > 4
+			// Collapse second half of 4 lines into first half
+			// (only working if threads count is at least 8)
+			if ( $sv_groupThreadID.y < 4 ) {
+				[unroll]
+				for ( uint i=0; i < PassesCount; i++ ) {
+					int	BucketIndex = NUMTHREADX * i + $sv_groupThreadID.x;
+					Histogram[$sv_groupThreadID.y][BucketIndex] += Histogram[4+$sv_groupThreadID.y][BucketIndex];
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		#if NUMTHREADY > 2
+			// Collapse second half of 2 lines into first half
+			// (only working if threads count is at least 4)
+			if ( $sv_groupThreadID.y < 2 ) {
+				[unroll]
+				for ( uint i=0; i < PassesCount; i++ ) {
+					int	BucketIndex = NUMTHREADX * i + $sv_groupThreadID.x;
+					Histogram[$sv_groupThreadID.y][BucketIndex] += Histogram[2+$sv_groupThreadID.y][BucketIndex];
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		#endif
+
+		// From there, we only need a single line of threads to finalize the histogram
+		if ( $sv_groupThreadID.y == 0 ) {
+			[unroll]
+			for ( uint i=0; i < PassesCount; i++ ) {
+				int	BucketIndex = NUMTHREADX * i + $sv_groupThreadID.x;
+				#if NUMTHREADY > 1
+					@(PostFX/Luminance/texHistogram)[uint2( BucketIndex, $sv_groupID.y )] = Histogram[0][BucketIndex] + Histogram[1][BucketIndex];	// Add the last two lines together and store into destination
+				#else // NUMTHREADY == 1
+					@(PostFX/Luminance/texHistogram)[uint2( BucketIndex, $sv_groupID.y )] = Histogram[0][BucketIndex];								// Simply write result into destination
+				#endif
+			}
+		}
+	}
+}

@@ -1,0 +1,61 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		// Transforms a world-space position into a texture UV
+		float2	World2UV( float2 _wsPosition ) {
+			return (_wsPosition - $(arkShootVistaProjectedShadowMap/parms0).xy) / $(arkShootVistaProjectedShadowMap/parms0).zw;
+		}
+		// Transforms a texture UV into a world-space position
+		float2	UV2World( float2 _UV ) {
+			return $(arkShootVistaProjectedShadowMap/parms0).xy + _UV * $(arkShootVistaProjectedShadowMap/parms0).zw;
+		}
+
+		float	SampleWorldHeight( float2 _UV ) {
+			float	Zproj = $(arkShootVistaProjectedShadowMap/texDepth).SampleLevel( $linearClamp, _UV, 0.0 );				// Zn=1 Zf=0 (reversed depth)
+			return lerp( $(arkShootVistaProjectedShadowMap/parms1).x, $(arkShootVistaProjectedShadowMap/parms1).y, Zproj );	// A simple interpolation retrieves the appropriate height
+		}
+
+	}
+	hlsl_cp_main {
+		float2	MaxExtents = $(arkShootVistaProjectedShadowMap/parms0).xy + $(arkShootVistaProjectedShadowMap/parms0).zw;
+
+		// Compute initial world position
+		uint2	Position = $sv_dispatchThreadID.xy;
+		float2	UV = (Position + 0.5) / $(arkShootVistaProjectedShadowMap/parms2).zw;
+				UV.x = 1.0 - UV.x;
+				UV.y = 1.0 - UV.y;
+		float2	wsInitialPosition = UV2World( UV );
+
+		// Compute slope
+		float3	scaledSunDirection = $(atm/sky/SunDirection) / length( $(atm/sky/SunDirection).xy );	// Sun direction is scaled so that the horizontal displacement is always 1 unit
+				scaledSunDirection.xy *= -1.0;
+		float2	dUV = scaledSunDirection.xy;
+		float2	texelSize = 1.0 / $(arkShootVistaProjectedShadowMap/parms2).xy;							// Size of a texel, in UV-space
+		dUV *= length( texelSize );																		// Scale so that the horizontal displacement along the slope is at least a texel in the texture
+
+		// Trace and keep maximum occluder position and height
+		float3	OccluderUVHeight = float3( UV, $(arkShootVistaProjectedShadowMap/parms1).x );
+		[loop]
+		while ( all( UV > 0.0 && UV < 1.0 ) ) {
+			float	Height = SampleWorldHeight( UV );
+			if ( Height > OccluderUVHeight.z )
+				OccluderUVHeight = float3( UV, Height );
+			UV += dUV;
+		}
+
+		// Compute maximum height from occluder's position
+		float2	wsOccluderPosition = UV2World( OccluderUVHeight.xy );
+		float	distance2Occluder = length( wsOccluderPosition - wsInitialPosition );					// Horizontal distance to occluder, in world units
+		float	reducedOccluderHeight = OccluderUVHeight.z - distance2Occluder * scaledSunDirection.z;	// Height of the occluder, reduced by Sun's vertical slope after walking the distance from initial point to occluder
+
+		@(arkShootVistaProjectedShadowMap/texProjectedShadow)[Position] = reducedOccluderHeight - $(arkShootVistaProjectedShadowMap/parms1).x;
+
+//@(arkShootVistaProjectedShadowMap/texProjectedShadow)[Position] = SampleWorldHeight( World2UV( wsInitialPosition ) );
+
+	}
+}

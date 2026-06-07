@@ -1,0 +1,31 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		static const int	KERNEL_HALF_SIZE = 8;
+
+	}
+	hlsl_cp_main {
+		int2	Position = int2( $sv_dispatchThreadID.xy );
+		int2	PosMax = int2( $(arkShootVistaProjectedShadowMap/parms2).zw ) - 1;
+
+		float	a = $(arkShootVistaProjectedShadowMap/parms0).x;
+		float2	sum = 0.0;
+		int2	Delta;
+		for ( Delta.y=-KERNEL_HALF_SIZE; Delta.y <= KERNEL_HALF_SIZE; Delta.y++ ) {
+			for ( Delta.x=-KERNEL_HALF_SIZE; Delta.x <= KERNEL_HALF_SIZE; Delta.x++ ) {
+				float	gaussianWeight = exp( a * dot( Delta.xy, Delta.xy ) );
+				int2	ClippedPosition = max( 0, min( PosMax, Position+Delta ) );
+				float	height = $(arkShootVistaProjectedShadowMap/texDepth)[ClippedPosition];
+				sum += float2( gaussianWeight * height, gaussianWeight );
+			}
+		}
+
+		@(arkShootVistaProjectedShadowMap/texProjectedShadow)[Position] = sum.x / sum.y;
+//@(arkShootVistaProjectedShadowMap/texProjectedShadow)[Position] = $(arkShootVistaProjectedShadowMap/texDepth)[Position];
+	}
+}

@@ -1,0 +1,39 @@
+{
+	newstyle
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <dof>
+	}
+
+	hlsl_cp_main {
+		const float2 center = $(PostFX/DOF/center).xy;
+		float focusCurrent = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, center*$resolutionScale.xy, 0.0 ).x;
+
+		// Extend Focus
+		const uint nbSteps = 8;
+		const float anglestep = TWOPI / nbSteps;
+		const float speed = $(PostFX/DOF/Autofocus/speed);
+		const float radius = $(PostFX/DOF/Autofocus/radius);
+
+		[unroll]
+		for( uint idx=0; idx < nbSteps; ++idx ) {
+			const float angle = (idx * anglestep);
+			float2 offset = rot2d( float2(radius,0.0), angle );
+			float2 texcoords = (center + $(PostFX/DOF/targetSize).xy * offset) * $resolutionScale.xy;
+			float  focus = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, texcoords, 0.0 ).x;
+			focusCurrent = min( focusCurrent, focus );
+		}
+
+		float focusLast = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center*$resolutionScale.xy, 0.0 ).x;
+		float val = lerp(focusLast,focusCurrent,speed);
+		@(PostFX/DOF/ZbufferAutofocusOut)[uint2($sv_groupThreadID.xy)] = val;
+	}
+}

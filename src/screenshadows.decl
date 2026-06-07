@@ -1,0 +1,44 @@
+{
+	newstyle
+	
+	state {
+		depthfunc NOTEQUAL
+		depthEnable	0
+	}
+	
+	hlsl_prefix {
+		#include <shadow>
+		#include <helper>
+	}
+	
+	hlsl_vp_main {
+		//draw quad on far plane
+		@sv_position = float4( $vertex_position.xy, 0.0, 1.0 );
+		@legacy_texcoord = float4( $vertex_texcoord.xy, 0.f, 0.f );
+	}
+	
+	hlsl_fp_main {
+		//Compute world space position
+		float depth = $(screenShadows/DepthBuffer).SampleLevel( $pointClamp, $legacy_texcoord.xy * $resolutionScale.xy, 0 ).x * $modelDepthHack.x;
+		float4 ndcPos = float4( $legacy_texcoord.x * 2.f - 1.f, 1.f -($legacy_texcoord.y * 2.f), depth, 1.f );
+		float4 wsPos = mul ( $inverseViewProjectionMatrix, ndcPos );
+		wsPos.xyz /= wsPos.w;
+
+		#if $(screenshadows/useJitter)
+			//Jitter position for better blur
+			float3 wsView	= normalize($wsCamPos.xyz - wsPos.xyz);
+			float stepSize = $(screenShadows/stepSize);
+			const uint interleavedSize = 8;
+			const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+			uint2 interleavedPos = uint2($sv_position.xy) % interleavedSize;
+			float rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+
+			wsPos.xyz += wsView * rayOffset;
+		#endif
+
+		float4x4 worldToShadowMat_unused;
+		float4x4 shadowToWorldMat_unused;
+		uint sliceIdx_unused;	
+		@sv_target = ComputeParallelShadow( wsPos.xyz, float3( 0.0, 0.0, 0.0 ), worldToShadowMat_unused, shadowToWorldMat_unused, sliceIdx_unused, HIGH_QUALITY );
+	}
+}

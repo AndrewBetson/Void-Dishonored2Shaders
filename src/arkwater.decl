@@ -1,0 +1,204 @@
+{
+	newstyle
+	
+	state {
+		cull none
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+
+	parms {
+		stageSort	sortWater
+	}
+	
+	options {
+		forcePixelShader 1
+	}	
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <arkWaterHelpers>
+	
+		float ComputeWaves( float2 _wsPos, float _camDist )
+		{
+			float rawOctaves = $(ocean/PerlinMaxOctaves).x / (1.0f + _camDist * $(ocean/PerlinAntiAlias).x);
+			rawOctaves = max( rawOctaves, 1.0f );
+		
+			//Perform kind of a trilinear texture filtering
+			int octaves = 1 + (int)floor( rawOctaves );
+			float lastOctaveBlend = fmod( rawOctaves, 1.0f );
+
+			const int hashMethod = NOISE_HASH_GPU_GEMS;
+			const int interpQuality = HIGH_QUALITY_NOISE_INTERP;
+
+			const float2 windSpeed = float2( 0.8, 0.6 ) * 0.0f;
+			float2 movement = windSpeed * $localTime.x;
+
+			float perlinNoise = FractalNoise3DBlendLastOctave( 	float3( (_wsPos + movement) * $(ocean/PerlinFrequency).x, $localTime.x * $(ocean/PerlinSpeed).x ), 
+																octaves, lastOctaveBlend, 
+																float3( 2.054f, 2.042f, 1.3f ), 
+																$(ocean/PerlinPersistence).x, 
+																hashMethod, interpQuality );
+
+			perlinNoise *= $(ocean/PerlinAmplitude).x;
+			
+			perlinNoise *= 0.1f; //Scale hack (the slider to tweak this parameter is shared with the ocean which typically has higher waves)
+			 
+			return perlinNoise;
+		}
+	
+	
+		float3 ComputeWavesNormal( float2 _wsPos, float _camDist )
+		{
+			const float delta = 0.01f;
+			
+			float h   = ComputeWaves( _wsPos,                        _camDist );
+			float hdx = ComputeWaves( _wsPos + float2( delta, 0 ), _camDist );
+			float hdy = ComputeWaves( _wsPos + float2( 0, delta ), _camDist );
+
+			float normalFadeout = 1.0f;   //max( _camDist - $(ocean/NormalFadeOutStart).x, 0.0f ) * $(ocean/NormalFadeOut).x + 1.0f;
+
+			return normalize( float3( h - hdx, h - hdy, delta * normalFadeout ) );
+		}
+	
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;	
+		@wsPosition = vout._worldPosition;
+		
+		#if !$isZPrePass && !$(tool/unlit) && !$(water/IsHorizontalWaterSurface)
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#endif
+
+		#if $isZPrePass && !$isZPrePassAlpha
+			//The motion vector generation for motion blur & temporalAA is done here
+			VertexOutContext previousFrameVout = TransformVertex( victx, true );
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+	
+
+		#if $(water/UseIBLProbesOption)
+			#if !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe
+				float3	unused_vertex_SH, unused_vertex_SH1, unused_vertex_SH2, unused_vertex_SH3;
+				float	unused_IBLLuminanceFactor;
+			
+				#if defined(PC) && ($useMultiInstancing || $(tool/usePerVertexSH))
+					// Use special barycentric coordinates associated to vertices to convey cube map index to pixel
+					uint	cubeMapIndex;
+					WriteIndirectLightingVertexOutput( vout, unused_vertex_SH, unused_vertex_SH1, unused_vertex_SH2, unused_vertex_SH3, unused_IBLLuminanceFactor, cubeMapIndex );
+					@vertex_iblprobeindex = vout._vertexBarycentricCoordinates * cubeMapIndex;
+					@vertex_iblbarycentric = vout._vertexBarycentricCoordinates.xy;	// bmayaux (2016-07-22) Only write XY, Z will be reconstructed by the pixel as 1-X-Y
+				#else
+					// Use per-object SH & IBL probe info
+					WriteIndirectLightingVertexOutput( vout, unused_vertex_SH, unused_vertex_SH1, unused_vertex_SH2, unused_vertex_SH3, unused_IBLLuminanceFactor, @instance_IBLProbeIndex );
+				#endif
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+
+	#if $isZPrePass
+		#if !$isZPrePassAlpha
+			//Motion vector
+			float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+			psMotionVector -= $jitterRelativeToPreviousFrame;
+			psMotionVector *= 0.5f;
+			psMotionVector.y *= -1.0f;
+			@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+		#endif
+		return;
+	#elif $(tool/unlit)
+		@sv_target =  1.0;
+	#else
+		IBLInfo iblInfo;
+
+		#if $(water/UseIBLProbesOption)
+			#if !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe
+				// Retrieves the 3 IBL cube map indices of the triangle and the barycentric coordinates to interpolate between them
+				#if ($useMultiInstancing || $(tool/usePerVertexSH))
+					#if defined(PC)
+						// On PC, we had to duplicate some vertices to ensure barycentrics unicity... :(
+						iblInfo.barycentrics = float3( $vertex_iblbarycentric, 1.0 - $vertex_iblbarycentric.x - $vertex_iblbarycentric.y );
+						iblInfo.IBLCubeMapIndex = uint3( iblInfo.barycentrics > 0.0 ? round( $vertex_iblprobeindex.xyz / iblInfo.barycentrics ) : $vertex_iblprobeindex );
+					#else
+						// On consoles, these are free!
+						iblInfo.barycentrics = GetBarycentricCoords();
+						iblInfo.IBLCubeMapIndex = $instance_IBLProbeIndex;
+					#endif
+				#else
+					// Retrieves a single cube map index for the entire object
+					iblInfo.IBLCubeMapIndex = $instance_IBLProbeIndex.x;
+				#endif
+			#else // !USE_INDIRECT_LIGHTING
+				#if ($useMultiInstancing || $(tool/usePerVertexSH))
+					iblInfo.barycentrics = 1.0;
+				#endif
+				iblInfo.IBLCubeMapIndex = 0U;
+			#endif
+		#endif
+
+	    float waveAmplitudeMask = 1.0f;
+    
+	    bool bUnderWater = !$sv_isFrontFace;
+    
+	    float3 vsPosition = mul( $viewMatrix, float4( $wsPosition, 1.0f ) ).xyz;
+
+		float3 wsViewDir = $wsCamPos - $wsPosition;
+
+		float waterSurfaceDist = length( wsViewDir );
+		wsViewDir /= waterSurfaceDist; //normalize
+
+	    float foam = 0.0f;
+    
+		#if $(water/IsHorizontalWaterSurface)
+			float3 wsNormal = ComputeWavesNormal( $wsPosition.xy, waterSurfaceDist );
+		#else
+			float3 tsNormal = ComputeWavesNormal( $wsPosition.xy, waterSurfaceDist );
+			float3 wsBiTangent = cross( $wsNormal, $wsTangent.xyz ) * sign( $IBLLuminanceFactor );
+			float3 wsNormal = normalize( tsNormal.x * $wsTangent.xyz + tsNormal.y * wsBiTangent + tsNormal.z * $wsNormal );
+		#endif
+	
+		float4 waterResult = WaterShading(	false/*isOcean*/, bUnderWater, $wsPosition.z, $sv_position.xy, $wsPosition, vsPosition, wsNormal, $wsCamPos, wsViewDir, waterSurfaceDist,
+										$(water/WaterColor), $(water/Extinction), $(water/Inscattering),
+										$parallelLightDir.xyz, $parallelLightColor.rgb, $(water/SpecularPower), 1.0,
+										$(water/Refraction),
+										foam, foam, foam, waveAmplitudeMask,
+										iblInfo	);
+										
+		@sv_target.xyz = RangeCompressColorToR11G11B10( waterResult.xyz );
+		@sv_target.w = waterResult.w;
+
+		// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+		#if defined(PC) && $buildingEnvironmentProbe
+																							
+			uint	modelID = $(precomputeIL/modelSurfaceID).x;
+			uint	surfaceID = $(precomputeIL/modelSurfaceID).y;
+			uint	faceID = $SV_PRIMITIVEID;
+			uint	materialID = $(precomputeIL/materialID).x;
+																														
+			float	distance = length( $wsPosition - $wsCamPos );
+			#if $twoSidedLighting
+				distance *= $sv_isFrontFace ? 1.0 : -1.0;	/* Negative distance is a sign for backfaces! */
+			#endif
+																											
+			/* Write result into multiple RTs */
+			@sv_target  = 0.0f;
+			@sv_target1 = asfloat( uint4( modelID, surfaceID, faceID, materialID ) );											/* Model, Surface, Face & material IDs */
+			@sv_target2 = 0.0f;
+			@sv_target3 = float4( wsNormal, distance );																	/* Normal + Distance */
+
+		#endif
+
+	
+    #endif
+		
+	}	
+}

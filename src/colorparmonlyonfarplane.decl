@@ -1,0 +1,22 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		cull none
+	}
+		
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xy, 1, 1 );		
+	}
+	
+	hlsl_fp_main {
+		#if !$isShadow && !$isZPrePass
+			@sv_target = $color;
+		#endif
+	}	
+}

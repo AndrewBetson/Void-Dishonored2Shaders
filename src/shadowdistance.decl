@@ -1,0 +1,257 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef SHADOW_INCLUDED
+		#define SHADOW_INCLUDED
+		#include <shadowCommon>
+
+		// Computed by inverting the projection matrice's operation
+		float2	ShadowComputeUnprojectionParms( float _Znear, float _Zfar ) {
+			float	Q = _Zfar / (_Zfar - _Znear);
+			return float2( Q, Q * _Znear );
+		}
+
+		float	ShadowUnproject( float _Zproj, float2 _UnprojectionParms ) {
+			return _UnprojectionParms.y / (_UnprojectionParms.x - _Zproj);
+		}
+		
+		float	ShadowUnprojectLinear( float _Zproj, float2 _ZnearFar ) {
+			return _ZnearFar.x + _Zproj * (_ZnearFar.y - _ZnearFar.x);
+		}
+
+		float3 SampleShadowMapManualPCFLow( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, float2 _Unproject ) {	// Manual PCF
+			float4	shadowMapPos = ComputeShadowOffset( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir);
+			float	shadowZ = $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo) ), 0.0 );
+			return float3( step( shadowMapPos.z, shadowZ ), ShadowUnproject( shadowZ, _Unproject ), ShadowUnproject( shadowMapPos.z, _Unproject ) );
+		}
+		
+		float3 SampleShadowMapManualPCFHigh( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, float2 _Unproject ) {	// Combining four manual 2x2 PCF to have kind of gaussian
+			float4	shadowMapPos = ComputeShadowOffset( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir);		
+			
+			uint	sliceIndex = SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo);
+			float4	smp;
+			smp.x = $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( 1, 0 ) );
+			smp.y = $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(-1, 0 ) );
+			smp.z = $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( 0, 1 ) );
+			smp.w = $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( 0,-1 ) );
+
+			float4	cmp = step( shadowMapPos.z, smp );
+
+			return float3( 0.25 * (cmp.x+cmp.y+cmp.z+cmp.w), ShadowUnproject( 0.25 * (smp.x+smp.y+smp.z+smp.w), _Unproject ), ShadowUnproject( shadowMapPos.z, _Unproject ) );
+		}
+
+		float3 SampleShadowMapManualPCFUltra( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, float2 _Unproject ) {	// Combining nine manual 2x2 PCF to have kind of gaussian
+			float4	shadowMapPos = ComputeShadowOffset( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir);
+			
+			uint	sliceIndex = SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo);
+			float4	smp0, smp1;
+			float	smpCenter; 
+			smp0.x		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( -1, -1 ) );
+			smp0.y		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(  0, -1 ) );
+			smp0.z		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(  1, -1 ) );
+			smp0.w		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( -1,  0 ) );
+			smpCenter	= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0 );
+			smp1.x		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(  1,  0 ) );
+			smp1.y		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2( -1,  1 ) );
+			smp1.z		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(  0,  1 ) );
+			smp1.w		= $(shadowMapAtlas).SampleLevel( $bilinearClamp, float3( shadowMapPos.xy, sliceIndex ), 0.0, int2(  1,  1 ) );
+
+			float4	cmp0 = step( shadowMapPos.z, smp0 );
+			float4	cmp1 = step( shadowMapPos.z, smp1 );
+			float	cmpCenter = step( shadowMapPos.z, smpCenter );
+
+			smp0 += smp1;
+			smpCenter += smp0.x + smp0.y + smp0.z + smp0.w;
+			cmp0 += cmp1;
+			cmpCenter += cmp0.x + cmp0.y + cmp0.z + cmp0.w;
+
+			return float3( (1.0/9.0) * cmpCenter, ShadowUnproject( (1.0/9.0) * smpCenter, _Unproject ), ShadowUnproject( shadowMapPos.z, _Unproject ) );
+		}
+
+		float3 SampleOmniShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, float2 _Unproject, const int _quality ) {
+			switch( _quality ) {
+			case HIGH_QUALITY :
+				{
+					#if $shadowFilteringQuality == 0
+						return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#elif $shadowFilteringQuality == 1
+						return SampleShadowMapManualPCFHigh( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#else
+						return SampleShadowMapManualPCFUltra( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#endif				
+				}
+				break;
+			case AVERAGE_QUALITY:
+				{
+					#if QUALITY <= 0
+						return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#else
+						return SampleShadowMapManualPCFHigh( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );				
+					#endif
+				}
+				break;
+			case LOW_QUALITY:
+				{
+					return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+				}
+				break;
+			}
+			return float3( 1.0, 1e8, 0.0 );
+		}
+		
+		float3 SampleOmniShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsLightDir, float2 _Unproject, const int _quality ) {
+			float3 wsNormalFake = float3(0,1,0);
+			return SampleOmniShadowMap( _shadowMapInfo, _wsPosition, wsNormalFake, _wsLightDir, _Unproject, _quality );
+		}
+		
+		float3 SampleSpotShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, float2 _Unproject, const int _quality ) {
+			switch( _quality ) {
+			case HIGH_QUALITY :
+				{
+					#if $shadowFilteringQuality == 0
+						return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#elif $shadowFilteringQuality == 1
+						return SampleShadowMapManualPCFHigh( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#else
+						return SampleShadowMapManualPCFUltra( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#endif				
+				}
+				break;
+			case AVERAGE_QUALITY:
+				{					
+					#if QUALITY <= 0
+						return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+					#else
+						return SampleShadowMapManualPCFHigh( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );				
+					#endif
+				}
+				break;
+			case LOW_QUALITY:
+				{
+					return SampleShadowMapManualPCFLow( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir, _Unproject );
+				}
+				break;
+			}
+			return float3( 1.0, 1e8, 0.0 );
+		}
+
+		float3 SampleSpotShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float2 _Unproject, const int _quality ) {
+			float3 wsNormalFake = float3(0,1,0);
+			float3 wsLightDirFake = float3(0,0,1);
+			return SampleSpotShadowMap( _shadowMapInfo, _wsPosition, wsNormalFake, wsLightDirFake, _Unproject, _quality );
+		}
+
+		float SampleDirectionalShadowMap( float4 _shadowTexCoord, int _sliceIndex, const int _quality ) {
+			float3 slice1TexCoord = _shadowTexCoord.xyz;
+			float shadow;
+			
+			switch( _quality ) {
+				case HIGH_QUALITY: {
+					#if $shadowFilteringQuality == 0
+						shadow = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0 );
+					#elif $shadowFilteringQuality == 1
+						float4	smp;	 //combining four 2x2 HW PCF to have kind of gaussian
+						smp.x = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  1, 0 ) );
+						smp.y = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2( -1, 0 ) );
+						smp.z = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0, 1 ) );
+						smp.w = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0,-1 ) );
+						shadow = 0.25 * (smp.x+smp.y+smp.z+smp.w);
+					#else
+						float4	smp0, smp1;
+						float	smpCenter; //combining nine 2x2 HW PCF to have kind of gaussian
+						smp0.x		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2( -1, -1 ) );
+						smp0.y		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0, -1 ) );
+						smp0.z		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  1, -1 ) );
+						smp0.w		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2( -1,  0 ) );
+						smpCenter	= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0 );
+						smp1.x		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  1,  0 ) );
+						smp1.y		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2( -1,  1 ) );
+						smp1.z		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0,  1 ) );
+						smp1.w		= $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  1,  1 ) );
+
+						smp0 += smp1;
+						smpCenter += smp0.x + smp0.y + smp0.z + smp0.w;
+
+						shadow = (1.0/9.0) * smpCenter;
+					#endif			
+					break;
+				}
+
+				case AVERAGE_QUALITY: {
+					#if QUALITY <= 0
+						shadow = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0 );
+					#else
+						float4	smp;	 //combining four 2x2 HW PCF to have kind of gaussian
+						smp.x = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  1, 0 ) );
+						smp.y = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2( -1, 0 ) );
+						smp.z = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0, 1 ) );
+						smp.w = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0, int2(  0,-1 ) );
+						shadow = 0.25 * (smp.x+smp.y+smp.z+smp.w);
+					#endif
+					break;
+				}
+
+				case LOW_QUALITY: {
+					shadow = $(lightDepthCompareMap).SampleLevel( $bilinearClamp, float3( slice1TexCoord.xy, _sliceIndex ), 0.0 );
+					break;
+				}
+
+				default:
+					shadow = 0.0;
+					break;
+			}
+			
+			return shadow;
+		}
+
+		float3	ComputeParallelShadow( const float3 _wsPosition, const float3 _wsNormal, out float4x4 _worldToShadowMat, out float4x4 _shadowToWorldMat, out uint _sliceIdxOut, const int _quality ) {
+			float4	wsPos = float4( _wsPosition, 1 );
+			float3	parallelShadow = float3( 1.0, 1e8, 0.0 );
+			#if $parallelLightHasShadow
+				// select slice
+				float	viewZ = -dot( wsPos, $viewMatrix[2] );
+				float4	slicesFar = $parallelLightSliceFars; 
+				float4	slicesMask = step( slicesFar, viewZ );
+				uint	sliceIndex = uint( slicesMask.x + slicesMask.y + slicesMask.z + slicesMask.w );
+				_worldToShadowMat = $shadowProjections[sliceIndex];
+
+				#if SHADOW_INVERSE_TRANSFORM_REQUIRED
+					_shadowToWorldMat = $shadowInvProjections[sliceIndex];
+				#else
+					_shadowToWorldMat = _worldToShadowMat; //just to avoid the compiler from complaining about unitialized output variable
+				#endif
+
+				float4	sliceSelector = float4( 1.0, slicesMask.xyz ) - slicesMask;	// (1, Mask >> 1) - Mask  (e.g. slice 2 => mask = (1100) => selector = (1110) - (1100) = (0010) => correctly selects 3rd vector element except for slice == 4)
+				float2	ZnearFar = float2( dot( $parallelLightSliceNears_LightSpace, sliceSelector ), dot( $parallelLightSliceFars_LightSpace, sliceSelector ) );
+
+				float4	shadowCoords = ComputeShadowOffset( $shadowProjections[sliceIndex], _wsPosition, _wsNormal, $(atm/sky/SunDirection), true /*isDirectional*/ );	 //todo optimize: we may use only 2 or 3 rows of the matrices if changing here the 'majorness' and revert the mul (we could for directional as the projection is orthogonal => invert = transpose, but probably not for spot/omnis)							
+				float	casterZproj = SampleDirectionalShadowMap( shadowCoords, sliceIndex, _quality );
+
+				parallelShadow = float3( step( shadowCoords.z, casterZproj ), ShadowUnprojectLinear( casterZproj, ZnearFar ), ShadowUnprojectLinear( shadowCoords.z, ZnearFar ) );
+
+				//parallelShadow.x = saturate( parallelShadow.x + sliceClamper );
+				
+				// attenuation at the end (hardcoded parms for now)
+				const float attenuationRange = 5.0;
+				float	attenuation = 1.0 - saturate( ($parallelLightSliceFars.w - viewZ) / attenuationRange );
+						attenuation *= attenuation * attenuation;
+
+				parallelShadow.x = saturate( attenuation + parallelShadow.x );
+				
+				_sliceIdxOut = sliceIndex;
+			#endif
+
+			// Account for cloud shadowing
+			#if SHADOW_USE_TAPS != 1 && !$(translucency/enable)
+				parallelShadow.x *= GetFastCloudShadowing( _wsPosition );
+			#endif
+
+			// Account for Earth shadowing
+//			parallelShadow.x *= ComputeEarthShadowing( _AltitudeKm, $(atm/sky/SunDirection).z );
+
+			return parallelShadow;
+		}
+
+		#endif // #ifndef SHADOW_INCLUDED
+	}
+}

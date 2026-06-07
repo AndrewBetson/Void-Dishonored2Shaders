@@ -1,0 +1,631 @@
+{
+	newstyle
+	hlsl_prefix {
+	//=============================================================================
+	// HELPERS
+	//=============================================================================
+	#include <helper>
+
+	#ifndef HELPER_DOF
+	#define HELPER_DOF
+
+	#define E_LINEAR 	(0) //round diaphragm (average size)
+	#define E_POISSON	(1) //round diaphragm (with Poisson sampling - not good bokeh)
+	#define E_DISK		(2) //round diaphragm (with disk sampling)
+	#define E_DOT		(3) //round diaphragm (small size)
+	#define E_HEXAGON	(4) //hexagon diaphragm (heavy gpu - for cinematic only)
+	#define E_CIRCLE	(5) //catadioptric lens (average size)
+
+	static const float dofMaskThreshold = 0.05; //this value is captain-age driven
+	static const float dofMaxRadius = 6.0;
+	static const float dofRefractionOffsets = 10.0;
+
+	#if $(PostFX/DOF/FILTER) == E_LINEAR
+		#define NB_SAMPLES 21
+			static const float2 Kernel[NB_SAMPLES] =
+			{
+				float2(-1,-2),	float2(-2,-1),	float2(-1,-1),
+				float2(-2, 0),	float2(-1, 0),	float2(-2, 1),
+				float2(-1, 1),	float2(-1, 2),	float2( 1, 1),
+				float2( 2, 1),	float2( 1, 2),	float2( 1,-2),
+				float2( 1,-1),	float2( 2,-1),	float2( 1, 0),
+				float2( 2, 0),	float2( 0,-1),	float2( 0,-2),
+				float2( 0, 2),	float2( 0, 1),	float2( 0, 0)
+			};
+	#elif $(PostFX/DOF/FILTER) == E_POISSON
+		#define NB_SAMPLES 20
+			static const float2 Kernel[NB_SAMPLES] =
+			{
+				float2(0.5897178, -0.4512787),	float2(0.8114389, 0.1385584),
+				float2(-0.06968249, -0.3807211),float2(0.1155433, 0.03833198),
+				float2(0.009805628, -0.7976339),float2(0.6442168, 0.5465492),
+				float2(-0.4345386, 0.1035281),	float2(0.2085701, 0.4618743),
+				float2(0.5174306, -0.0755545),	float2(-0.4449292, 0.7810358),
+				float2(-0.4699421, -0.5469458),	float2(-0.8985307, 0.2393024),
+				float2(-0.9226851, -0.1752382),	float2(0.3115233, 0.9126123),
+				float2(-0.201965, 0.5075257),	float2(0.5305942, -0.8415312),
+				float2(0.9077175, -0.215271),	float2(-0.8396321, -0.518961),
+				float2(-0.03861452, 0.8250327),	float2(-0.6175019, 0.4526942)
+			};
+	#elif $(PostFX/DOF/FILTER) == E_DISK
+		#define NB_SAMPLES 21
+	#elif $(PostFX/DOF/FILTER) == E_DOT
+		#define NB_SAMPLES 8
+			static const float2 Kernel[NB_SAMPLES] =
+			{
+				float2( 0.000,  0.000),			float2( 0.527, -0.085),
+				float2(-0.040,  0.536),			float2(-0.670, -0.179),
+				float2(-0.419, -0.616),			float2( 0.440, -0.639),
+				float2(-0.757,  0.349),			float2( 0.574,  0.685)
+			};
+	#elif $(PostFX/DOF/FILTER) == E_HEXAGON
+		#define NB_SAMPLES 60
+			static const float2 Kernel[NB_SAMPLES] =
+			{
+				float2(  0.2165,  0.1250 ),	float2(  0.0000,  0.2500 ),
+				float2( -0.2165,  0.1250 ),	float2( -0.2165, -0.1250 ),
+				float2( -0.0000, -0.2500 ),	float2(  0.2165, -0.1250 ),
+				float2(  0.4330,  0.2500 ),	float2(  0.0000,  0.5000 ),
+				float2( -0.4330,  0.2500 ),	float2( -0.4330, -0.2500 ),
+				float2( -0.0000, -0.5000 ),	float2(  0.4330, -0.2500 ),
+				float2(  0.6495,  0.3750 ),	float2(  0.0000,  0.7500 ),
+				float2( -0.6495,  0.3750 ),	float2( -0.6495, -0.3750 ),
+				float2( -0.0000, -0.7500 ),	float2(  0.6495, -0.3750 ),
+				float2(  0.8660,  0.5000 ),	float2(  0.0000,  1.0000 ),
+				float2( -0.8660,  0.5000 ),	float2( -0.8660, -0.5000 ),
+				float2( -0.0000, -1.0000 ),	float2(  0.8660, -0.5000 ),
+				float2(  0.2163,  0.3754 ),	float2( -0.2170,  0.3750 ),
+				float2( -0.4333, -0.0004 ),	float2( -0.2163, -0.3754 ),
+				float2(  0.2170, -0.3750 ),	float2(  0.4333,  0.0004 ),
+				float2(  0.4328,  0.5004 ),	float2( -0.2170,  0.6250 ),
+				float2( -0.6498,  0.1246 ),	float2( -0.4328, -0.5004 ),
+				float2(  0.2170, -0.6250 ),	float2(  0.6498, -0.1246 ),
+				float2(  0.6493,  0.6254 ),	float2( -0.2170,  0.8750 ),
+				float2( -0.8663,  0.2496 ),	float2( -0.6493, -0.6254 ),
+				float2(  0.2170, -0.8750 ),	float2(  0.8663, -0.2496 ),
+				float2(  0.2160,  0.6259 ),	float2( -0.4340,  0.5000 ),
+				float2( -0.6500, -0.1259 ),	float2( -0.2160, -0.6259 ),
+				float2(  0.4340, -0.5000 ),	float2(  0.6500,  0.1259 ),
+				float2(  0.4325,  0.7509 ),	float2( -0.4340,  0.7500 ),
+				float2( -0.8665, -0.0009 ),	float2( -0.4325, -0.7509 ),
+				float2(  0.4340, -0.7500 ),	float2(  0.8665,  0.0009 ),
+				float2(  0.2158,  0.8763 ),	float2( -0.6510,  0.6250 ),
+				float2( -0.8668, -0.2513 ),	float2( -0.2158, -0.8763 ),
+				float2(  0.6510, -0.6250 ),	float2(  0.8668,  0.2513 )
+			};
+	#elif $(PostFX/DOF/FILTER) == E_CIRCLE
+		#define NB_SAMPLES 16
+	#else
+		#define NB_SAMPLES 1
+	#endif
+
+		/* Hyper-focal Distance  (in millimeters)
+		 *
+		 * H = (L x L) / (f x d)
+		 *
+		 *  H 	= 	Hyper-focal Distance (in millimeters)
+		 *  L 	= 	Lens focal length (i.e. 24mm, 28mm, 35mm, 45mm)
+		 *  f 	= 	Lens aperture f-stop
+		 *  d 	= 	diameter of circle of confusion (in millimeters)
+		 *
+		 */
+		float HyperfocalDistance(float L, float f, float d)
+		{
+			return (L * L) / (f * d);
+		}
+
+		/* NEAR FOCUS LIMIT  (in millimeters)
+		 *
+		 * NF = (H x D) / (H + (D - L))
+		 *
+		 *  NF 	= 	Near Focus Limit (in millimeters)
+		 *  H 	= 	Hyper-focal Distance (in millimeters, from above equation)
+		 *  D 	= 	Distance at which the lens is focused
+		 *  L 	= 	lens focal length (i.e. 24mm, 28mm, 35mm, 45)
+		 */
+		float NearFocusLimit(float H, float D, float L)
+		{
+			return (H * D) / (H + (D - L));
+		}
+
+		/* FAR FOCUS LIMIT  (in millimeters)
+		 *
+		 * FF = (H x D) / (H - (D - L))
+		 *
+		 *  FF 	= 	Far Focus Limit (in millimeters)
+		 *  H 	= 	Hyper-focal Distance (in millimeters, from above equation)
+		 *  D 	= 	Distance at which the lens is focused
+		 *  L 	= 	lens focal length (i.e. 24mm, 28mm, 35mm, 45)
+		 */
+		float FarFocusLimit(float H, float D, float L)
+		{
+			return (H * D) / (H - (D - L));
+		}
+
+		/* BOKEH SIZE  (in millimeters)
+		 *
+		 * x = | (o*f)/(o-f) - (p*f)/(p-f) | * (p-f) / (p*F)
+		 *
+		 * x = Diameter of blur (Coc)
+		 * o = Object distance (in millimeters)
+		 * p = Focal distance (in millimeters)
+		 * f = Focal length (in millimeters)
+		 * F = Lens aperture f-stop
+		 */
+		float bokehSize(float o, float p, float f, float F)
+		{
+			return abs((o*f)/(o-f) - (p*f)/(p-f)) * (p-f) / (p*F);
+		}
+
+		/* Circle of confusion diameter
+		 *
+		 * DCoc = | D*f*(fd-z)/fd*(z-f) |
+		 *
+		 * D  = lens diameter
+		 * f  = focal length
+		 * fd = focal distance
+		 * z  = depth of the point
+		 */
+		float DCoc(float D, float f, float fd, float z)
+		{
+			return abs( D*f*(fd-z) / fd*(z-f) );
+		}
+
+		float2 cubicLensDistortion( float2 coords, float2 center, float k = -0.15, float kcube = 0.3)
+		{
+			// r2 = image_aspect*image_aspect*u*u + v*v
+			// f = 1 + r2*(k + kcube*sqrt(r2))
+			// u' = f*u
+			// v' = f*v
+			//
+			// k =  lens distortion coefficient
+			// kcube = cubic distortion value
+
+			float r2 = (coords.x-center.x) * (coords.x-center.x) + (coords.y-center.y) * (coords.y-center.y);
+			float f = 0;
+
+			//only compute the cubic distortion if necessary
+			if( kcube == 0.0)
+			{
+				f = 1 + r2 * k;
+			}
+			else
+			{
+				f = 1 + r2 * (k + kcube * sqrt(r2));
+			};
+
+			// get the right pixel for the current position
+			float x = f*(coords.x-0.5)+0.5;
+			float y = f*(coords.y-0.5)+0.5;
+
+			return float2(x,y);
+		}
+
+		float vignette( float2 coords, float2 center, float4 vignParams)
+		{
+			const float vignout  = vignParams.x; //vignetting outer border
+			const float vignin   = vignParams.y; //vignetting inner border
+			const float vignfade = vignParams.z; //f-stops till vignette fades
+			const float fstop    = vignParams.w;
+
+			float dist = distance(coords, center);
+			dist = LinearStep(vignout+(fstop/vignfade), vignin+(fstop/vignfade), dist);
+			return dist;
+		}
+
+		float3 fringing(Texture2D colorMap, float2 coords, float2 texel, float blur, float3 fringParams)
+		{
+			const float fringe    = fringParams.x; //bokeh chromatic aberration/fringing
+			const float hightlight_threshold = fringParams.y; //highlight threshold
+			const float gain      = fringParams.z; //highlight gain
+
+			float red   = colorMap.SampleLevel( $bilinearMirror, coords + float2(0.0,1.0)    *texel*fringe*blur, 0.0).r;
+			float green = colorMap.SampleLevel( $bilinearMirror, coords + float2(-0.866,-0.5)*texel*fringe*blur, 0.0).g;
+			float blue  = colorMap.SampleLevel( $bilinearMirror, coords + float2(0.866,-0.5) *texel*fringe*blur, 0.0).b;
+
+			float3 col = float3(red, green, blue);
+			return col;
+
+			// const float EPSILON = 0.000001;
+			// float3 col = float3(red, green, blue) + EPSILON.xxx; //add epsilon to avoid Nan after normalize
+			// const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);
+			// float lum = dot(normalize(col.rgb), RGB_TO_GREYSCALE);
+			// float thresh = saturate((lum-hightlight_threshold)*gain*blur);
+			// return lerp(col,(col*thresh),thresh);
+		}
+		
+		float3 fringingPurple(Texture2D colorMap, float3 centerColor, float2 coords, float2 texel, float blur, float3 fringParams)
+		{
+			const float fringe    = fringParams.x; //bokeh chromatic aberration/fringing
+			const float hightlight_threshold = fringParams.y; //highlight threshold
+			const float gain      = fringParams.z; //highlight gain
+
+			float2 rg = colorMap.SampleLevel( $bilinearMirror, coords + float2(-0.866,-0.5) *texel*fringe*blur, 0.0).rg;
+			float2 gb = colorMap.SampleLevel( $bilinearMirror, coords + float2(0.866,-0.5) *texel*fringe*blur, 0.0).gb;
+
+			float red = rg.x;
+			float blue = gb.y;
+			float green = min(rg.y, gb.x);
+			float3 col = float3(red, green, blue);
+			return col;
+		}
+
+		float3 noise_lum(float3 texColor, float2 texCoords, float4 noiseParams, float dofMask)
+		{
+			const float luminanceAmount = noiseParams.x;
+			const float grainAmount = noiseParams.y;
+			const float curve = noiseParams.z;
+			const float speed = noiseParams.w;
+
+			float2 cnoi = lerp( rand(texCoords), rand(texCoords * $time.x), speed);
+			float3 noise1, noise2;
+			//noisiness response curve based on scene luminance
+			{
+				const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance
+				float luminance = lerp(0.0,dot(texColor, RGB_TO_GREYSCALE),luminanceAmount);
+				float lum = smoothstep(0.2,0.0,luminance);
+				noise1 = lerp( float3(cnoi.xyx * 0.125) ,float3(0,0,0),pow(lum*dofMask,4.0)) * luminance;
+				noise1 = texColor + noise1*texColor*(grainAmount*0.5);
+			}
+
+			//noisiness based on scene gray
+			{
+				float origgray=dot(texColor, 0.3333);
+				origgray/=origgray + 1.0;
+				float focusAmount = pow(dofMask, luminanceAmount /*curve*/);// curve: lower the value, the noise grain will increase faster when out of foucs.
+				float noiseAmount= grainAmount * focusAmount;
+				noise2=lerp(texColor, (cnoi.xxx)*texColor, noiseAmount*saturate(1.0-origgray*1.8));
+			}
+
+			return lerp(noise1,noise2,curve);
+		}
+
+		float2 rot2d( float2 p, float angle )
+		{
+			float sinAngle, cosAngle;
+			sincos(angle,sinAngle,cosAngle);
+			float2x2 rotMat = { cosAngle, -sinAngle, sinAngle, cosAngle };
+			return mul(rotMat, p);
+		}
+
+		float2 GetOffsets(int idx, float radius, float nbSteps)
+		{
+			const float anglestep = TWOPI / nbSteps;
+			const float angle = (idx * anglestep);
+			float2 offsets = rot2d( float2(radius,0.0), angle );
+			return -offsets;
+		}
+
+		float2 GetOffsets(int idx)
+		{
+			#if $(PostFX/DOF/FILTER)   == E_LINEAR
+				return Kernel[idx];
+			#elif $(PostFX/DOF/FILTER) == E_POISSON
+				return Kernel[idx];
+			#elif $(PostFX/DOF/FILTER) == E_DISK
+				if(idx >= 12)
+					return GetOffsets(idx-12, 3.0, 9);
+				else if(idx >= 5)
+					return GetOffsets(idx-5, 2.0, 7);
+				else if(idx >= 1)
+					return GetOffsets(idx-1, 1.0, 4);
+				else
+					return float2(0.0,0.0);
+			#elif $(PostFX/DOF/FILTER) == E_DOT
+				return Kernel[idx];
+			#elif $(PostFX/DOF/FILTER) == E_HEXAGON
+				return Kernel[idx];
+			#elif $(PostFX/DOF/FILTER) == E_CIRCLE
+				return GetOffsets(idx, 3.0, NB_SAMPLES);
+			#else
+				return float2(0.0,0.0);
+			#endif
+		}
+
+		float2 GetCOCRadius(float depth, float scale)
+		{
+			#if $(PostFX/DOF/FILTER) == E_LINEAR
+			{
+				//x = circle of confusion (default value = 0.025mm)
+				//y = focal distance (in millimeters)
+				//z = focal length (default value = 35mm)
+				//w = aperture f-Stop (default value = f/4)
+				//const float coc         = aLensParams.x;
+				//const float focalDist   = aLensParams.y;
+				//const float focalLength = aLensParams.z;
+				//const float fStop       = aLensParams.w;
+				//float size = bokehSize( depth * 1000, focalDist, focalLength, fStop);
+				//return min(size * (1080/35),1.0);
+				return depth.xx * scale.xx;
+			}
+			#elif $(PostFX/DOF/FILTER) == E_POISSON
+			{
+				return depth.xx * scale.xx * 2.25;
+			}
+			#elif $(PostFX/DOF/FILTER) == E_DISK
+			{
+				return depth.xx * scale.xx * 0.7;
+			}
+			#elif $(PostFX/DOF/FILTER) == E_DOT
+			{
+				return depth.xx * scale.xx * 2.5;
+			}
+			#elif $(PostFX/DOF/FILTER) == E_HEXAGON
+			{
+				return depth.xx * scale.xx * 2.3;
+			}
+			#elif $(PostFX/DOF/FILTER) == E_CIRCLE
+			{
+				return depth.xx * scale.xx * 0.7;
+			}
+			#else
+			{
+				return float2(0.0,0.0);
+			}
+			#endif
+		}
+
+		float2 GetCOCRadius(float depth)
+		{
+			float scale = $(PostFX/DOF/bokehSize);
+			return GetCOCRadius( depth, scale );
+		}
+
+		float2 GetCOCRefraction( float bias )
+		{
+			float scale = bias * dofMaxRadius * 0.5;
+			return GetCOCRadius( 1.0, scale );
+		}
+
+		float GetRefractionOffset( )
+		{
+			return dofRefractionOffsets;
+		}
+
+		//=============================================================================
+		float4 Dof_Alpha ( float2 texcoord, float2 pixelSize, float3 centerColor, float2 centerDepth, float useBias, float bias)
+		{
+			// Start with center samples
+			float3 output;
+			float3 accumulator = 0.0;
+			float fuzzAccumulator = 0.0;
+			const float centerFuz = centerDepth.r;
+			const float centerSharp = max( centerDepth.g , useBias );
+			const float2 cocRadius = ( GetCOCRadius(centerDepth.r) + GetCOCRefraction(bias) );
+			float alpha = 0.0;
+			float fuzzMask = 0.0;
+
+			// Sample points
+			for ( int i = 0; i < NB_SAMPLES; ++i )
+			{
+				float2 coords = texcoord + pixelSize * GetOffsets(i) * cocRadius;
+				float2 samples = $(PostFX/DOF/dofBlurMap).SampleLevel( $bilinearMirror, coords, 0.0 ).rg;
+				samples = max( samples, useBias );
+
+				float3 color;
+				#if ($(PostFX/DOF/USE_FRINGING))
+				{
+					//color = fringing($(PostFX/DOF/blurredMap), coords, pixelSize, centerFuz, $(PostFX/DOF/fringParams));
+					color = fringingPurple($(PostFX/DOF/blurredMap), centerColor, coords, pixelSize, centerFuz, $(PostFX/DOF/fringParams));
+				}
+				#else
+				{
+					color = $(PostFX/DOF/blurredMap).SampleLevel( $bilinearMirror, coords, 0.0 ).rgb;
+				}
+				#endif
+
+				accumulator += color * samples.r;
+				fuzzAccumulator += samples.r;
+				fuzzMask += samples.g;
+			}
+
+			// normalize kernel result
+			alpha = saturate( centerSharp * max( (fuzzAccumulator/NB_SAMPLES) , (fuzzMask/NB_SAMPLES) ) );
+			//alpha = saturate( (centerDepth.g) * (fuzzAccumulator/NB_SAMPLES) );
+			return (fuzzAccumulator > 0.0) ? float4(accumulator/fuzzAccumulator,alpha) : float(0.0).xxxx;
+		}
+
+		float4 Dof_Near ( float2 texcoord, float2 pixelSize, float3 centerColor, float centerDepth)
+		{
+			// Start with center sample
+			float3 accumulator = 0.0;
+			float fuzzAccumulator = 0.0;
+			const float2 cocRadius = GetCOCRadius(centerDepth);
+
+			// Sample points
+			for ( int i = 0; i < NB_SAMPLES; ++i )
+			{
+				float2 coords = texcoord + pixelSize * GetOffsets(i) * cocRadius;
+
+				float3 color;
+				#if($(PostFX/DOF/USE_FRINGING))
+				{
+					color = fringing($(PostFX/DOF/diffuseMap), coords, pixelSize, centerDepth, $(PostFX/DOF/fringParams));
+				}
+				#else
+				{
+					color = $(PostFX/DOF/diffuseMap).SampleLevel( $bilinearClamp, coords, 0.0).rgb;
+				}
+				#endif
+
+
+				accumulator += color * centerDepth;
+				fuzzAccumulator += centerDepth;
+			}
+
+			// normalize kernel result
+			float3 color = (accumulator/fuzzAccumulator);
+			float alpha = (fuzzAccumulator/NB_SAMPLES);
+			return (fuzzAccumulator > 0.0) ? float4(color, alpha) : float(0.0).xxxx;
+		}
+
+		float4 Dof_Far(	float2 coords_high, float2 coords_low, float4 fTargetSize, float3 centerColor, float centerDepth )
+		{
+			const float2 pixelSizeHigh = fTargetSize.xy;
+			const float2 pixelSizeLow  = fTargetSize.zw;
+			const float2 cocRadius     = GetCOCRadius(centerDepth);
+			const float discRadiusHigh = cocRadius.x;
+			const float discRadiusLow  = cocRadius.y;
+
+			float3 output;
+
+			// Start with center sample
+			float3 accumulator =  0.0;
+			float totalContribution = 0.0;
+
+			//Precomputed Offsets
+			float4 coordHighLow[NB_SAMPLES];
+
+			#if($(PostFX/DOF/USE_CATEYE))
+			{
+				float cateye = vignette(coords_high, $(PostFX/DOF/center).xy, $(PostFX/DOF/vignParams));
+
+				float2 uv = coords_high * 2.0 - 1.0;
+				float angle = atan2(uv.y, uv.x);
+				float cosAngle;
+				float sinAngle;
+				sincos(angle,sinAngle,cosAngle);
+				float2x2 rotMat = { cosAngle, -sinAngle, sinAngle, cosAngle };
+
+				for ( int i = 0; i < NB_SAMPLES; ++i )
+				{
+					float catEyeRadius = (i < 8) ? cateye : 1.0;
+					float2x2 scaleMat = { catEyeRadius, 0.0, 0.0, 1.0 };
+					float2x2 scaleRotMat = mul( rotMat, scaleMat );
+					coordHighLow[i].xy = coords_high + pixelSizeHigh * discRadiusHigh * GetOffsets(i);
+					coordHighLow[i].zw  = coords_low + pixelSizeLow  * discRadiusLow  * mul( scaleRotMat, GetOffsets(i) ) ;
+				}
+			}
+			#else
+			{
+				for ( int i = 0; i < NB_SAMPLES; ++i )
+				{
+					coordHighLow[i].xy = coords_high + pixelSizeHigh * GetOffsets(i) * discRadiusHigh;
+					coordHighLow[i].zw  = coords_low + pixelSizeLow  * GetOffsets(i) * discRadiusLow;
+				}
+			}
+			#endif
+
+			//Sample points
+			for ( int i = 0; i < NB_SAMPLES; ++i )
+			{
+				//Fetch blurriness
+				float blurLow  = $(PostFX/DOF/dofBlurMap).SampleLevel( $bilinearClamp, coordHighLow[i].zw, 0.0).g;
+				float blurHigh = $(PostFX/DOF/dofDataMap).SampleLevel( $bilinearClamp, coordHighLow[i].xy, 0.0).g;
+
+				//Fetch color
+				float3 tapHigh;
+				float3 tapLow;
+
+				#if($(PostFX/DOF/USE_FRINGING))
+				{
+					tapHigh = $(PostFX/DOF/diffuseMap).SampleLevel( $bilinearClamp, coordHighLow[i].xy, 0.0).rgb;
+					tapLow  = fringing($(PostFX/DOF/blurredMap), coordHighLow[i].zw, pixelSizeLow, centerDepth, $(PostFX/DOF/fringParams));
+					//tapLow  = fringing($(PostFX/DOF/blurredMap), coordHighLow[i].zw, pixelSizeLow, blurLow, $(PostFX/DOF/fringParams));
+				}
+				#else
+				{
+					tapHigh = $(PostFX/DOF/diffuseMap).SampleLevel( $bilinearClamp, coordHighLow[i].xy, 0.0).rgb;
+					tapLow  = $(PostFX/DOF/blurredMap).SampleLevel( $bilinearClamp, coordHighLow[i].zw, 0.0).rgb;
+					//tapLow  = $(PostFX/DOF/blurredMap).SampleLevel( $bilinearClamp, coordHighLow[i].zw, 0.0).rgb;
+				}
+				#endif
+
+				tapLow.xyz = tapLow.xyz;
+				tapHigh.xyz = tapHigh.xyz;
+
+				//Compute blur coef and leaking
+				bool tapBlur = (blurLow >= centerDepth);
+				float blur = blurLow;
+				//float leak = pow(saturate(blurLow * blurHigh), 8.0/centerDepth );	//average anti-leaking, too fast blur
+				//float leak = blurLow * saturate(blurHigh-centerDepth);			//strong anti-leaking, bad artifact on far fuzziness
+				//float leak = centerDepth;											//no anti-leaking
+				float leak = lerp(blurHigh,blurLow,centerDepth);
+
+				//Get Coef and Color
+				float coef = tapBlur ? 1.0 : leak;
+
+				#if($(PostFX/DOF/USE_CATEYE))
+				{
+					//weight is not homogeneous for cat-eyes
+					coef *= (i < 8) ? 1.0/8.0 : 1.0;
+				}
+				#endif
+
+				blur = lerp(blurHigh,leak,blurHigh);
+				float3 tap = lerp(tapHigh, tapLow, blur);
+
+				//Accumulate
+				accumulator += tap * coef;
+				totalContribution += coef;
+			}//for(NB_SAMPLES)
+
+			float alpha = saturate((totalContribution)/NB_SAMPLES);
+			return (totalContribution > 0) ? float4(accumulator / totalContribution, 1.0) : float4(centerColor,0.0);
+		}
+
+		float ComputeFuzziness(float depth, const float4 aDofRangeFar)
+		{
+			float farFuzzy = aDofRangeFar.x;
+			float farSharp = aDofRangeFar.y;
+			const float fuzzinessBias = aDofRangeFar.z;
+			float fDofFar = aDofRangeFar.w;
+
+			#if $(PostFX/DOF/AUTOFOCUS)
+				float focusDist = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, float2(0.5,0.5), 0.0 ).x;
+				fDofFar += focusDist;
+				farSharp = (farSharp + focusDist) / fDofFar;
+				farFuzzy = (farFuzzy + focusDist) / fDofFar;
+			#endif
+
+			float linearDepth    = ComputeLinearZ( depth );
+			linearDepth = LinearStep(0, fDofFar, linearDepth);
+
+			// compute fuzziness Far - range [-1,1]
+			float k1 = ( linearDepth - farSharp ) / (farFuzzy - farSharp);
+			float fuzzinessFar = (linearDepth > farSharp) * k1;
+
+			float fuzziness = saturate( fuzzinessFar + fuzzinessBias );
+			return fuzziness;
+		}
+
+		float ComputeMotion(float2 motion, const float3 aDofRangeNear)
+		{
+			const float motionStrength = aDofRangeNear.z;
+			float motionAmount = saturate( dot(motion,motion) * motionStrength );
+			return motionAmount;
+		}
+
+		float2 ComputeDofMask(Texture2D dofMaskMap, float2 texCoord, float2 invTexSize, float2 weight )
+		{
+			float2 dofMask, dofMask00, dofMask10, dofMask01, dofMask11;
+			dofMask00 = dofMaskMap.SampleLevel( $bilinearClamp, texCoord+invTexSize*float2(-0.5,-0.5), 0.0).rg;
+			dofMask10 = dofMaskMap.SampleLevel( $bilinearClamp, texCoord+invTexSize*float2(+0.5,-0.5), 0.0).rg;
+			dofMask01 = dofMaskMap.SampleLevel( $bilinearClamp, texCoord+invTexSize*float2(-0.5,+0.5), 0.0).rg;
+			dofMask11 = dofMaskMap.SampleLevel( $bilinearClamp, texCoord+invTexSize*float2(+0.5,+0.5), 0.0).rg;
+			dofMask00 = lerp(dofMask00,dofMask10, weight.x);
+			dofMask01 = lerp(dofMask01,dofMask11, weight.x);
+			dofMask = lerp(dofMask00, dofMask01,  weight.y);
+			dofMask = saturate(dofMask);
+			return dofMask;
+		}
+
+		float3 ComputeDofColor(Texture2D dofColorMap, float2 texCoord, float2 invTexSize, float2 weight )
+		{
+			float3 sample00, sample10, sample01, sample11;
+			sample00 = dofColorMap.SampleLevel( $bilinearBorderClamp, texCoord+invTexSize*float2(-0.5,-0.5), 0.0).rgb;
+			sample10 = dofColorMap.SampleLevel( $bilinearBorderClamp, texCoord+invTexSize*float2(+0.5,-0.5), 0.0).rgb;
+			sample01 = dofColorMap.SampleLevel( $bilinearBorderClamp, texCoord+invTexSize*float2(-0.5,+0.5), 0.0).rgb;
+			sample11 = dofColorMap.SampleLevel( $bilinearBorderClamp, texCoord+invTexSize*float2(+0.5,+0.5), 0.0).rgb;
+			sample00 = lerp(sample00,sample10, weight.x);
+			sample01 = lerp(sample01,sample11, weight.x);
+			float3 dofColor = lerp(sample00, sample01,  weight.y);
+
+			//float3 dofColor = dofColorMap.Sample( $bilinearBorderClamp, texCoord.xy).rgb;
+			return dofColor;
+		}
+
+	#endif	//HELPER_DOF
+	//=============================================================================
+	}//hlsl_prefix
+}

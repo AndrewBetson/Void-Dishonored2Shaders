@@ -1,0 +1,53 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthwrite	1
+		cull		none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+
+		// Build local space for the quad
+		// Each instance will represent a face of the box we're drawing
+		uint	faceIndex = $sv_instanceid >> 1;				// in [0,3[
+		float	instSign = ($sv_instanceid & 1) != 0 ? 1.0 : -1.0;	// +1 or -1
+		float3	lsNormal, lsTangent, lsBiTangent;
+		switch ( faceIndex ) {
+			case 0: lsNormal = float3( 1, 0, 0 ); lsTangent = float3( 0, 1, 0 ); lsBiTangent = float3( 0, 0, 1 ); break;	// X axis
+			case 1: lsNormal = float3( 0, 1, 0 ); lsTangent = float3( 0, 0, 1 ); lsBiTangent = float3( 1, 0, 0 ); break;	// Y axis
+			case 2: lsNormal = float3( 0, 0, 1 ); lsTangent = float3( 1, 0, 0 ); lsBiTangent = float3( 0, 1, 0 ); break;	// Z axis
+			default: lsNormal = 0.0, lsTangent = 0.0, lsBiTangent = 0.0; break;
+		}
+
+		lsNormal *= instSign;
+		lsTangent *= instSign;
+		lsBiTangent *= instSign;
+
+		// Build world space transform
+		float3	wsNormal = lsNormal.x * $(indirectLighting/precompute/occluderAxisX) + lsNormal.y * $(indirectLighting/precompute/occluderAxisY) + lsNormal.z * $(indirectLighting/precompute/occluderAxisZ);
+		float3	wsTangent = lsTangent.x * $(indirectLighting/precompute/occluderAxisX) + lsTangent.y * $(indirectLighting/precompute/occluderAxisY) + lsTangent.z * $(indirectLighting/precompute/occluderAxisZ);
+		float3	wsBiTangent = lsBiTangent.x * $(indirectLighting/precompute/occluderAxisX) + lsBiTangent.y * $(indirectLighting/precompute/occluderAxisY) + lsBiTangent.z * $(indirectLighting/precompute/occluderAxisZ);
+
+		// Transform unit quad from [-1,+1] to an actual world space quad
+		float4	wsPosition = float4( $(indirectLighting/precompute/occluderPosition) + $vertex_position.x * wsTangent + $vertex_position.y * wsBiTangent + wsNormal, 1.0 );
+		float4	ProjPosition = mul( $viewProjectionMatrix, wsPosition );
+
+		@sv_position = ProjPosition;
+		@wsPosition = wsPosition.xyz;
+	}
+
+	hlsl_fp_main {
+		float	Distance2Plane = distance( $wsPosition.xyz, $(indirectLighting/precompute/currentProbePosition) );
+		@sv_target = float4( asfloat( $(indirectLighting/precompute/occluderID) ), Distance2Plane, 0, 0 );
+	}
+}

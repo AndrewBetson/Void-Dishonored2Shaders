@@ -1,0 +1,35 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 256
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <indirectLighting/common>
+	}
+
+	hlsl_cp_main {
+		uint	ProbeIndex = $sv_dispatchThreadID.x;
+		if ( ProbeIndex >= $(indirectLighting/update/parmsUint).x )
+			return;
+
+		#if defined(PC)
+			// PC VERSION
+// 			$(indirectLighting/SH3)	SHTarget = $(indirectLighting/update/bufferProbesSH_ImmediateTarget)[ProbeIndex];
+//			PackSH2RGBE( SHTarget, @(indirectLighting/bufferProbesSH_RGBE)[ProbeIndex] );
+ 			@(indirectLighting/bufferProbesSH_RGBE)[ProbeIndex] = $(indirectLighting/update/bufferProbesSH_ImmediateTarget)[ProbeIndex];
+		#else
+			// CONSOLE VERSION
+			$(indirectLighting/SH3)	SHTarget = $(indirectLighting/update/bufferProbesSH_ImmediateTarget)[ProbeIndex];
+
+			$(indirectLighting/SH3_Order2)	Result;
+			[unroll]
+			for ( uint i=0; i < 4; i++ ) {
+				Result.SH[i] = SHTarget.SH[i];
+			}
+
+			@(indirectLighting/bufferProbesSH_Order2)[ProbeIndex] = Result;
+		#endif
+	}
+}

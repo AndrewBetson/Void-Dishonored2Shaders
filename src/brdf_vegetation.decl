@@ -1,0 +1,301 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef BRDF_VEGETATION_INCLUDED
+		#define BRDF_VEGETATION_INCLUDED
+
+		#define BRDF_OK	1					// Every BRDF include file must define this so we can easily spot the shaders that forgot to include a BRDF model!
+		#define	BRDF_VEGETATION	1
+		#define	BRDF_SURFACE_INFO_OK 1		// We need additional info for the surface
+		#define TRANSLUCENCY_2SIDED 1
+
+		// Translucency needs both shadow transforms!
+		#if $(translucency_hq/enable)
+			#define	SHADOW_INVERSE_TRANSFORM_REQUIRED	1
+		#endif
+
+		//////////////////////////////////////////////////////////////
+		// Retrieves the values of the pre-integrated BRDF (cf. http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)
+		//	_VdotN, dot( View, Normal )
+		//	_SurfaceRoughness, the surface roughness in [0,1]
+		//
+		// Returns a scale (X) and bias (Y) value to use in the following manner:
+		//
+		//	float3	PreFilteredIrradiance = SampleIBL( Direction, Roughness );	// Or any other source of irradiance
+		//	float3	CorrectedPreFilteredIrradiance = PreFilteredIrradiance * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y);
+		//
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness ) {
+			return $texPreIntegratedBRDF_Ward.SampleLevel( $bilinearClamp, float2( _VdotN, _SurfaceRoughness ), 0.0 ).xy;
+		}		
+		
+		// ================================================================================================
+		// Vegetation additional surface info		
+		struct BRDFSurfaceInfo {
+
+			float3		transmittance;		// Transmitted reflectance, a modified version of the diffuse albedo with more vivid colors
+
+			#if $(vegetation/useTransmittanceMap)
+				float3	transmittanceHL2;	// RGB each encode transmittance along a HL2 basis vector. This should come from a map generated using the "GenerateTranslucencyMap" tool in base/tools
+				float3	wsHL2Basis_R;		// HL2 basis
+				float3	wsHL2Basis_G;
+				float3	wsHL2Basis_B;
+			#endif
+
+			void	Clear() {
+				transmittance = 0.0;
+				#if $(vegetation/useTransmittanceMap)
+					transmittanceHL2 = 0.0;
+					wsHL2Basis_R = wsHL2Basis_G = wsHL2Basis_B = 0.0;
+				#endif
+			}
+		};
+
+		#include <surfaceContext>	// Contains information about the surface
+		#include <lightContext>		// Contains information about the light
+		#include <areaLight>
+		#include <ward>				// Ward specular model
+		#include <fresnel>
+		#include <colorimetry>
+		#include <translucency>
+		#include <vegetation>
+		#include <orenNayar>
+		
+		// Any BRDF structure must provide the following methods so it's compatible with the IntergrateLighting() function found in lighting.mrpr:
+		//		void	Init( in SurfaceContext _surface );
+		//		void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light );
+		//		void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight );	// bmayaux (2015-07-30) Special for area lights
+		//		void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality );
+		//
+		struct BRDF {
+			WardContext			m_ward;				//	Contains all the information to compute the Ward specular model
+			float3				m_sheenColor;
+			
+			//////////////////////////////////////////////////////////////
+			// BRDF Initialization
+			void	Init( in SurfaceContext _Surface ) {
+				// Create the ward context for our BRDF
+				CreateWardContext( m_ward, _Surface.roughness );
+
+				// Compute sheen color
+				m_sheenColor = ComputeSheenColor( _Surface.diffuseAlbedo, _Surface.sheen );	// A sheen of -1 will show desaturated color, a sheen of +1 will show fully saturated color
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Diffuse Part
+			float ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+				return INVPI * ComputeOrenNayar( _Surface.wsNormal, _Light.m_wsToLight, _Surface.wsView, _Surface.roughness );
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Computes a fake translucency using a bent normal
+			//	_TranslucencyWeight, a "material translucency" weight value in [0,1] where black is no translucency and white is full translucency (usually painted in a texture alpha or in vertex colors)
+			//	_View, the view vector in world space
+			//	_Light, the light vector in world space
+			//	_Normal, the VERTEX normal of the surface (don't try using the normal mapped normal because it adds too many disturbing details for a not so great result)
+			//
+			float	ComputeTranslucencyNoRamp( float _TranslucencyWeight, float3 _Normal, float3 _Light, float3 _View ) {
+				float3	LightVec = _Light + $(translucency/distortion) * _Normal;
+				float	LdotV = exp2( saturate( -dot( _View, LightVec ) ) * $(translucency/power) - $(translucency/power) );	// Cheap/fast approx. from http://colinbarrebrisebois.com/2012/04/09/approximating-translucency-revisited-with-simplified-spherical-gaussian/
+
+				return $(translucency/intensity) * ($(translucency/min) + _TranslucencyWeight * LdotV);
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Main lighting, called for each light
+			void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light ) {
+				#if $(translucency/enable)
+					bool isTranslucent = true;
+				#else
+					bool isTranslucent = false;
+				#endif
+
+				if ( _Light.m_attenuation > 0.0 && (isTranslucent || _Light.m_shadow > 0.0) ) {
+					float3	View = _Surface.wsView;
+					float3	Light = _Light.m_wsToLight;
+					float3	Normal = _Surface.wsNormal;
+					float3	Half_unorm = View + Light;
+					float3	Half = normalize( Half_unorm );
+
+					float	LdotN = saturate( dot( Light, Normal ) );
+					float	VdotN = saturate( dot( View, Normal ) );
+					float	HdotN = saturate( dot( Half, Normal ) );
+
+					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+					float3	Irradiance_shadowed = Irradiance;
+
+					// Stolen from BRDFskin & translucencyHQ
+					if ( _Light.m_ShadowSetup != 0xFFFFFFFF ) {
+						float	shadowCoordZ, shadowMapZ;
+						float3	wsCasterPos;
+						GetShadowMapZandPos( _Surface.wsPosition, _Light.m_shadowInfo.mWorldToShadowMat, _Light.m_shadowInfo.mShadowToWorldMat, SHADOW_SLICE_INDEX(_Light.m_shadowInfo.mInfo), _Light.m_isDirectionalLight, shadowCoordZ, shadowMapZ, wsCasterPos );
+
+						float	enableShadow = saturate( 1e5 * shadowMapZ );					// 0 if caster is exactly on Znear (pancaking), 1 otherwise
+						float	isBehindCaster = saturate( 1e4 * (shadowCoordZ - shadowMapZ) );	// 1 if receiver is in front of caster, 0 otherwise
+						float	shadow = enableShadow * exp( -$(vegetation/transmittanceParms).w * isBehindCaster * distance( _Surface.wsPosition, wsCasterPos ) );
+						float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+						Irradiance_shadowed = shadow * cloudShadow * Irradiance;
+					}
+
+// Formerly, I used the "shadowDistance.mrpr" implementation but F.Tournade had already written the code I needed in the BRDFskin translucency! It turns out shadowDistance.mrpr is quite useless after all... ^^
+// 					#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+//						float3	Irradiance_shadowed = exp( -$(vegetation/transmittanceParms).w * max( 0.0, _Light.m_shadowReceiverZ - _Light.m_shadowCasterZ) ) * Irradiance;
+//					#else
+//						float3	Irradiance_shadowed = _Light.m_shadow * Irradiance;
+//					#endif
+
+					// =================================================================
+					// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+					float3	FresnelSpecular = FresnelAccurate( _Surface.IOR, HdotN, _Surface.fresnelStrength );
+					FresnelSpecular *= _Light.m_SpecularAttn; // Apply attenuation factor from artist settings. (cf. dlaurent for more infos)
+					float3	FresnelDiffuse = 1.0 - FresnelSpecular;	// Diffuse Fresnel is always left with what has not been specularly reflected...
+
+					// ====== Diffuse lighting ======
+					float3	DiffuseColor = lerp( _Surface.diffuseAlbedo, m_sheenColor, _Surface.roughness * pow( FresnelSchlick( HdotN ), _Surface.sheenImportance ) );
+					float3	DiffuseTerm = DiffuseColor * ComputeDiffuseTerm( _Surface, _Light );	// BRDF * (L.N)
+					_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * DiffuseTerm;
+
+					// ====== Specular lighting ======
+					float	SpecularTerm = m_ward.ComputeWardTerm( Normal, Light, View ) * LdotN;	// BRDF * (L.N)
+					_Result.accumSpecular += FresnelSpecular * Irradiance_shadowed * SpecularTerm;
+
+					#if $(fuzz/enable)
+						float fuzz = pow( 1.0f - VdotN, $(fuzz/fresnel) ) * $(fuzz/intensity);
+						#if $(fuzz/hasMask)
+							fuzz *= _Surface.fuzzMask;
+						#endif
+						_Result.accumSpecular += Irradiance_shadowed * fuzz * LdotN;
+					#endif
+
+					// =================================================================
+					// Translucency
+					#if $(translucency/enable)
+
+						float	LdotN_translucency = -dot( Light, _Surface.wsVertexNormal );
+						float	TranslucencyFactor = smoothstep( -$(vegetation/transmittanceParms).z, 0.1, LdotN_translucency ) * _Surface.translucency;
+
+						float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+						float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * DiffuseColor;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+
+						// Compute simple translucency using bent normal
+						float	Translucency = ComputeTranslucencyNoRamp( TranslucencyFactor, _Surface.wsVertexNormal, Light, View );
+
+						#if $(vegetation/useTransmittanceMap)
+							// Advanced translucency using precomputed transmittance map
+							float	Tr  = _Surface.userData.transmittanceHL2.x * saturate( dot( _Surface.userData.wsHL2Basis_R, Light ) )
+										+ _Surface.userData.transmittanceHL2.y * saturate( dot( _Surface.userData.wsHL2Basis_G, Light ) )
+										+ _Surface.userData.transmittanceHL2.z * saturate( dot( _Surface.userData.wsHL2Basis_B, Light ) );
+
+//							Translucency = lerp( Translucency, TranslucencyFactor, Tr );
+							Translucency += Tr * TranslucencyFactor;
+						#endif
+
+						_Result.accumDiffuse += INVPI * Rho_t * _Surface.userData.transmittance * Irradiance_shadowed * Translucency;
+					#endif
+				}
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Area light lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the area light
+			//	_BaseLight, standard information about the original light
+			//
+			void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight ) {
+
+				// Standard lighting
+				COMPUTE_AREA_LIGHT_LIGHTING( _Result, _Surface, _Light );
+
+				// =================================================================
+				// Translucency
+				#if $(translucency/enable)
+					float3	Light = _Light.m_wsLight;
+					float3	View = _Surface.wsView;
+
+					float	LdotN_translucency = -dot( Light, _Surface.wsVertexNormal );
+					float	TranslucencyFactor = smoothstep( -$(vegetation/transmittanceParms).z, 0.1, LdotN_translucency ) * _Surface.translucency;
+
+					float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+					float3	Rho_t = INVPI * ( 1.0 - (1.0 - FresnelSpecular_translucency) ) * _Surface.diffuseAlbedo;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+
+					// Compute simple translucency using bent normal
+					float	Translucency = ComputeTranslucencyNoRamp( TranslucencyFactor, _Surface.wsVertexNormal, Light, View );
+
+					#if $(vegetation/useTransmittanceMap)
+						// Advanced translucency using precomputed transmittance map
+						float	Tr  = _Surface.userData.transmittanceHL2.x * saturate( dot( _Surface.userData.wsHL2Basis_R, Light ) )
+									+ _Surface.userData.transmittanceHL2.y * saturate( dot( _Surface.userData.wsHL2Basis_G, Light ) )
+									+ _Surface.userData.transmittanceHL2.z * saturate( dot( _Surface.userData.wsHL2Basis_B, Light ) );
+
+//						Translucency = lerp( Translucency, TranslucencyFactor, Tr );
+						Translucency += Tr * TranslucencyFactor;
+					#endif
+
+					float3	Irradiance_shadowed = _Light.m_attenuation * _Light.m_shadow * _Light.m_color * _Light.m_irradianceDiffuse;
+					_Result.accumDiffuse += Rho_t * _Surface.userData.transmittance * Irradiance_shadowed * Translucency;
+				#endif
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Indirect/Ambient lighting computation
+			float3	ComputeVegetationAmbientLighting( SurfaceContext _Surface, float _AO ) {
+
+				#if $twoSidedLighting
+					// Retrieve the original TBN vectors used by the vertex shader (BEFORE being reversed in the pixel context)
+					float3	wsOriginalVertexTangent = _Surface.frontFaceFactor * _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.frontFaceFactor * _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.frontFaceFactor * _Surface.wsVertexNormal;
+				#else
+					float3	wsOriginalVertexTangent = _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.wsVertexNormal;
+				#endif
+
+				// Let the SH compute the irradiance
+				float3	AmbientTerm = UnPackSHPrincipalDirections( _Surface.wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+
+				#if $(translucency/enable)
+
+					// Compute indirect lighting translucency
+					float3	Light = -_Surface.wsVertexNormal;
+					float3	View = _Surface.wsView;
+
+					float	TranslucencyFactor = _Surface.translucency;
+
+					float3	FresnelSpecular_translucency = $specularTintDielectric.xyz;						// For standard dielectrics at normal incidence angle
+					float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * _Surface.diffuseAlbedo;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+
+					// Compute simple translucency using bent normal
+					float	Translucency = ComputeTranslucencyNoRamp( TranslucencyFactor, _Surface.wsVertexNormal, Light, View );
+
+					#if $(vegetation/useTransmittanceMap)
+						// Advanced translucency using precomputed transmittance map
+						float	Tr = (_Surface.userData.transmittanceHL2.x + _Surface.userData.transmittanceHL2.y + _Surface.userData.transmittanceHL2.z) * sqrt(1.0/3.0);	// Here the light = -VertexNormal so we simply average directional contributions...
+//						Translucency = lerp( Translucency, TranslucencyFactor, Tr );
+						Translucency += Tr * TranslucencyFactor;
+					#endif
+
+					float3	BackIrradiance = UnPackSHPrincipalDirections( Light, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+					float3	AmbientTranslucency = Rho_t * _Surface.userData.transmittance * BackIrradiance * Translucency;
+
+					return AmbientTerm + $(vegetation/indirectTranslucencyBoost) * AmbientTranslucency;
+				#else
+					return AmbientTerm;
+				#endif
+			}
+
+			// =================================================================
+			// Add ambient terms
+			void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality ) {
+				float	AO = ComputeAmbientOcclusion( _Surface, _Surface.AO.x, _ssao );
+				float3	Fdr = DiffuseFresnelReflectance_Ward( _Surface.IOR, _Surface.roughness );
+				_Result.accumAmbient += INVPI * _Surface.diffuseAlbedo * Fdr * ComputeVegetationAmbientLighting( _Surface, AO );
+
+				#if !$buildingEnvironmentProbe
+					_Result.accumSpecular += AO * COMPUTE_IBL( _Surface, _quality );
+				#endif
+			}
+		};
+		#endif	// #ifndef BRDF_VEGETATION_INCLUDED
+	}
+}

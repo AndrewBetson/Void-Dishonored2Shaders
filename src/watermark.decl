@@ -1,0 +1,139 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <PostFX/Luminance/common>
+		#include <PostFX/Debug/DrawText>
+	}
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull		none
+		blend		ONE ONE
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+		//Exposure
+		$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+		float amount = 1.0/Adaptation.EngineLuminanceFactor;
+
+		float col = 00.0;
+		float2 pixelCoords = $sv_position.xy;
+		float2 vTextLength = float2(STRWIDTH($watermark_len), STRHEIGHT(1.0) );
+		float2 printPos = floor($watermark_coords - vTextLength);
+		//float2 printPos = floor(pixelCoords/vTextLength) * vTextLength;
+		printPos.y += vTextLength.y - 2;
+
+		//Fetch char
+		uint idx = 0;
+		while( $watermark_txt[idx] != 0 || idx > (256/4) ) {
+			switch( $watermark_txt[idx] ) {
+				case 0x20: col += get_char(ch_spc,printPos,pixelCoords);	break;//(Space)
+				case 0x21: col += get_char(ch_exc,printPos,pixelCoords);	break;//(exclamation mark)
+				case 0x22: col += get_char(ch_quo,printPos,pixelCoords);	break;//(double quote)
+				case 0x23: col += get_char(ch_hsh,printPos,pixelCoords);	break;//(number sign)
+				case 0x24: col += get_char(ch_dol,printPos,pixelCoords);	break;//(dollar sign)
+				case 0x25: col += get_char(ch_pct,printPos,pixelCoords);	break;//(percent)
+				case 0x26: col += get_char(ch_amp,printPos,pixelCoords);	break;//(ampersand)
+				case 0x27: col += get_char(ch_apo,printPos,pixelCoords);	break;//(single quote)
+				case 0x28: col += get_char(ch_lbr,printPos,pixelCoords);	break;//(left opening parenthesis)
+				case 0x29: col += get_char(ch_rbr,printPos,pixelCoords);	break;//(right closing parenthesis)
+				case 0x2A: col += get_char(ch_ast,printPos,pixelCoords);	break;//(asterisk)
+				case 0x2B: col += get_char(ch_crs,printPos,pixelCoords);	break;//(plus)
+				case 0x2C: col += get_char(ch_com,printPos,pixelCoords);	break;//(comma)
+				case 0x2D: col += get_char(ch_dsh,printPos,pixelCoords);	break;//(minus or dash)
+				case 0x2E: col += get_char(ch_per,printPos,pixelCoords);	break;//(dot)
+				case 0x2F: col += get_char(ch_lsl,printPos,pixelCoords);	break;//(forward slash)
+				case 0x30: col += get_char(ch_0,printPos,pixelCoords);		break;
+				case 0x31: col += get_char(ch_1,printPos,pixelCoords);		break;
+				case 0x32: col += get_char(ch_2,printPos,pixelCoords);		break;
+				case 0x33: col += get_char(ch_3,printPos,pixelCoords);		break;
+				case 0x34: col += get_char(ch_4,printPos,pixelCoords);		break;
+				case 0x35: col += get_char(ch_5,printPos,pixelCoords);		break;
+				case 0x36: col += get_char(ch_6,printPos,pixelCoords);		break;
+				case 0x37: col += get_char(ch_7,printPos,pixelCoords);		break;
+				case 0x38: col += get_char(ch_8,printPos,pixelCoords);		break;
+				case 0x39: col += get_char(ch_9,printPos,pixelCoords);		break;
+				case 0x3A: col += get_char(ch_col,printPos,pixelCoords);	break;//(colon)
+				case 0x3B: col += get_char(ch_scl,printPos,pixelCoords);	break;//(semi-colon)
+				case 0x3C: col += get_char(ch_les,printPos,pixelCoords);	break;//(less than sign)
+				case 0x3D: col += get_char(ch_equ,printPos,pixelCoords);	break;//(equal sign)
+				case 0x3E: col += get_char(ch_grt,printPos,pixelCoords);	break;//(greater than sign)
+				case 0x3F: col += get_char(ch_que,printPos,pixelCoords);	break;//(question mark)
+				case 0x40: col += get_char(ch_ats,printPos,pixelCoords);	break;//(AT symbol)
+				case 0x41: col += get_char(ch_A,printPos,pixelCoords);		break;
+				case 0x42: col += get_char(ch_B,printPos,pixelCoords);		break;
+				case 0x43: col += get_char(ch_C,printPos,pixelCoords);		break;
+				case 0x44: col += get_char(ch_D,printPos,pixelCoords);		break;
+				case 0x45: col += get_char(ch_E,printPos,pixelCoords);		break;
+				case 0x46: col += get_char(ch_F,printPos,pixelCoords);		break;
+				case 0x47: col += get_char(ch_G,printPos,pixelCoords);		break;
+				case 0x48: col += get_char(ch_H,printPos,pixelCoords);		break;
+				case 0x49: col += get_char(ch_I,printPos,pixelCoords);		break;
+				case 0x4A: col += get_char(ch_J,printPos,pixelCoords);		break;
+				case 0x4B: col += get_char(ch_K,printPos,pixelCoords);		break;
+				case 0x4C: col += get_char(ch_L,printPos,pixelCoords);		break;
+				case 0x4D: col += get_char(ch_M,printPos,pixelCoords);		break;
+				case 0x4E: col += get_char(ch_N,printPos,pixelCoords);		break;
+				case 0x4F: col += get_char(ch_O,printPos,pixelCoords);		break;
+				case 0x50: col += get_char(ch_P,printPos,pixelCoords);		break;
+				case 0x51: col += get_char(ch_Q,printPos,pixelCoords);		break;
+				case 0x52: col += get_char(ch_R,printPos,pixelCoords);		break;
+				case 0x53: col += get_char(ch_S,printPos,pixelCoords);		break;
+				case 0x54: col += get_char(ch_T,printPos,pixelCoords);		break;
+				case 0x55: col += get_char(ch_U,printPos,pixelCoords);		break;
+				case 0x56: col += get_char(ch_V,printPos,pixelCoords);		break;
+				case 0x57: col += get_char(ch_W,printPos,pixelCoords);		break;
+				case 0x58: col += get_char(ch_X,printPos,pixelCoords);		break;
+				case 0x59: col += get_char(ch_Y,printPos,pixelCoords);		break;
+				case 0x5A: col += get_char(ch_Z,printPos,pixelCoords);		break;
+				case 0x5B: col += get_char(ch_lsb,printPos,pixelCoords);	break;//(left opening bracket)
+				case 0x5C: col += get_char(ch_rsl,printPos,pixelCoords);	break;//(back slash)
+				case 0x5D: col += get_char(ch_rsb,printPos,pixelCoords);	break;//(right closing bracket)
+				case 0x5E: col += get_char(ch_pow,printPos,pixelCoords);	break;//(caret cirumflex)
+				case 0x5F: col += get_char(ch_usc,printPos,pixelCoords);	break;//(underscore)
+				case 0x61: col += get_char(ch_a,printPos,pixelCoords);		break;
+				case 0x62: col += get_char(ch_b,printPos,pixelCoords);		break;
+				case 0x63: col += get_char(ch_c,printPos,pixelCoords);		break;
+				case 0x64: col += get_char(ch_d,printPos,pixelCoords);		break;
+				case 0x65: col += get_char(ch_e,printPos,pixelCoords);		break;
+				case 0x66: col += get_char(ch_f,printPos,pixelCoords);		break;
+				case 0x67: col += get_char(ch_g,printPos,pixelCoords);		break;
+				case 0x68: col += get_char(ch_h,printPos,pixelCoords);		break;
+				case 0x69: col += get_char(ch_i,printPos,pixelCoords);		break;
+				case 0x6A: col += get_char(ch_j,printPos,pixelCoords);		break;
+				case 0x6B: col += get_char(ch_k,printPos,pixelCoords);		break;
+				case 0x6C: col += get_char(ch_l,printPos,pixelCoords);		break;
+				case 0x6D: col += get_char(ch_m,printPos,pixelCoords);		break;
+				case 0x6E: col += get_char(ch_n,printPos,pixelCoords);		break;
+				case 0x6F: col += get_char(ch_o,printPos,pixelCoords);		break;
+				case 0x70: col += get_char(ch_p,printPos,pixelCoords);		break;
+				case 0x71: col += get_char(ch_q,printPos,pixelCoords);		break;
+				case 0x72: col += get_char(ch_r,printPos,pixelCoords);		break;
+				case 0x73: col += get_char(ch_s,printPos,pixelCoords);		break;
+				case 0x74: col += get_char(ch_t,printPos,pixelCoords);		break;
+				case 0x75: col += get_char(ch_u,printPos,pixelCoords);		break;
+				case 0x76: col += get_char(ch_v,printPos,pixelCoords);		break;
+				case 0x77: col += get_char(ch_w,printPos,pixelCoords);		break;
+				case 0x78: col += get_char(ch_x,printPos,pixelCoords);		break;
+				case 0x79: col += get_char(ch_y,printPos,pixelCoords);		break;
+				case 0x7A: col += get_char(ch_z,printPos,pixelCoords);		break;
+				case 0x7B: col += get_char(ch_lpa,printPos,pixelCoords);	break;//(left opening brace)
+				case 0x7C: col += get_char(ch_bar,printPos,pixelCoords);	break;//(vertical bar)
+				case 0x7D: col += get_char(ch_rpa,printPos,pixelCoords);	break;//(right closing brace)
+				case 0x7E: col += get_char(ch_tid,printPos,pixelCoords);	break;//(tilde)
+				default: col += get_char(ch_lar,printPos,pixelCoords);		break;
+			}
+			++idx; //read next 4 chars
+		}
+
+		float3 color = float3(0.0, col * amount, 0.0);
+		@sv_target = float4( color, 1.0 );
+		
+	}
+}

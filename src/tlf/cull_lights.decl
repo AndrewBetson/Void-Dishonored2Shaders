@@ -1,0 +1,402 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 64
+		NUMTHREADY 1
+		NUMTHREADZ 1
+		isAsyncCompute 1
+	}
+
+  hlsl_prefix {
+		#include <tlf/common>
+		#include <intersection>
+
+		static const uint4 lineIdx[6] = { uint4(0,1,1,2), uint4(2,3,3,0), uint4(4,5,5,6), uint4(6,7,7,4), uint4(0,4,1,5), uint4(2,6,3,7) };
+
+		float sqDist( float3 a, float3 b, float3 c) {
+		  float3 ab = b - a;
+		  float3 ac = c - a;
+		  float3 bc = c - b;
+
+		  float e = dot( ac, ab );
+		  if ( e <= 0.0 )
+			return dot( ac, ac );
+
+		  float f = dot( ab, ab );
+		  if (e >= f)
+			return dot( bc, bc );
+
+		  return dot( ac, ac ) - e * e / f;
+		}
+		
+		static const float INF = 1e20;
+		
+		float2 NdcToUv(float2 xy)
+		{
+			return xy * float2(0.5, -0.5) + 0.5;
+		}
+		
+		float4 NdcToUv(float4 xyxy)
+		{
+			return xyxy * float2(0.5, -0.5).xyxy + 0.5;
+		}
+		
+		float2 UvToNdc(float2 uv)
+		{
+			return float2(2.0, -2.0) * uv + float2(-1.0, 1.0);
+		}
+
+		float4 UvToNdc(float4 uv)
+		{
+			return float2(2.0, -2.0).xyxy * uv + float2(-1.0, 1.0).xyxy;
+		}
+			
+		float2 CAMERA_UvToRay_v_xy(float2 uv)
+		{
+			return UvToNdc(uv) * $(tlf/uvToRay).zw + $(tlf/uvToRay).xy;
+		}
+
+		float4 CAMERA_UvToRay_v_xyxy(float4 uv)
+		{
+			return UvToNdc(uv) * $(tlf/uvToRay).zwzw + $(tlf/uvToRay).xyxy;
+		}
+
+		float3 CAMERA_UvToRay_v(float2 uv)
+		{
+			return float3(CAMERA_UvToRay_v_xy(uv), 1.0);
+		}
+
+		float CAMERA_HalfTileUnproject(float z)
+		{
+			// NOTE: conservatively enlarge light volume by this value,
+			// it is safe to not use it if your lights are big and use phisically based falloff
+			
+			return max(z, 0.0) * $(tlf/uvToRay).z * $(tlf/invTileDimensions).x;
+		}
+		
+		float4 SPOT_ScatteringParams(float Rmin, float cosa0, float3 X, float3 S)
+		{
+			float cosa0_sq = cosa0 * cosa0;
+			float tana0_inv = cosa0 * rsqrt(1.0 - cosa0_sq);
+			float delta = -Rmin * tana0_inv;
+			float3 p = X + S * delta;
+			float s_dot_c = dot(S, p);
+			float c_dot_c = dot(p, p);
+
+			float4 c;
+			c.x = cosa0_sq;
+			c.y = cosa0_sq * delta - s_dot_c;
+			c.z = s_dot_c * s_dot_c - cosa0_sq * c_dot_c;
+			c.w = delta;
+
+			return c;
+		}
+
+		float2 OMNI_Trace(float3 Xv, float4 param, float2 tile_center_uv)
+		{
+			float2 halfPixel = $(tlf/invTileDimensions).xy * 0.5;
+			
+			// IMPORTANT: select only one ray nearest to sphere center
+
+			float2 delta = param.xy - tile_center_uv;
+			float2 max_uv = tile_center_uv + sign_fast(delta) * halfPixel;
+			float3 ray = CAMERA_UvToRay_v(max_uv);
+
+			float inv_len = rsqrt( dot(ray, ray) );
+
+			float r_dot_c = dot(ray, Xv) * inv_len;
+			float h = param.z + r_dot_c * r_dot_c;
+
+			h = sqrt( max(h, 0.0) );
+
+			float2 sphere_minmax = r_dot_c + h * float2(-1, 1);
+			sphere_minmax *= inv_len;
+
+			sphere_minmax = h == 0.0 ? float2(INF, -INF) : sphere_minmax;
+
+			float2 t = abs(delta);
+			float2 minmax = Xv.z + param.w * float2(-1.0, 1.0);
+			sphere_minmax = (t.x > halfPixel.x || t.y > halfPixel.y) ? sphere_minmax : minmax;
+
+			return sphere_minmax;
+		}
+
+		float2 SPOT_Trace_TwoRays(float3 V0, float3 V1, float3 L, float sphere, float3 S, float l_dot_s, float4 vParam0)
+		{
+			float2 v_dot_s;
+			v_dot_s.x = dot(V0, S);
+			v_dot_s.y = dot(V1, S);
+			
+			float2 l_dot_v;
+			l_dot_v.x = dot(V0, L);
+			l_dot_v.y = dot(V1, L);
+
+			float2 a = vParam0.xx - v_dot_s * v_dot_s;
+			float2 b = vParam0.yy * v_dot_s + vParam0.xx * l_dot_v;
+
+			float4 d;
+			d.xz = b * b + vParam0.zz * a;
+			d.yw = l_dot_v * l_dot_v + sphere.xx;
+
+			d = sqrt( max(d, 0.0) );
+
+			// NOTE: cone (unsorted)
+
+			b /= a;
+			d.xz /= a;
+
+			float4 u = b.xxyy + d.xxzz * float2(1, -1).xyxy;
+			float4 v = v_dot_s.xxyy * u - vParam0.w;
+
+			float2 far;
+			far.x = v_dot_s.x > 0.0 ? INF : -INF;
+			far.y = v_dot_s.y > 0.0 ? INF : -INF;
+
+			u.x = v.x > 0.0 ? u.x : far.x;
+			u.y = v.y > 0.0 ? u.y : far.x;
+			u.z = v.z > 0.0 ? u.z : far.y;
+			u.w = v.w > 0.0 ? u.w : far.y;
+
+			// NOTE: sphere (sorted)
+
+			v = l_dot_v.xxyy + d.yyww * float2(-1, 1).xyxy;
+
+			// NOTE: sort
+
+			float4 t;
+			t.xz = max(min(u.xz, u.yw), v.xz);
+			t.yw = min(max(u.xz, u.yw), v.yw);
+
+			// NOTE: plane (sorted)
+			
+			#if 0
+
+				float2 tp = l_dot_s / v_dot_s;
+
+				// FIXME: this fix is required to remove a line with false positives,
+				// more precisely, a plane = {p = light origin, n = light direction}, but 0.05 should be cos(tile FOV)
+				
+				//tp.x = abs(v_dot_s.x) < 0.05 ? -INF * sign_fast(v_dot_s.x) : tp.x;
+				//tp.y = abs(v_dot_s.y) < 0.05 ? -INF * sign_fast(v_dot_s.y) : tp.y;
+			
+			#else
+			
+				float2 tp;
+				tp.x = -INF * sign_fast(v_dot_s.x);
+				tp.y = -INF * sign_fast(v_dot_s.y);
+			
+			#endif
+			
+			if( l_dot_s > 0.0 )
+				t.xz = max(t.xz, tp);
+			else
+			{
+				float2 tt = min(t.yw, tp);
+
+				t.y = tp.x > 0.0 ? tt.x : t.y;
+				t.w = tp.y > 0.0 ? tt.y : t.w;
+			}
+
+			// NOTE: ray length to view-z
+
+			t.xy *= V0.z;
+			t.zw *= V1.z;
+
+			// NOTE: mask invalid values (where d <= 0)
+
+			t.xy = (d.x == 0.0 || d.y == 0.0) ? float2(INF, -INF) : t.xy;
+			t.zw = (d.z == 0.0 || d.w == 0.0) ? float2(INF, -INF) : t.zw;
+
+			// NOTE: update bounds (now t.xy is near_z and far_z)
+			// FIXME: swap t.x and t.y for GL!
+
+			t.x = min(t.x, t.z);
+			t.y = max(t.y, t.w);
+
+			return t.xy;
+		}
+
+		bool IsInside(float A, float B, uint mask, float2 object_minmax)
+		{	
+			bool inside = false;
+			
+			float2 f = object_minmax * A + B;
+			
+			if( f.x <= 1.0 && f.y >= 0.0 ) 
+			{
+				uint2 bits = 1 << uint2( trunc(saturate(f) * shred) );
+				uint object_mask = ((bits.y - 1) | bits.y) & ~(bits.x - 1);
+				
+				inside = (mask & object_mask) != 0;
+			}
+
+			return inside;
+		}
+		
+		float4 GetTileRect(uint2 tileId, out float2 tile_center_uv)
+		{
+			float2 tile_size = $(tlf/invTileDimensions).xy;
+			float2 tile_uv = float2(tileId) * tile_size;
+
+			tile_center_uv = tile_uv + tile_size * 0.5;
+
+			float4 v;
+			v.xy = CAMERA_UvToRay_v_xy(tile_uv);
+			v.zw = CAMERA_UvToRay_v_xy(tile_uv + tile_size);
+
+			return v;
+		}
+	}
+
+
+	hlsl_cp_main {
+		uint2	tile = $sv_groupID.xy;
+		uint	thread = $sv_groupThreadID.x;
+		uint	lightCount = $(tlf/light_count);
+		
+		// OPTION #1: TO MATCH ORIGINAL SOLUTION - "tlf/depthMinMax" format is RG32ui 
+		
+		//uint2 rawViewZsAndMask = $(tlf/depthMinMax)[tile].xy;
+		//float3 rawViewZsAndMask;
+		//rawViewZsAndMask.x = f16tof32( rawViewZsAndMask.x >> 16 );
+		//rawViewZsAndMask.yz = f16tof32( rawViewZsAndMask.x & 0x0000FFFF )
+		//uint	mask = rawViewZsAndMask.y;
+
+		// OPTION #2: OPTIMIZED - "tlf/depthMinMax" format is RGBA32f
+		
+		float4 rawViewZsAndMask = $(tlf/depthMinMax)[tile];
+		
+		uint mask = asuint(rawViewZsAndMask.w);
+
+		float2	tile_center_uv;
+		float4	tileRect = GetTileRect(tile, tile_center_uv);
+		
+		for ( uint lightIdx = thread; lightIdx < lightCount; lightIdx += 64 ) {
+			$(tlf/lightCull_t) light = $(tlf/lights_sb)[ lightIdx ];
+			
+			bool intersecting = false;
+			float zNear = -rawViewZsAndMask.x;
+			float zFar = -rawViewZsAndMask.z; // no sky
+
+			#if $(tlf/gatherScattering) == 1
+			
+				if ( light.mScatterValue > 0.0 ) {
+					intersecting = light.mRadiusCutoff > 0.0;
+					zNear = 0.0;
+					zFar = -rawViewZsAndMask.y; // with sky
+					mask = 0xFFFFFFFF;
+				}
+				
+			#else
+			
+				if ( !LIGHT_SCATTER_ONLY(light.mFlags) )
+					intersecting = light.mRadiusCutoff > 0.0;
+				
+			#endif
+			
+			if ( !intersecting )
+				continue;
+
+			float	A = 1.0 / (zFar - zNear);
+			float	B = -zNear * A;
+		
+			uint	lightType = LIGHT_TYPE( light.mFlags );
+			float	cosa0 = rsqrt( light.mSpotParms.z * light.mSpotParms.z + 1.0 );
+			
+			float3	Xv = light.mViewPosition;
+					Xv.z = -Xv.z;
+			
+			float3	Sv = mul( $viewMatrix, float4( lightType == LIGHT_TYPE_SPOT ? -light.mSpotDir : light.mSpotDir, 0.0) ).xyz;
+					Sv.z = -Sv.z;
+			
+			float conservative_offset = CAMERA_HalfTileUnproject(Xv.z);
+			float R = light.mRadiusCutoff + conservative_offset;
+
+			float2 minmax;
+			
+
+			float3 center_uv = mul( $projectionMatrix, float4(light.mViewPosition, 1.0) ).xyw;
+			float2 center_proj = NdcToUv(center_uv.xy / center_uv.zz);
+			
+			if( lightType == LIGHT_TYPE_POINT ) {
+			
+				float4 param;
+				param.xy = center_proj;
+				param.z = R * R - dot(Xv, Xv);
+				param.w = R;
+
+				minmax = OMNI_Trace(Xv, param, tile_center_uv);
+			} else {
+				if( lightType == LIGHT_TYPE_HALF_POINT || lightType == LIGHT_TYPE_AREA )
+				{
+					// IMPORTANT: replace a hemisphere with a cone, but guarantee that a cone fully includes a hemisphere
+					// It is required to avoid imprecision problems when cone angle is close to 90 deg.
+					
+					const float BIAS = 0.1;
+					
+					cosa0 = cos(atan(1.0 / BIAS)); // cos(atan(R / (R * 0.1)))
+					Xv -= Sv * R * BIAS;
+					R += R * BIAS;
+				}
+					
+				Xv -= Sv * conservative_offset;
+
+				float Rmin = 0.0 + conservative_offset;
+				
+				// yes, another one.. due to position shifted back
+				R += conservative_offset;
+
+
+				float sphere = R * R - dot(Xv, Xv);
+				float ldots = dot(Xv, Sv);
+
+				float4 param = SPOT_ScatteringParams(Rmin, cosa0, Xv, Sv);
+				param.w += ldots;
+
+				float3 r0 = normalize( float3(tileRect.xy, 1.0) );
+				float3 r1 = normalize( float3(tileRect.zw, 1.0) );
+
+				minmax = SPOT_Trace_TwoRays(r0, r1, Xv, sphere, Sv, ldots, param);
+
+				r0 = normalize( float3(tileRect.xw, 1.0) );
+				r1 = normalize( float3(tileRect.zy, 1.0) );
+
+				float2 cone_minmax23 = SPOT_Trace_TwoRays(r0, r1, Xv, sphere, Sv, ldots, param);
+
+				minmax.x = min(minmax.x, cone_minmax23.x);
+				minmax.y = max(minmax.y, cone_minmax23.y);
+				
+				// IMPORTANT: special case - we don't want to lose cone origin in rare cases
+
+				float2 halfPixel = $(tlf/invTileDimensions).xy * 0.5;
+				float2 delta = abs(center_proj - tile_center_uv);
+				
+				[flatten]
+				if( delta.x < halfPixel.x && delta.y < halfPixel.y )
+				{
+					minmax.x = min(minmax.x, Xv.z);
+					minmax.y = max(minmax.y, Xv.z);
+				}
+			}
+
+			if( IsInside(A, B, mask, minmax) )
+			{
+				// Get a node in the pool
+				uint nextEntry;
+				InterlockedAdd( @(tlf/ll/free_node)[0], 1, nextEntry );
+
+				// Replace the linked list head for the tile with the new index
+				uint	oldHead;
+				uint2	tileOffset = lightType * uint2( $(tlf/invTileDimensions).z, 0 );			// Will offset by the entire TILES_COUNT_X for each new light type so we get N linked-lists, one per light type
+				InterlockedExchange( @(tlf/ll/heads)[tile + tileOffset], nextEntry, oldHead );
+				
+				$(tlf/ll/node_t) node;
+				node.pack = (oldHead << LC_INDEX_BITS) | lightIdx;
+
+				// Now we can fill the node and write it to memory
+				@(tlf/ll/pool)[ nextEntry ] = node;
+			}
+		}
+	}
+
+}

@@ -1,0 +1,48 @@
+{
+	newstyle
+
+	state {
+		depthEnable		0
+		depthWrite		0
+		depthfunc		ALWAYS
+		cull			NONE
+		blendOp			ADD
+		blend			ONE		ZERO
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <helper>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+		const float decay = $(godRaysMask/Decay);
+		const float density = saturate($(godRaysMask/Density));
+		float2 lightPositionOnScreen = float2( $(godRaysMask/Transform2).x, $(godRaysMask/Transform2).y ) * 0.5 + 0.5;
+		lightPositionOnScreen.y = 1.0 - lightPositionOnScreen.y;
+		lightPositionOnScreen *= $resolutionScale.xy;
+
+		float2 tc = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+		float2 deltaTexCoord = (tc - lightPositionOnScreen);
+		float4 color = $(atm/distanceFog/TexSourceImage).GatherGreen( $linearClamp, tc );
+
+		//Interleaved Offset
+		float distToCenter = length(deltaTexCoord) + $positionToViewTexture.z * 0.5;
+		float2 stepSize = $positionToViewTexture.zw;
+		const uint interleavedSize = 8;
+		const float interleavedSquareRcp = 1.0 / float(interleavedSize * interleavedSize);
+		uint2 interleavedPos = uint2($sv_position.xy) % interleavedSize;
+		float2 rayOffset = (float)B8( interleavedPos ) * stepSize * interleavedSquareRcp;
+
+		tc += rayOffset * (deltaTexCoord/distToCenter);
+		deltaTexCoord *= density;
+		tc -= deltaTexCoord;
+		color += $(atm/distanceFog/TexSourceImage).GatherGreen( $linearClamp, tc );
+
+		@sv_target = smoothstep( 64.0/255.0, 1.0, dot( color, 0.25 ) );
+	}
+}

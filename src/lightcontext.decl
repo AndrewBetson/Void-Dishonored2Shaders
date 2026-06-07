@@ -1,0 +1,457 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef LIGHT_CONTEXT_INCLUDED
+		#define LIGHT_CONTEXT_INCLUDED
+
+		// bmayaux (2015-07-28) Define this prior to include light context to change the shadow technique
+		// If defined then the whole shadows system is changed:
+		//	_ SampleCmp are replaced by a simple Sample
+		//	_ The average distance of the shadow caster is provided in the additional "m_casterDistance" field
+		//
+		// Very useful for semi-transparent objects like vegetation that can fade the shadow over a distance from the caster to avoid hard shadows
+		//
+// 		#define	SHADOWS_PROVIDE_CASTER_DISTANCE 1
+
+		#include <surfaceContext>
+		#include <IBL>			// ARKANE: bmayaux (2014-06-30) IBL should be included late to know of the SurfaceContext structure
+		#include <intersection>
+		#ifndef SHADOWS_PROVIDE_CASTER_DISTANCE	// bmayaux (2015-07-28) 
+			#include <shadow>
+		#else
+			#include <shadowDistance>
+		#endif
+		#if $whaleOilEmissivePATCH
+			#include <PostFX/Luminance/common>
+		#endif
+		#if $useSelfShadowedBumpMap
+			#include <parallaxSelfShadow>
+		#endif
+		#include <indirectLighting/common>
+
+		// =======================================================================
+		// Light type & flags accessors
+		#define LIGHT_TYPE_POINT							(0)
+		#define LIGHT_TYPE_HALF_POINT						(1)
+		#define LIGHT_TYPE_SPOT								(2)
+		#define LIGHT_TYPE_AREA								(3)
+		#define LIGHT_TYPE_PARALLEL							(4)
+
+		#define LIGHT_SCATTER_TURBULENCE( flags )			((flags) & 0x00000001)
+		#define LIGHT_SCATTER_VOLUMETRIC_SHADOW( flags )	(((flags) >> 1) & 0x00000001)
+		#define LIGHT_SCATTER_CUSTOM_SHAPE( flags )			(((flags) >> 2) & 0x00000001)
+		#define LIGHT_SCATTER_ONLY( flags )					(((flags) >> 3) & 0x00000001)
+		#define LIGHT_TYPE( flags )							(((flags) >> 4) & 0x00000007)
+		#define LIGHT_SPOT_SHADOW_SPLITTED( flags )			(((flags) >> 7) & 0x00000001)
+		#define AREA_LIGHT_SLICE( flags )					(((flags) >> 8) & 0x0000FF)
+
+		// =======================================================================
+		//    _   __  __ ___ ___ ___ _  _ _____   _____ ___ ___ __  __
+		//   /_\ |  \/  | _ )_ _| __| \| |_   _| |_   _| __| _ \  \/  |
+		//  / _ \| |\/| | _ \| || _|| .` | | |     | | | _||   / |\/| |
+		// /_/ \_\_|  |_|___/___|___|_|\_| |_|     |_| |___|_|_\_|  |_|
+		// Ambient term computation
+		// =======================================================================
+		float	ComputeAmbientOcclusion( SurfaceContext _Surface, float _AO, float _SSAO ) {
+			#if $isAlpha
+				return 1.0;
+			#else
+				return min( _SSAO, _AO );
+			#endif
+		}
+		float3	HQ_ComputeAmbientLighting( SurfaceContext _Surface, float _AO ) {
+			// Standard ambient depending on normal orientation
+// 			float3	Ambient = _AO * lerp( $(env/ambient/low), $(env/ambient/high), saturate( 0.5 + 0.5 * _Surface.wsNormal.z ) );	// Single ambient global for all frame (This is equivalent to the computation that was done in the old version)
+			float3	Ambient = 0.0;	// bmayaux (2015-04-02) Ambient is now disabled!
+
+			float3 EnvironmentIrradiance = 0.0; 	// ARKANE: bmayaux (2013-10-30) Completely removed sky ambient! Only direct view of the sky will influence probes' ambient now... (as requested by D. Laurent)
+
+			// Let the SH compute the irradiance
+			#if !$buildingEnvironmentProbe
+
+				#if $twoSidedLighting
+					// Retrieve the original TBN vectors used by the vertex shader (BEFORE being reversed in the pixel context)
+					float3	wsOriginalVertexTangent = _Surface.frontFaceFactor * _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.frontFaceFactor * _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.frontFaceFactor * _Surface.wsVertexNormal;
+				#else
+					float3	wsOriginalVertexTangent = _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.wsVertexNormal;
+				#endif
+
+				// bmayaux (2015-02-11) Now using packed irradiance instead of SH coefficients
+//				EnvironmentIrradiance = EvaluateSHIrradiance( _Surface.wsNormal, _Surface.Irradiance, _AO );
+				EnvironmentIrradiance = UnPackSHPrincipalDirections( _Surface.wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+			#endif
+
+			return Ambient + EnvironmentIrradiance;
+		}
+
+		float3	AQ_ComputeAmbientLighting( SurfaceContext _Surface, float _AO ) {
+			// Standard ambient depending on normal orientation
+// 			float3	Ambient = lerp( $(env/ambient/low), $(env/ambient/high), saturate( 0.5 + 0.5 * _Surface.wsNormal.z ) );	// Single ambient global for all frame (This is equivalent to the computation that was done in the old version)
+// 					Ambient *= _AO;
+			float3	Ambient = 0.0;	// bmayaux (2015-04-02) Ambient is now disabled!
+
+			float3 EnvironmentIrradiance = 0.0; 	// ARKANE: bmayaux (2013-10-30) Completely removed sky ambient! Only direct view of the sky will influence probes' ambient now... (as requested by D. Laurent)
+
+			// Let the SH compute the irradiance
+			#if !$buildingEnvironmentProbe
+				#if $twoSidedLighting
+					// Retrieve the original TBN vectors used by the vertex shader (BEFORE being reversed in the pixel context)
+					float3	wsOriginalVertexTangent = _Surface.frontFaceFactor * _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.frontFaceFactor * _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.frontFaceFactor * _Surface.wsVertexNormal;
+				#else
+					float3	wsOriginalVertexTangent = _Surface.wsVertexTangent;
+					float3	wsOriginalVertexBiTangent = _Surface.wsVertexBiTangent;
+					float3	wsOriginalVertexNormal = _Surface.wsVertexNormal;
+				#endif
+
+				// bmayaux (2015-02-11) Now using packed irradiance instead of SH coefficients
+//				EnvironmentIrradiance = EvaluateSHIrradiance( _Surface.wsNormal, _Surface.Irradiance, _AO );
+				EnvironmentIrradiance = UnPackSHPrincipalDirections( _Surface.wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _Surface.Irradiance, _AO );
+			#endif
+
+			return Ambient + EnvironmentIrradiance;
+		}
+
+		float3	LQ_ComputeAmbientLighting( SurfaceContext _Surface, float _AO ) {
+			// Standard ambient depending on normal orientation
+// 			float3	Ambient = lerp( $(env/ambient/low), $(env/ambient/high), saturate( 0.5 + 0.5 * _Surface.wsNormal.z ) );	// Single ambient global for all frame (This is equivalent to the computation that was done in the old version)
+// 					Ambient *= _AO;
+			float3	Ambient = 0.0;	// bmayaux (2015-04-02) Ambient is now disabled!
+
+			#if $buildingEnvironmentProbe
+				if($alwaysOne) {
+					_Surface.coarseIL.xyz = 0.0;	// ARKANE: bmayaux (2013-10-30) Completely removed sky ambient! Only direct view of the sky will influence probes' ambient now... (as requested by D. Laurent)
+				}
+			#endif
+
+			return Ambient + _Surface.coarseIL;
+		}
+
+		float3	ComputeAmbientLighting( SurfaceContext _Surface, float _AO, const uint _quality ) {
+			float3	ambient;
+			switch ( _quality ) {
+				case HIGH_QUALITY: 		ambient = HQ_ComputeAmbientLighting( _Surface, _AO ); break;
+				case AVERAGE_QUALITY:	ambient = AQ_ComputeAmbientLighting( _Surface, _AO ); break;
+				case LOW_QUALITY:  		ambient = LQ_ComputeAmbientLighting( _Surface, _AO ); break;
+				default:				ambient = 0.0; break;
+			}
+
+			float3	Fdr = DiffuseFresnelReflectance_Ward( _Surface.IOR, _Surface.roughness );
+			return INVPI * _Surface.diffuseAlbedo * Fdr * ambient;
+		}
+
+
+		// =======================================================================
+		//   _    ___ ___ _  _ _____    ___ ___  _  _ _____ _____  _______ 
+		//  | |  |_ _/ __| || |_   _|  / __/ _ \| \| |_   _| __\ \/ /_   _|
+		//  | |__ | | (_ | __ | | |   | (_| (_) | .` | | | | _| >  <  | |  
+		//  |____|___\___|_||_| |_|    \___\___/|_|\_| |_| |___/_/\_\ |_|  
+		//
+		// =======================================================================
+		//
+		
+		struct LightNode
+		{
+			uint mLightIndex;
+			uint mNext;
+		};
+		
+		#define LC_INDEX_BITS		9
+		#define LC_NEXT_BITS			(32 - LC_INDEX_BITS)
+		#define LC_INDEX_MASK		((1 << LC_INDEX_BITS) - 1)
+		#define LC_END_OF_LIST		((1 << LC_NEXT_BITS) - 1)
+		
+		struct LightContext {
+			uint		m_currentLightIndex;
+			uint		m_lightsCount;
+			float3		m_wsPosition;
+
+			// Light contribution informations
+			float		m_attenuation;		// Combined radial and angular attenuations
+			float		m_shadow;
+			#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+			float		m_shadowCasterZ;	// Gives the depth of the shadow caster
+			float		m_shadowReceiverZ;	// Gives the depth of the current position in shadow map space
+			#endif
+			float		m_scatter;
+			//
+			float		m_distance2Light;
+			float		m_invDistance2Light;
+			float3		m_wsToLight;		// Position => Light (normalized)
+
+			// Shadow information (if available)
+			bool		m_castsShadow;
+			uint		m_ShadowSetup;
+			$(tlf/shadow_t)	m_shadowInfo;
+
+			// current light data
+			float3		m_wsLightPos;
+			float		m_RadiusFalloff;
+			float		m_RadiusCutoff;
+			float3		m_color;
+			float		m_Decay;
+			float3		m_SpotDir;
+			float		m_SpecularAttn;
+			float		m_ScatterValue;
+			float		m_ScatterScale;
+			float		m_ScatterOffset;
+			float		m_ScatterTurbulence;
+			float		m_originOffset;
+			float3		m_SpotParms;
+			float3		m_AreaLightX;		// bmayaux (2015-01-19) Area light normalized X axis
+			uint		m_AreaLightSlice;	// bmayaux (2015-01-19) Area light slice index in the texture array of area lights
+
+			// current light flags
+			bool		m_isDirectionalLight;
+			bool		m_useVolumetricShadow;
+			bool		m_scatterCustomShape;
+			bool		m_scatter2ndTurbulence;
+			bool		m_spotShadowSplitted;
+
+			//////////////////////////////////////////////////////////////
+			// Methods
+
+			// Ben: Break down the light data fetching in several pieces
+			bool NextLightData( const uint _MaxLights) {
+				return !( m_currentLightIndex == LC_END_OF_LIST || m_lightsCount >= _MaxLights );
+			}
+
+			// Ben: Get the *scalar* light index and return the mask i.e. the threads
+			// currently using this index. We update the light count and the index
+			// just for those guys
+			bool LightIndex(out int lightIndex) {
+				$(tlf/ll/node_t) nodePacked = $(tlf/ll/pool)[m_currentLightIndex];
+				
+				LightNode node;
+				node.mLightIndex = nodePacked.pack & LC_INDEX_MASK;
+				node.mNext = nodePacked.pack >> LC_INDEX_BITS;
+				
+			#ifdef ORBIS
+				// Ben: here I use readfirstlane. If you have (kind-of, it does not have
+				// to be fully sorted) sorted index, then it will be much better to take
+				// the minimum accross the lanes if you have increasing order or the max
+				// if you have decreasing order. This will give you way more coherency
+				// and SIMD occupancy
+				#if 1
+					lightIndex =  __v_readfirstlane_b32(node.mLightIndex);
+					// mcunzi: from http://developer.amd.com/wordpress/media/2012/12/AMD_Southern_Islands_Instruction_Set_Architecture.pdf
+					//	V_READFIRSTLANE_B32: copy one VGPR value to one SGPR. Dst = SGPRdest,
+					//	Src0 = Source Data (VGPR# or M0(lds-direct)), Lane# =
+					//	FindFirst1fromLSB(exec) (lane = 0 if exec is zero). Ignores exec mask.
+				#elif 0 // increasing order
+					AtomicOr(g_index, 0xffffffffu);
+					AtomicMin(g_index, node.mLightIndex);
+					lightIndex = g_index;
+				#elif 0 // decreasing order
+					AtomicAnd(g_index, 0x0u);
+					AtomicMax(g_index, node.mLightIndex);
+					lightIndex = g_index;
+				#endif
+			#elif DURANGO
+				lightIndex = __XB_MakeUniform(node.mLightIndex);
+				// mcunzi: from XDK DOC : 		type __XB_MakeUniform(type)
+				//An intrinsic to promote values from being wave variant to wave invariant. This information is propagated to allow operations and expressions to be evaluated on scalar units instead of vector units.
+				//The performance of the shader compiler benefits if you mark scalar values with the __XB_MakeUniform intrinsic. Vector to scalar promotion optimization is on by default. However, if you need to disable this feature, use the fxc define /D __XBOX_DISABLE_V_TO_S.
+			#else
+				lightIndex = node.mLightIndex;
+			#endif
+
+			#if( defined ORBIS || defined DURANGO )
+				if ((uint)lightIndex == node.mLightIndex) {
+			#endif	
+					m_currentLightIndex = node.mNext;
+					m_lightsCount++;
+					return true;
+			#if( defined ORBIS || defined DURANGO )
+				} else {
+					return false;
+				}
+			#endif
+			}
+
+			// Ben: Fetch the light properties. All loads will be scalar
+			void FetchLightData(int lightIndex) {
+				$(tlf/light_t)		light  = $(tlf/lights)[lightIndex];
+				m_wsLightPos = light.mWorldPosition;
+				m_RadiusFalloff = light.mRadiusFalloff;
+				m_RadiusCutoff = light.mRadiusCutoff;
+				m_color = light.mColor;
+				m_Decay = light.mDecay;
+				m_SpotDir = light.mSpotDir;
+				m_SpotParms = light.mSpotParms;
+				m_AreaLightX = light.mAreaLightX;
+				m_AreaLightSlice = AREA_LIGHT_SLICE( light.mFlags );
+
+				m_castsShadow = false;
+				m_ShadowSetup = light.mShadowSetup;
+
+				uint	LightType = LIGHT_TYPE( light.mFlags );
+				m_isDirectionalLight = false;
+
+				m_spotShadowSplitted = LIGHT_SPOT_SHADOW_SPLITTED( light.mFlags );
+				
+				// initialize computed parameters
+				m_attenuation = 1.0;
+				m_shadow = 1.0;
+				#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+				m_shadowCasterZ = 1e8;
+				m_shadowReceiverZ = 0.0;
+				#endif
+				
+				//light-scattering
+				m_scatter = 0.0;
+				m_SpecularAttn = light.mSpecularAttn;
+				m_ScatterValue = light.mScatterValue;
+				m_ScatterScale = light.mScatterScale;
+				m_ScatterOffset = light.mScatterOffset;
+				m_ScatterTurbulence = light.mScatterTurbulence;
+				m_originOffset = light.mOriginOffset;
+				m_useVolumetricShadow = LIGHT_SCATTER_VOLUMETRIC_SHADOW(light.mFlags);
+				m_scatterCustomShape = LIGHT_SCATTER_CUSTOM_SHAPE(light.mFlags);
+				m_scatter2ndTurbulence = LIGHT_SCATTER_TURBULENCE(light.mFlags);
+
+				// Compute world light vector (pointing TOWARD the light)
+				m_wsToLight = light.mWorldPosition - m_wsPosition;
+				m_distance2Light = length( m_wsToLight );
+				m_invDistance2Light = 1.0 / m_distance2Light;
+				m_wsToLight *= m_invDistance2Light;
+			}
+			
+			// Computes the angular and distance attenuations
+			void ComputeAttenuation( const uint _lightType ) {
+				// Compute radial attenuation
+				m_attenuation = square( lerp( 1.0, m_invDistance2Light, m_Decay ) );				// Attenuation is 1/r² - ARKANE: bmayaux (2013-12-04) Decay now can be removed for special "fill in" lights
+				m_attenuation *= smoothstep( m_RadiusCutoff, m_RadiusFalloff, m_distance2Light );	// Now with forced cutoff smoothed out like this (so we keep the physically correct 1/r² but can nonetheless artificially attenuate early)
+			
+				if ( _lightType == LIGHT_TYPE_SPOT ) {
+					// Compute angular attenuation
+					float angularAttenuation = 1.0 - saturate( dot( m_wsToLight, m_SpotDir ) * m_SpotParms.x + m_SpotParms.y );
+					m_attenuation *= angularAttenuation;
+
+				} else if ( _lightType == LIGHT_TYPE_HALF_POINT ) {
+					float a = dot( m_wsToLight, -m_SpotDir );
+					if ( a <= 0.0 ) { 
+						m_attenuation = 0.0; // we joined the dark side of the force...the half-force....I mean the half point.
+					} else {
+						float angularAttenuation = 1.0 - saturate( a * m_SpotParms.x + m_SpotParms.y ); // light side, angular attenuation similar to spot
+						m_attenuation *= angularAttenuation;
+					}
+				}
+			}
+
+			// Computes shadowing of the surface's pixel
+			void ComputeShadow( SurfaceContext _Surface, const int _quality, const uint _lightType ) {
+
+				if ( m_ShadowSetup != 0xFFFFFFFF ) {
+					bool	queryShadowMap = m_attenuation > 0.0 || m_ScatterValue > 0.0;
+					if ( _lightType == LIGHT_TYPE_POINT || _lightType == LIGHT_TYPE_HALF_POINT ) {
+						uint shadowIndex = m_ShadowSetup + OmniShadowMapSliceOffset( m_wsToLight );
+						m_shadowInfo = $(tlf/shadows)[ shadowIndex ];
+						#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+							float2	Unproject = ShadowComputeUnprojectionParms( 0.1, m_RadiusCutoff );	// 0.1 is the hardcoded Znear used to build shadow projection matrices
+							float3	Shadow = queryShadowMap ? SampleOmniShadowMap( m_shadowInfo, _Surface.wsPositionHacked, _Surface.wsNormal, m_wsToLight, Unproject, _quality ) : 0.0;
+							m_shadow = Shadow.x;
+							m_shadowCasterZ = Shadow.y;
+							m_shadowReceiverZ = Shadow.z;
+						#else
+							m_shadow = queryShadowMap ? SampleOmniShadowMap( m_shadowInfo, _Surface.wsPositionHacked, _Surface.wsNormal, m_wsToLight, _quality ) : 0.0;
+						#endif
+					}
+					else {
+						uint shadowIndex = m_ShadowSetup + ( m_spotShadowSplitted ? SpotShadowMapSliceOffset( m_wsToLight, m_AreaLightX ) : 0 ); //nb: m_AreaLightX, is left axis with spots
+						m_shadowInfo = $(tlf/shadows)[ shadowIndex ];
+						#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+							float2	Unproject = ShadowComputeUnprojectionParms( 0.1, m_RadiusCutoff );	// 0.1 is the hardcoded Znear used to build shadow projection matrices
+							float3	Shadow = queryShadowMap ? SampleSpotShadowMap( m_shadowInfo, _Surface.wsPositionHacked, _Surface.wsNormal, m_SpotDir, Unproject, _quality ) : 0.0;
+							m_shadow = Shadow.x;
+							m_shadowCasterZ = Shadow.y;
+							m_shadowReceiverZ = Shadow.z;
+						#else
+							m_shadow = queryShadowMap ? SampleSpotShadowMap( m_shadowInfo, _Surface.wsPositionHacked, _Surface.wsNormal, m_SpotDir, _quality ) : 0.0;
+						#endif
+					}
+
+					m_castsShadow = true;
+				} else {
+					// Initialize shadow info to a default value
+					m_shadowInfo.mShadowToWorldMat = float4x4(	0, 0, 0, 0,
+																0, 0, 0, 0,
+																0, 0, 0, 0,
+																0, 0, 0, 1 );
+					m_shadowInfo.mWorldToShadowMat = float4x4(	0, 0, 0, 0,
+																0, 0, 0, 0,
+																0, 0, 0, 0,
+																0, 0, 0, 1 );
+					m_shadowInfo.mInfo = 0U;
+				}
+
+				#if $useSelfShadowedBumpMap && !TRANSLUCENCY_2SIDED
+					// Compute directional attenuation due to self-shadowing
+					m_shadow *= ComputeDirectionalOcclusion( m_wsToLight, _Surface.AO.yzw, _Surface.AO.x, _Surface.wsHL2Basis_R, _Surface.wsHL2Basis_G, _Surface.wsHL2Basis_B, _Surface.wsHL2Basis_N );
+				#endif
+			}
+
+		};
+
+		LightContext	CreateLightContext( float3 _wsPosition, uint2 _pixelAddr, const uint _lightType ) {
+			LightContext	context = (LightContext) 0;
+
+			context.m_currentLightIndex = $(tlf/ll/heads)[ (_pixelAddr >> $(tlf/tileDimForLighting).xx) + _lightType*uint2( $(tlf/invTileDimensions).z, 0 ) ] ;	// Read entry index from the linked list for the specified light type (1 linked list per type)
+			context.m_lightsCount = 0;
+			context.m_wsPosition = _wsPosition;
+
+			return context;
+		}
+
+		LightContext	CreateLightContext( SurfaceContext _Surface, const uint _lightType ) {
+			return CreateLightContext( _Surface.wsPosition, _Surface.pixelIndex, _lightType );
+		}
+
+		// =======================================================================
+		//  _    ___ ___ _  _ _____ ___ _  _  ___   ___ ___ ___ _   _ _  _____
+		// | |  |_ _/ __| || |_   _|_ _| \| |/ __| | _ \ __/ __| | | | ||_   _|
+		// | |__ | | (_ | __ | | |  | || .` | (_ | |   / _|\__ \ |_| | |__| |
+		// |____|___\___|_||_| |_| |___|_|\_|\___| |_|_\___|___/\___/|____|_|
+		//
+		// =======================================================================
+		struct	ComputeLightingResult {
+			float3		accumDiffuse;
+			float3		accumSpecular;
+			float3		accumAmbient;
+			float3		accumEmissive;
+			float4		accumScattering;
+			float3		finalizedColor;
+			float		directionalShadowTerm;
+
+			void Clear() {
+				accumDiffuse = 0.0;
+				accumSpecular = 0.0;
+				accumAmbient = 0.0;
+				accumEmissive = 0.0;
+				accumScattering = 0.0;
+				finalizedColor = 0.0;
+				directionalShadowTerm = 1.0;
+			}
+
+			void Finalize() {
+				#if $whaleOilEmissivePATCH
+					$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+					accumEmissive /= Adaptation.EngineLuminanceFactor;
+				#endif
+
+				finalizedColor = accumDiffuse + accumSpecular + accumAmbient + accumEmissive;
+
+				// bmayaux (2016-07-25) Avoid infinites by clamping to max 16 bits float value: 65503
+				finalizedColor = min( 65000.0, finalizedColor );
+			}
+
+		};
+
+		#endif // LIGHT_CONTEXT_INCLUDED
+	}
+}

@@ -1,0 +1,396 @@
+{
+	newstyle
+	hlsl_prefix {
+	
+		static const int	DEFAULT_IBL_CUBE_MAP_SIZE_POT = 8;	// WARNING: Should always equal to the power of two of the DEFAULT_IBL_CUBE_MAP_SIZE defined in arkEnvProbe.h!
+
+		static const uint	CUBE_MAPS_ARRAY_SIZE = 16;			// Size of the dynamic cube maps array (WARNING: Must correspond to the value defined in arkEnvironmentProbesNetwork.h!)
+																// Also, make sure the default value for the render parm "IBL/cubeMapIndex" declared above is always CUBE_MAPS_ARRAY_SIZE-1
+
+		#include <helper>
+		#include <fresnel>
+		#if $useSelfShadowedBumpMap
+			#include <parallaxSelfShadow>
+		#endif
+
+		// Pre-declare this function, later declared by the BRDF
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness );
+
+		// Unpacks a packed-plane float2 into a regular float4 (Normal + Distance)
+		void	UnPackVirtualPlane( float2 _packedPlane, out float3 _normal, out float _orthoDistance ) {
+			// The first float encodes the normal.
+			// It must be read as an uint then both WORDs encode a half-float
+			uint	packedNormal = asuint( _packedPlane.x );
+
+			#if 1	// bmayaux (2016-10-05) Don't use costly tetrahedron unpacking
+				// SIMPLE XYZ PACKING
+				_normal.x = (packedNormal & 0xFFU) / 127.0 - 1.0;
+				_normal.y = ((packedNormal >> 8U) & 0xFFU) / 127.0 - 1.0;
+				_normal.z = ((packedNormal >> 16U) & 0xFFU) / 127.0 - 1.0;
+			#else
+				// OCTAHEDRON PACKING
+				float2	p = (1.0 /  16384.0) * unpack2_f16tof32( packedNormal );	// The division is here to retrieve the [-1,1] value because we multiplied by 16384 on the CPU to use the exponent's bits
+				_normal = OctahedronUnpack( p );									// Then, we unpack the normal that was packed using tetrahedron mapping
+			#endif
+
+			// Ortho distance is given unpacked
+			_orthoDistance = _packedPlane.y;
+		}
+
+		float GetHitDistance( float2 _packedPlane, float3 _lsPosition, float3 _wsDirection ) {
+			// bmayaux (2016-08-16) Use packed virtual planes
+			float3	N;
+			float	orthoDist;
+			UnPackVirtualPlane( _packedPlane, N, orthoDist );
+
+// 			float3	P = -orthoDist * N;																// Plane position
+// 			float	distFromPlane = dot( _lsPosition - P, N );										// Ortho distance of start position from plane
+			float	distFromPlane = dot( _lsPosition, N ) + orthoDist;								// Ortho distance of start position from plane
+
+// 			float	t = -distFromPlane / dot( _wsDirection, N );									// Hit distance (at this point, can be negative)
+// 					t = lerp( t, 1e6, saturate( step( distFromPlane, 0.0 ) + step( t, 0.0  ) ) );	// Reject hit to infinity if we're standing below the plane or we don't hit it (i.e. backward hit)
+
+			float	t = -abs( distFromPlane ) / dot( _wsDirection, N );								// Hit distance. The abs() helps to not reject possible hits when the start position is below the plane in certain cases otherwise some planes show as hard cuts and we don't want that!
+					t = t > 0.0 ? t : 1e6;															// Reject hit to infinity if we're having a backward hit
+					
+			return t;
+		}
+
+		// Computes the intersection of the provided ray (position, direction) with the virtual planes of the cube map
+		float3	ComputeVirtualHitPosition( float3 _wsPosition, float3 _wsDirection, uint _cubeMapIndex, out float3 _wsProbePosition ) {
+			$(IBL/virtualPlanes_t)	planes = $(IBL/bufferProbeVirtualPlanes)[_cubeMapIndex];
+
+			_wsProbePosition = planes.position;
+			float3	lsPosition = _wsPosition - _wsProbePosition;	// Now relative to the probe's position
+
+			// The probe's planes are given as float4 where XYZ=Normal direction and W is the distance of the plane from the probe along the normal
+			float HitDistance = GetHitDistance(planes.plane01.xy, lsPosition, _wsDirection);
+
+			float d = GetHitDistance(planes.plane01.zw, lsPosition, _wsDirection);
+			HitDistance = min( HitDistance, d );
+
+			d = GetHitDistance(planes.plane23.xy, lsPosition, _wsDirection);
+			HitDistance = min( HitDistance, d );
+
+			d = GetHitDistance(planes.plane23.zw, lsPosition, _wsDirection);
+			HitDistance = min( HitDistance, d );
+
+			d = GetHitDistance(planes.plane45.xy, lsPosition, _wsDirection);
+			HitDistance = min( HitDistance, d );
+
+			d = GetHitDistance(planes.plane45.zw, lsPosition, _wsDirection);
+			HitDistance = min( HitDistance, d );
+
+			// Return world space intersection
+			return _wsPosition + HitDistance * _wsDirection;
+		}
+
+		// Computes the luminance factor based on the ratio of distances
+		// The idea is shown in the figure below:
+		//		 
+		//			 |\
+		//			 |  \
+		//	emissive |    \
+		//	wall	 X--d---* probe
+		//			 |   ./..
+		//			 |  /     ..D.
+		//			 |/            ....
+		//			                    ....
+		//				                      ...P
+		//		 
+		// After computing the intersection of the ray starting from P with the virtual scene we find the intersection X
+		// The probe shot a large portion of the emissive wall from its position and saw pixel at X from a distance "d".
+		// Now, P sees pixels at X from a much larger distance "D".
+		// The solid angle covering the emissive wall as if the probe was shot from P would be much lower and thus the
+		//	luminance would be much lower too so the idea is to approximate the increase or decrease of energy based on
+		//	the ratio of distances d / D.
+		//
+		// We simply assume a square factor as solid angles grow with the square of the distance...
+		//
+		float	ComputeLuminanceFactor( float3 _wsStartPosition, float3 _wsProbePosition, float3 _wsHitPosition ) {
+			float	Distance2Probe = length( _wsHitPosition - _wsProbePosition );
+			float	Distance2Start = length( _wsHitPosition - _wsStartPosition );
+			float	LuminanceFactor = Distance2Probe / (1e-3 + Distance2Start);
+					LuminanceFactor *= LuminanceFactor;		// Squared to account for the usual 1/r² 
+			return min( 2.0, LuminanceFactor );				// In case of points much closer, don't increase more than twice initial luminance
+		}
+
+		// Returns the sampling direction for the cube map to view the intersection of the ray with the virtual scene
+		float3	ComputeVirtualHitDirection( float3 _wsPosition, float3 _wsDirection, uint _cubeMapIndex, out float _LuminanceFactor ) {
+			float3	wsProbePosition;
+			float3	wsHitPosition = ComputeVirtualHitPosition( _wsPosition, _wsDirection, _cubeMapIndex, wsProbePosition );
+
+			_LuminanceFactor = ComputeLuminanceFactor( _wsPosition, wsProbePosition, wsHitPosition );
+
+			return normalize( wsHitPosition - wsProbePosition );
+		}
+
+		// Returns the 3 sampling directions for the 3 cube maps and the 3 luminance factors for each of them
+		// Only 1 virtual scene intersection is performed using the virtual planes from the first cube map
+		void	ComputeVirtualHitDirection( float3 _wsPosition, float3 _wsDirection, uint _cubeMapIndex0, uint _cubeMapIndex1, uint _cubeMapIndex2, out float3 _wsDirection0, out float3 _wsDirection1, out float3 _wsDirection2, out float3 _LuminanceFactor ) {
+			float3	wsProbePosition0;
+			float3	wsHitPosition = ComputeVirtualHitPosition( _wsPosition, _wsDirection, _cubeMapIndex0, wsProbePosition0 );
+			_wsDirection1 = _wsDirection2 = _wsDirection0 = normalize( wsHitPosition - wsProbePosition0 );
+			_LuminanceFactor = ComputeLuminanceFactor( _wsPosition, wsProbePosition0, wsHitPosition );
+
+			if ( _cubeMapIndex1 != _cubeMapIndex0 || _cubeMapIndex2 != _cubeMapIndex0 ) {
+				float3	wsProbePosition1 = $(IBL/bufferProbeVirtualPlanes)[_cubeMapIndex1].position;
+				float3	wsProbePosition2 = $(IBL/bufferProbeVirtualPlanes)[_cubeMapIndex2].position;
+
+				_wsDirection1 = normalize( wsHitPosition - wsProbePosition1 );
+				_wsDirection2 = normalize( wsHitPosition - wsProbePosition2 );
+
+				_LuminanceFactor.y = ComputeLuminanceFactor( _wsPosition, wsProbePosition1, wsHitPosition );
+				_LuminanceFactor.z = ComputeLuminanceFactor( _wsPosition, wsProbePosition2, wsHitPosition );
+			}
+		}
+
+		float3	SampleCubeMap( float3 _Direction, float _MipIndex, uint _CubeMapIndex ) {
+			//float3 shiftedDir = bpcem( _Direction, EnvBoxMax, EnvBoxMin, EnvBoxPos, _CubeMapIndex.y );			
+			return $(IBL/texCubeMapArray).SampleLevel( $iblSampler, float4( _Direction, _CubeMapIndex ), _MipIndex ).xyz;
+		}
+		
+		// Computes the irradiance due to lighting by the environment
+		//	_Roughness, the average ward roughness of the surface in [0,1]
+		//	_LODBias, use the LOD bias to modify the smoothness of the IBL cube map (should be a clever formula depending on the pixel's distance and average glossiness (i.e. widening of the BRDF specular lobe))
+		float3	HQ_ComputeIBL( SurfaceContext _Surface, float _Roughness, float _LODBias=0.0 ) {
+			//	wsNormal, the normalized normal vector in world space
+			//	wsView, the normalized view vector in world space
+			//	IOR, the surface's index of refraction for R,G,B wavelength
+			//
+			float3	wsNormal = _Surface.wsNormal;
+			float3	wsView = _Surface.wsView;
+			float3	IOR = _Surface.IOR;
+
+			float	m = _Roughness;
+
+			// Interpolate sampling direction based on roughness
+			float3	ReflectedView = reflect( -wsView, wsNormal );						// Perfect specular reflection
+			float3	wsLight = normalize( lerp( ReflectedView, wsNormal, m ) );			// When roughness is almost diffuse, the sampling direction becomes the normal direction
+
+			float3	Half = normalize( wsView + wsLight );
+
+			float	LdotN = saturate( dot( wsLight, wsNormal ) );
+			float	VdotN = saturate( dot( wsView, wsNormal ) );
+			float	LdotH = dot( wsLight, Half );
+
+			// Retrieve lobe aperture angle from roughness (based on a least square fitting) then map to a specific mip
+			float	LobeApertureAngle = 0.0003474660443456835 + m * (1.3331290497744692 - m * 0.5040552688878546);
+			float	AlphaNorm = LobeApertureAngle / 0.834;								// 0.834 radians = 48° is the maximum lobe angle we encoded in the mips
+			float	MipLevel = (DEFAULT_IBL_CUBE_MAP_SIZE_POT-2) * sqrt( AlphaNorm );	// Lobe aperture was stored squared, hence the sqrt() here
+					MipLevel += _LODBias;
+
+			// Read back ward-lobe-convolved value
+			// glossy specular lobe in the direction of the reflection
+			#if $useMultiInstancing || $(tool/usePerVertexSH)
+				float	LuminanceFactor;
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
+				_Surface.IBLCubeMapIndex = max( uint3( 0, 0, 0 ), _Surface.IBLCubeMapIndex );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+					
+				if ( _Surface.IBLCubeMapIndex.y != _Surface.IBLCubeMapIndex.x || _Surface.IBLCubeMapIndex.z != _Surface.IBLCubeMapIndex.x ) {
+					Radiance_specular *= _Surface.barycentric.x;
+						
+					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.y, LuminanceFactor );
+					Radiance_specular += _Surface.barycentric.y * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.y );
+
+					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.z, LuminanceFactor );
+					Radiance_specular += _Surface.barycentric.z * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.z );
+				}
+			#else
+				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
+				float	LuminanceFactor;
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );	
+			#endif
+
+			#if $useSelfShadowedBumpMap
+				// Compute directional occlusion to apply to specular radiance
+				float	Occlusion = ComputeDirectionalOcclusion( wsLight, _Surface.AO.yzw, _Surface.AO.x, _Surface.wsHL2Basis_R, _Surface.wsHL2Basis_G, _Surface.wsHL2Basis_B, _Surface.wsHL2Basis_N );
+				Radiance_specular *= Occlusion;
+			#endif
+
+			// bmayaux (2016-05-30) Make the IBL luminance factor tend to 1 when the surface is strongly metallic (i.e. F0 => 1)
+			float3	F0 = Fresnel_F0FromIOR( _Surface.IOR );
+			float	IBLLuminanceFactor = lerp( _Surface.IBLLuminanceFactor, 1.0, dot( float3( 0.2126, 0.7152, 0.0722 ), F0 ) );
+
+			// ARKANE: bmayaux (2014-10-31) SH Probes now provide the bounce factor that should also apply to IBL cube maps
+			Radiance_specular *= IBLLuminanceFactor;
+
+			#if 1		// bmayaux (2015-01-26) Use the pre-integrated BRDF to scale/bias the irradiance...
+				float2	PreIntegratedBRDF = FetchPreIntegratedBRDF( VdotN, _Roughness );
+				return Radiance_specular * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y * (1.0 - _Roughness*_Roughness));	// *(1-r²) => Remove ambient term when totally rough
+
+			#else	// Formerly...
+				// Weight specular radiance, at least by 1/PI to fit ward model a little...
+//				Radiance_specular *= INVPI * LdotN;			// Too much attenuation
+//				Radiance_specular *= INVPI;					// Marmoset doesn't even bother...
+//				Radiance_specular *= INVPI * sqrt( LdotN );	// ok...
+				Radiance_specular *= sqrt( LdotN );			// ok... (1/PI already carried out in albedo)
+
+				return FresnelAccurate( IOR, VdotN, _Surface.fresnelStrength ) * Radiance_specular;
+			#endif
+		}
+		
+		float3	AQ_ComputeIBL( SurfaceContext _Surface, float _Roughness, float _LODBias=0.0 ) {
+			//	wsNormal, the normalized normal vector in world space
+			//	wsView, the normalized view vector in world space
+			//	IOR, the surface's index of refraction for R,G,B wavelength
+			//
+			float3	wsNormal = _Surface.wsNormal;
+			float3	wsView = _Surface.wsView;
+			float3	IOR = _Surface.IOR;
+
+			float	m = _Roughness;
+
+			// Interpolate sampling direction based on roughness
+			float3	ReflectedView = reflect( -wsView, wsNormal );						// Perfect specular reflection
+			float3	wsLight = normalize( lerp( ReflectedView, wsNormal, m ) );			// When roughness is almost diffuse, the sampling direction becomes the normal direction
+			float3	Half = normalize( wsView + wsLight );
+
+			float	LdotN = saturate( dot( wsLight, wsNormal ) );
+			float	VdotN = saturate( dot( wsView, wsNormal ) );
+			float	LdotH = dot( wsLight, Half );
+
+			// Retrieve lobe aperture angle from roughness (based on a least square fitting) then map to a specific mip
+			float	LobeApertureAngle = 0.0003474660443456835 + m * (1.3331290497744692 - m * 0.5040552688878546);
+			float	AlphaNorm = LobeApertureAngle / 0.834;								// 0.834 radians = 48° is the maximum lobe angle we encoded in the mips
+			float	MipLevel = (DEFAULT_IBL_CUBE_MAP_SIZE_POT-2) * sqrt( AlphaNorm );	// Lobe aperture was stored squared, hence the sqrt() here
+					MipLevel += _LODBias;
+
+			// Read back ward-lobe-convolved value
+			// glossy specular lobe in the direction of the reflection
+			#if 1 // Use virtual planes to compute the intersection of the reflected view and determine parallax-corrected sampling directions
+				float	LuminanceFactor;
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
+				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+			#else // Use light direction only, no parallax correction
+				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
+				float3	Radiance_specular = SampleCubeMap( wsLight, MipLevel, _Surface.IBLCubeMapIndex.x );
+			#endif
+
+			Radiance_specular *= sqrt( LdotN );
+
+			#if $useSelfShadowedBumpMap
+				// Compute directional occlusion to apply to specular radiance
+				float	Occlusion = ComputeDirectionalOcclusion( wsLight, _Surface.AO.yzw, _Surface.AO.x, _Surface.wsHL2Basis_R, _Surface.wsHL2Basis_G, _Surface.wsHL2Basis_B, _Surface.wsHL2Basis_N );
+				Radiance_specular *= Occlusion;
+			#endif
+
+			// bmayaux (2016-05-30) Make the IBL luminance factor tend to 1 when the surface is strongly metallic (i.e. F0 => 1)
+			float	F0 = Fresnel_F0FromIOR( dot( float3( 0.2126, 0.7152, 0.0722 ), _Surface.IOR ) );
+			float	IBLLuminanceFactor = lerp( _Surface.IBLLuminanceFactor, 1.0, F0 );
+
+			// ARKANE: bmayaux (2014-10-31) SH Probes now provide the bounce factor that should also apply to IBL cube maps
+			Radiance_specular *= IBLLuminanceFactor;
+
+			return FresnelAccurate( IOR, VdotN, _Surface.fresnelStrength ) * Radiance_specular;
+		}		
+		
+		float3	LQ_ComputeIBL( SurfaceContext _Surface, float _Roughness, float _LODBias=0.0 )	{
+			//	wsNormal, the normalized normal vector in world space
+			//	wsView, the normalized view vector in world space
+			//	IOR, the surface's index of refraction for R,G,B wavelength
+			//
+			float3	wsNormal = _Surface.wsNormal;
+			float3	wsView = _Surface.wsView;
+			float3	IOR = _Surface.IOR;
+
+			float	m = _Roughness;
+
+			// Interpolate sampling direction based on roughness
+			float3	ReflectedView = reflect( -wsView, wsNormal );						// Perfect specular reflection
+			float3	wsLight = normalize( lerp( ReflectedView, wsNormal, m ) );			// When roughness is almost diffuse, the sampling direction becomes the normal direction
+			float3	Half = normalize( wsView + wsLight );
+
+			float	LdotN = saturate( dot( wsLight, wsNormal ) );
+			float	VdotN = saturate( dot( wsView, wsNormal ) );
+			float	LdotH = dot( wsLight, Half );
+
+			// Retrieve lobe aperture angle from roughness (based on a least square fitting) then map to a specific mip
+			float	LobeApertureAngle = 0.0003474660443456835 + m * (1.3331290497744692 - m * 0.5040552688878546);
+			float	AlphaNorm = LobeApertureAngle / 0.834;								// 0.834 radians = 48° is the maximum lobe angle we encoded in the mips
+			float	MipLevel = (DEFAULT_IBL_CUBE_MAP_SIZE_POT-2) * sqrt( AlphaNorm );	// Lobe aperture was stored squared, hence the sqrt() here
+					MipLevel += _LODBias;
+
+			// Read back ward-lobe-convolved value
+			// glossy specular lobe in the direction of the reflection
+			#if 1 // Use virtual planes to compute the intersection of the reflected view and determine parallax-corrected sampling directions
+				float	LuminanceFactor;
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
+				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+			#else // Use light direction only, no parallax correction
+				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
+				float3	Radiance_specular = SampleCubeMap( wsLight, MipLevel, _Surface.IBLCubeMapIndex.x );
+			#endif
+
+			Radiance_specular *= sqrt( LdotN );			// ok... (1/PI already carried out in albedo)
+
+			// bmayaux (2016-05-30) Make the IBL luminance factor tend to 1 when the surface is strongly metallic (i.e. F0 => 1)
+			float	F0 = Fresnel_F0FromIOR( dot( float3( 0.2126, 0.7152, 0.0722 ), _Surface.IOR ) );
+			float	IBLLuminanceFactor = lerp( _Surface.IBLLuminanceFactor, 1.0, F0 );
+
+			// ARKANE: bmayaux (2014-10-31) SH Probes now provide the bounce factor that should also apply to IBL cube maps
+			Radiance_specular *= IBLLuminanceFactor;
+
+			return FresnelAccurate( IOR, VdotN, _Surface.fresnelStrength ) * Radiance_specular;
+		}	
+
+		// bmayaux (2015-06-12) Computes the roughness bias to apply to cube map sampling depending on camera distance to pixel and the incident angle on the surface
+		// This operation helps to reduce specular aliasing a depending on distance and orientation of the surface.
+		//
+		// We compute the area covered by a single pixel viewing the current surface:
+		//
+		//	Area = (Distance * 2.0 * tan(FOV/2)/H)² / (N.V)
+		// 
+		// Afterward, we use the area as an exponent for the roughness:
+		//
+		//	Roughness' = 1 - (1 - Roughness)^f(Area)
+		// 
+		// We use the empirical equation:
+		//
+		//	f(Area) = lerp( MinExponent, MaxExponent, smoothstep( MinArea, MaxArea, Area ) )
+		// 
+		// 
+		float	ComputeFilteredIBLRoughness( SurfaceContext _Surface, float _Roughness ) {
+
+			float	PixelLength = _Surface.distance;	// L = Distance * tan(FOV/2) / H gives the size in meter of a single pixel (H is the vertical screen resolution)
+			float	PixelArea = pow( PixelLength, $(IBL/parms0).x );
+//			float	Projection = 1.0 - pow( saturate( 1.0 - dot( _Surface.wsVertexNormal, _Surface.wsView ) ), $(IBL/parms0).y );
+			float	Projection = pow( saturate( dot( _Surface.wsVertexNormal, _Surface.wsView ) ), $(IBL/parms0).y );
+					PixelArea /= max( 1e-3, Projection );				// Area estimate of the slanted surface
+
+			float	Exponent = lerp( $(IBL/parms1).x, $(IBL/parms1).y, smoothstep( $(IBL/parms1).z, $(IBL/parms1).w, PixelArea ) );
+
+			_Roughness = 1.0 - pow( saturate( 1.0 - _Roughness ), Exponent );
+
+			return _Roughness;
+		}
+
+		float3	ComputeIBL( SurfaceContext _Surface, const uint _quality ) {
+
+			float	Roughness = _Surface.roughness;
+					Roughness *= Roughness;	// Tweak roughness so the user feels it's a linear parameter (cf. ward.mrpr)
+
+			// bmayaux (2015-06-12) Filter roughness to reduce specular aliasing
+			// bmayaux (2015-06-17) Up until now, I didn't manage to make that simple linear interpolation work correctly as it reduces glossiness
+			//	for no apparent reason whereas the object is clearly not standing in the interpolation range...
+			// Disabled until further notice!
+//			Roughness = ComputeFilteredIBLRoughness( _Surface, Roughness );
+
+			float3	result;
+			switch ( _quality ) {
+				case HIGH_QUALITY: 		result = HQ_ComputeIBL( _Surface, Roughness ); break;
+				case AVERAGE_QUALITY:	result = AQ_ComputeIBL( _Surface, Roughness ); break;
+				case LOW_QUALITY:  		result = LQ_ComputeIBL( _Surface, Roughness ); break;
+				default:				result = 0.0; break;
+			}
+			return result;
+		}
+
+		// ARKANE_END: bmayaux (2013-11-26)
+		///////////////////////////////////////////////////////////////////////////////////////////////
+	}
+}

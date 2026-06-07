@@ -1,0 +1,37 @@
+{ newstyle
+	parms {
+		stageSort	sortPostTonemap
+	}
+	state {
+		blendOp	ADD
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		alphaBlendOp	ADD
+		alphaBlend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthfunc	ALWAYS
+		depthEnable	0
+	}
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+	}	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+		@wsNormal = vout.m_wsNormal;
+		@wsPosition = vout._worldPosition;
+	}
+	hlsl_fp_main {
+
+		float3 viewDir = normalize( $wsCamPos - $wsPosition );
+		float fakeLighting = saturate( 0.25 + abs( dot( $wsNormal, viewDir ) ) );
+
+		float4 color = $color;
+		color.rgb *= fakeLighting;
+		@sv_target = color;
+	}
+}

@@ -1,0 +1,73 @@
+{
+	newstyle
+	//parms {}
+	state {
+		blend		ONE ONE
+		blendOp		ADD
+		depthfunc	ALWAYS
+		alphaBlend	ONE ONE
+		alphaWrite	0
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+
+
+	hlsl_prefix {
+		#include <PostFX/screenProgs>
+	}
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		@texcoords.xy = ComputeRatioAdaptedTexcoord( $vertex_position.xy );
+		@texcoords.zw = $time.xx * $material_seed.xx;
+	}
+
+	hlsl_fp_main {
+		float3 uv = 0.0;
+		float4 color = 0.0;
+		float2 uvrot = $texcoords.xy ;
+		float4 disto1result, disto2result;
+
+		uv = Distortion($texcoords, disto1result, disto2result);
+
+		#if $(fx/opt/no_alpha_lookup_modulate)
+			color = TextureColor($texcoords, uv, 1.0);
+		#else
+			color = TextureColor($texcoords, uv, $color.w);
+		#endif
+
+
+		#if $(fx/opt/alpha_lerp_for_multiply)
+			color = float4( $color_Adjust.xyz , color.w * $(PostFX/screenQuadFade).x);
+			color.rgb = lerp( 1.0f.xxx, color.rgb, color.a );
+			@sv_target = color;
+		#else
+
+			color = AdjustColor( $color, color );
+
+			#if $(PostFX/ratioAdaptation/useClampColor)
+				if( $texcoords.x > 1.0 || $texcoords.x < 0.0 || $texcoords.y > 1.0 || $texcoords.y < 0.0 ) {
+					color = $(PostFX/ratioAdaptation/ClampColor);
+				}
+			#endif
+
+			#if $isShadow || $isZPrePass
+				ClipAlpha(color.a);
+				return;
+			#else
+				$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+				color.rgb /= ($(PostFX/post_tonemap).x>0.0)?1.0:Adaptation.EngineLuminanceFactor;
+				color *= $(PostFX/screenQuadFade);
+
+				// bmayaux (2016-06-22) 
+				#if $(PostFX/rangeCompressColor)
+					color.xyz = RangeCompressColorToR11G11B10( color.xyz );
+				#endif
+
+				ClipAlpha(color.a);
+				@sv_target = color;
+			#endif
+		#endif
+	}
+}

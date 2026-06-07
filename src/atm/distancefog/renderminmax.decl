@@ -1,0 +1,30 @@
+{
+	newstyle
+	state {
+		depthWrite 0		// No Z write
+		depthfunc	ALWAYS	// No Z read
+		depthEnable	0
+ 		cull none
+	}
+
+	hlsl_vp_main {
+		float4x4	Local2Camera = float4x4( $mvpMatrixX, $mvpMatrixY, $mvpMatrixZ, $mvpMatrixW );	// We stored the LOCAL=>CAMERA matrix in the MVP...
+
+		float4		csPosition = mul( Local2Camera, float4( $vertex_position.xyz, 1 ) );	// Position in camera space
+		@sv_position = mul( $projectionMatrix, csPosition );
+		@vsPosition = csPosition.xyz;
+	}
+
+	hlsl_fp_main {
+		float	Z = -$vsPosition.z;
+		float2	UV = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float	Zscene = $(water/DownsampledDepthBuffer2).SampleLevel( $linearClamp, UV, 0.0 ).x;
+		//float	Zscene = ComputeLinearZ( Zproj );
+		float	Zmin = Z;
+ 		float	Zmax = min( Z, Zscene );
+
+		// Let the targets sort the min and max of this Z...
+		// and Accumulate thickness (from ltartinville)
+		@sv_target = float4( Zmin, 1.0 - Zmax, Zmax, -Zmax * GetFrontFacingFactor( $sv_isFrontFace ) );
+	}
+}

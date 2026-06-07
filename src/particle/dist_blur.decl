@@ -1,0 +1,170 @@
+{
+	newstyle
+
+	options {
+		isParticle	1
+		noshadow	1
+	}
+	parms {
+		stageSort	sortPerturber
+		}
+	state {
+		depthWrite 0
+		blend		ONE	ONE
+	}
+	hlsl_prefix {
+		#include <particles>
+		#include <particles_instancing>
+	}
+
+	hlsl_vp_main {
+
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+
+		#if ( !$isShadow && !$isZPrePass )
+
+			@wsPosition = vout._worldPosition;
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+
+			#if $(fx/opt/use_mesh)
+				// Use the first set of texcoord in the case where the shader is applied on a mesh.
+				@texcoords.xyz = vout._texcoords.xyz;
+				@legacy_color = 1.0; // $vertex_color ?
+			#else
+				// Particle specific texcoord
+				@texcoords.xyz = GetParticleTextureCoordinates( victx, $vertex_texcoord4 ).xyz;
+				@legacy_color = GetParticleColor( victx, $vertex_color );
+			#endif
+
+			// Fog on eye distance
+			@texcoords.w = Fog( vout._projPosition.w );
+
+			// Soft contact
+			#if ($(fx/opt/use_softcontact) >= SOFT_CONTACT_CUBIC) && (!$isShadow && !$isZPrePass)
+				#if $useDirectInstancing
+					@particleCenterSize = float4( GetTranslation( vout ), GetParticleRadius( victx ) );
+				#else
+					@particleCenterSize = $vertex_texcoord5;
+				#endif
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+
+		float clipPlaneDot = dot( $(fx/ClipPlane).xyz, pixelCtx.m_wsPosition ) + $(fx/ClipPlane).w;
+		clip( sign( clipPlaneDot ) );
+
+		#if ( !$isShadow && !$isZPrePass )
+			float  dist_Opacity = 1.0;
+			float4 dist_Output = 0.0;
+			float2 dist_Vector = 0.0;
+			float2 dist_Vector_Blur = 0.0;
+
+			#if $(fx/opt/use_flipbook)
+				dist_Vector.xy	= $(fx/flipbooknormals).Sample( $linearClamp, $texcoords.xyz ).xy;
+				dist_Vector_Blur = dist_Vector * $disto1_Strength.zw;
+				dist_Vector *= $disto1_Strength.xy;
+			#else 
+				// get the blur and distortion Vectors from texture
+				dist_Vector = PanAndReadDistUV( $texcoords, $(fx/disto1), $disto1_RotationSpeed.x, $disto1_PanningSpeed, $disto1_Tilling.xy );
+
+				dist_Vector_Blur = dist_Vector * $disto1_Strength.zw;
+				dist_Vector *= $disto1_Strength.xy;
+
+				#if $(fx/opt/uv_disto2)
+					float2 vector2 = PanAndReadDistUV( $texcoords, $(fx/disto2), $disto2_RotationSpeed.x, $disto2_PanningSpeed, $disto2_Tilling.xy );
+
+					dist_Vector_Blur = ( dist_Vector_Blur + vector2 * $disto2_Strength.zw ) / 2.0;
+					vector2 *= $disto2_Strength.xy;
+					dist_Vector = ( dist_Vector + vector2 ) / 2.0;
+				#endif
+			#endif 
+
+			// mask the distortion
+			#if $(fx/opt/radial_ramp)
+				dist_Opacity = RadialRamp( $texcoords.xy, 0.0 ).x;
+			#else
+				#if $(fx/opt/use_flipbook)
+					dist_Opacity = $(fx/flipbook).Sample( $linearClamp, $texcoords.xyz ).x;
+				#else
+					dist_Opacity = PanAndReadDistUV( $texcoords, $(fx/opacity), $opacity_RotationSpeed.x, $opacity_PanningSpeed.xy, $opacity_Tilling.xy ).x;
+				#endif 
+			#endif
+			clip( dist_Opacity - (1.0/255.0) );
+
+			float3	wsTangent = pixelCtx.m_wsTangent;
+			float3	wsBiTangent = pixelCtx.m_wsBiTangent;
+
+			float3 wsDisto = dist_Vector.x * wsTangent + dist_Vector.y * wsBiTangent;
+			float3 wsBlur = dist_Vector_Blur.x * wsTangent + dist_Vector_Blur.y * wsBiTangent;
+
+			#if $(fx/opt/distblur_constant_offset)
+				#if $isAlpha
+					float depth = pixelCtx.m_opaqueZproj;
+				#else
+					float2 texCoordsForDepth = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture );
+					float depth = $(fx/depthFull).SampleLevel( $bilinearClamp, texCoordsForDepth, 0.0 ).x;
+				#endif
+				float4 currentPosFromDepth = float4( $sv_position.x*$positionToViewTexture.z*2.0-1.0, 1.0-$sv_position.y*$positionToViewTexture.w*2.0, depth, 1.0 );
+				float4 wsPos4 = mul( $inverseViewProjectionMatrix, currentPosFromDepth );
+				float3 wsPos = wsPos4.xyz/wsPos4.www;
+			#else
+				float3 wsPos = pixelCtx.m_wsPosition;
+			#endif
+			
+			float2 viewport_rendertarget_Ratio = $viewport.zw * $positionToViewTexture.zw * $resolutionScale.xy;
+			float4 projectedPixel = mul( $viewProjectionMatrix, float4( wsPos, 1.0f) );
+			projectedPixel.xy /= projectedPixel.w;
+			
+			// distortion on xy
+			float4 projDisto = mul( $viewProjectionMatrix, float4( wsPos + wsDisto, 1.0f) );
+			dist_Output.xy = ( (projDisto.xy/projDisto.w) - projectedPixel.xy ) * viewport_rendertarget_Ratio;
+
+			//blur on zw
+			float4 projBlur = mul( $viewProjectionMatrix, float4( wsPos + wsBlur,1.0f) );
+			dist_Output.zw = ( (projBlur.xy/projBlur.w) - projectedPixel.xy ) * viewport_rendertarget_Ratio;
+
+			float attenuation = dist_Opacity;
+			// Soft contact
+			#if (!$isShadow && !$isZPrePass) && $(fx/opt/use_softcontact) != SOFT_CONTACT_NONE
+				attenuation *= SoftContact( pixelCtx, $particleCenterSize );
+			#endif
+
+			// View dependent fade out.
+			#if $(fx/opt/view_dependent_fade)
+				attenuation *= ViewDependentFade( $sv_position.w );
+			#endif
+
+			// Fresnel opacity
+			attenuation *= FresnelOpacity( pixelCtx );
+			attenuation *= smoothstep( 0.0, $(fx/ClipPlaneFadeDistance).x, clipPlaneDot );
+
+			#if $(rendering/darkVisionLayer) == 4 && $(rendering/darkVisionPulsar) == 1
+				float distToWaveCenter = length($(rendering/darkVisionWaveCenter) - pixelCtx.m_wsPosition.xyz);
+
+				float innerRadius = $(rendering/darkVisionRevealWaveRadius).x;
+				float outerRadius = $(rendering/darkVisionRevealWaveRadius).y;
+
+				float depthPower = (1.0-smoothstep( innerRadius, outerRadius, distToWaveCenter ));
+				depthPower *= $(rendering/darkVisionRevealWavePower).x;
+				attenuation *= depthPower;
+			#endif
+
+			@sv_target =  attenuation * float4( dist_Output.zw * $legacy_color.zw  , dist_Output.xy * $legacy_color.xy );
+
+		#endif
+	}
+}

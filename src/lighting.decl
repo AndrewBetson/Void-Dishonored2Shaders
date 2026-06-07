@@ -1,0 +1,199 @@
+{
+	newstyle
+	hlsl_prefix {
+
+		#include <surfaceContext>
+		#include <lightContext>
+		#include <lightscattering>
+		#include <indirectLighting/common>
+		#include <colorimetry>
+		#include <atm/sky>		// ARKANE: bmayaux (2013-05-13) Now using the atmosphere renderer!
+		#include <helper>
+		#include <areaLight>	// bmayaux (2015-01-19) Support for area lights
+
+		// Make sure the user included a BRDF model!
+		#ifndef BRDF_OK
+			___You_forgot_to_include_a_BRDF_model_for_your_shader___
+		#endif
+
+
+		// =======================================================================
+		//  _ _ _   ___ ___ _  _ ___ ___ _____ _____   _____    ___ ___  _  _ _____ ___ _  _ _____   _ _ _
+		// | | | | / __| __| \| / __|_ _|_   _|_ _\ \ / / __|  / __/ _ \| \| |_   _| __| \| |_   _| | | | |
+		// |_|_|_| \__ \ _|| .` \__ \| |  | |  | | \ V /| _|  | (_| (_) | .` | | | | _|| .` | | |   |_|_|_|
+		// (_|_|_) |___/___|_|\_|___/___| |_| |___| \_/ |___|  \___\___/|_|\_| |_| |___|_|\_| |_|   (_|_|_)
+		//
+		// This small function is at the heart of mapping the artist's textures to physical values used by the lighting
+		// !PLEASE! Don't change anything without asking me (Pom) because you might break the entire base of
+		//	gloss/metallic textures the artists carefully tweaked by hand to match the settings of this function!
+		// =======================================================================
+		void NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( float _Gloss, float _Metallic, inout float3 _DiffuseAlbedo, float3 _SpecularTint, out float3 _IOR, out float _FresnelStrength, float3 _SpecularTintForDielectrics=0.04, float3 _DiffuseAlbedoForMetals=0.0, bool _UseMetallicToComputeSpecular=true ) {
+			if ( _UseMetallicToComputeSpecular ) {
+				// ARKANE: bmayaux (2014-02-24) As of today, specular tint is derived from diffuse based on metallic, and uses a global value of 4% (default) for dielectrics (i.e. plastic, glass, etc.)
+				_Metallic *= _Metallic;		// Artists prefer that...
+
+				_SpecularTint = lerp( _SpecularTintForDielectrics, _DiffuseAlbedo, _Metallic );
+
+				// Artists want to have a true matte rendering when gloss is 0...
+				// Artists want to have a true matte rendering when gloss is 0...
+				//_SpecularTint *= saturate( _Gloss / 0.1 );					// 1st draft - This is okay but a bit too hard
+				//_SpecularTint *= smoothstep( 0.0, 0.1, _Gloss + _Metallic );	// 2nd draft - They're okay with this, although I still can see the transition. I added metallic to gloss so the attenuation doesn't occur with metallic materials
+				
+				// 3rd draft - try to re-range gloss to avoid white veil on low gloss value
+				float glossMin = smoothstep(0.0 , 1.07, _Gloss);
+				float glossMax = smoothstep(0.05, 1.0 , _Gloss);
+				float Gloss = lerp(glossMin, glossMax, _Gloss);
+				_SpecularTint *= LinearStep( 0.0, 0.05, Gloss + _Metallic );				
+			}
+
+ 			// ARKANE: bmayaux (2014-02-24) As of today, diffuse is interpolated to a global value of black (default) based on metallic
+			_DiffuseAlbedo = lerp( _DiffuseAlbedo, _DiffuseAlbedoForMetals, _Metallic );
+
+			// Make the Fresnel disappear completely if rough and non-metallic so we get our diffuse lighting back
+			// Should be useless if users set a very low dielectric specular tint...
+//			_SpecularTint *= max( smoothstep( 0.0, 0.2, _Gloss ), smoothstep( 0.0, 0.2, _Metallic ) );
+// 			_SpecularTint *= saturate( smoothstep( 0.0, 0.2, _Gloss ) + smoothstep( 0.0, 0.7, _Metallic ) );	// Not used anymore since the error was a specular PI* larger than diffuse, that's why it was always showing no matter what!
+
+			// ARKANE: bmayaux (2014-02-24) As of today, IOR is derived from specular tint
+// 			// Retrieve Index of Refraction based on metallic coefficient
+// //		_IOR = exp2( lerp( 0.26303440583379383358341951445843, 9.9657842846620870436109582884682, _Metallic ) );	// IOR in [1.2, 1000]
+// //		_IOR = exp2( lerp( log2( 1.0 ), log2( 10.0 ), _Metallic*_Metallic ) );	// Quite good => hardcoded value below
+// 			_IOR = exp2( lerp( 0.0, 3.3219280948873623478703194294894, _Metallic*_Metallic ) );	// IOR in [1.0, 10]
+
+			_IOR = Fresnel_IORFromF0( _SpecularTint );
+
+			// Make Fresnel appear with gloss
+			_FresnelStrength = smoothstep( 0.1, 1.0, _Gloss );	// Satisfying: the smoothstep gives kind of a linear control over Fresnel strength
+		}
+
+		// =======================================================================
+		//  ___ _  _ _____ ___ ___ ___    _ _____ ___   _    ___ ___ _  _ _____ ___ _  _  ___
+		// |_ _| \| |_   _| __/ __| _ \  /_\_   _| __| | |  |_ _/ __| || |_   _|_ _| \| |/ __|
+		//  | || .` | | | | _| (_ |   / / _ \| | | _|  | |__ | | (_ | __ | | |  | || .` | (_ |
+		// |___|_|\_| |_| |___\___|_|_\/_/ \_\_| |___| |____|___\___|_||_| |_| |___|_|\_|\___|
+		//
+		// =======================================================================
+		ComputeLightingResult	IntegrateLighting( in SurfaceContext _Surface, const uint _quality ) {
+			ComputeLightingResult	Result;
+			Result.Clear();
+			float2 ssaoScreenShadow = float2( 1.0, 1.0 );
+
+			uint maxLights = 32;
+			switch ( _quality ) {
+				case HIGH_QUALITY: maxLights = 32; break;
+				case AVERAGE_QUALITY: maxLights = 16; break;
+				case LOW_QUALITY: maxLights = 8; break;
+			}
+
+			// =================================================================
+			// Initialize our BRDF
+			BRDF			brdf;
+			brdf.Init( _Surface );
+
+			// =================================================================
+			// Iterate over the lights
+			LightContext	light;
+
+			// =================================================================
+			// Add emissive
+			Result.accumEmissive += _Surface.emissive;
+
+			// =================================================================
+			// Add light scattering (only for alpha fragment)
+			Result.accumScattering = INTEGRATE_SCATTER( _Surface, _quality );
+			
+			// =================================================================
+			// parallel light
+			{
+				#if $(noScreenShadows)
+					ssaoScreenShadow = float2( $texScreenshadows[ _Surface.pixelIndex ].x, 1.0 );
+				#else
+					ssaoScreenShadow = $texScreenshadows[ _Surface.pixelIndex ].xy;
+				#endif
+				
+				light.m_ShadowSetup = 0;
+				light.m_color = $parallelLightColor.xyz;
+				light.m_attenuation = 1.0;
+				light.m_scatter = 0.0;
+				light.m_distance2Light = 1.0;
+				light.m_SpecularAttn = 1.0;
+				light.m_wsToLight = $parallelLightDir.xyz;
+				#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+					float3		Shadow = COMPUTE_PARALLEL_SHADOW( _Surface.wsPositionHacked, _Surface.wsVertexNormal, light.m_shadowInfo.mWorldToShadowMat, light.m_shadowInfo.mShadowToWorldMat, light.m_shadowInfo.mInfo, _quality );
+					light.m_shadow = Shadow.x;
+					light.m_shadowCasterZ = Shadow.y;
+					light.m_shadowReceiverZ = Shadow.z;
+				#else
+					#if $(noScreenShadows)
+						light.m_shadow = COMPUTE_PARALLEL_SHADOW( _Surface.wsPositionHacked, _Surface.wsVertexNormal, light.m_shadowInfo.mWorldToShadowMat, light.m_shadowInfo.mShadowToWorldMat, light.m_shadowInfo.mInfo, _quality );
+					#else
+						light.m_shadow = ssaoScreenShadow.y;
+					#endif
+				#endif
+
+				light.m_isDirectionalLight = true;
+				brdf.ComputeLighting( Result, _Surface, light );
+				
+				//store directional shadow term, alpha fog need it
+				Result.directionalShadowTerm = light.m_shadow;
+			}
+
+			// =================================================================
+			// Add indirect (diffuse + specular) terms
+			brdf.ComputeIndirect( Result, _Surface, ssaoScreenShadow.x, _quality );
+			
+			//LIGHT_TYPE_HALF_POINT 1
+			light = CreateLightContext( _Surface, LIGHT_TYPE_HALF_POINT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_HALF_POINT );
+					light.ComputeShadow( _Surface, _quality, LIGHT_TYPE_HALF_POINT );
+					brdf.ComputeLighting( Result, _Surface, light );
+				}
+			}
+			//LIGHT_TYPE_POINT 0
+			light = CreateLightContext( _Surface, LIGHT_TYPE_POINT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_POINT );
+					light.ComputeShadow( _Surface, _quality, LIGHT_TYPE_POINT );
+					brdf.ComputeLighting( Result, _Surface, light );
+				}
+			}
+			//LIGHT_TYPE_SPOT 2
+			light = CreateLightContext( _Surface, LIGHT_TYPE_SPOT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_SPOT );
+					light.ComputeShadow( _Surface, _quality, LIGHT_TYPE_SPOT );
+					brdf.ComputeLighting( Result, _Surface, light );
+				}
+			}
+			
+			// BEGIN: bmayaux (2015-01-19) Area Lights
+			// LIGHT_TYPE_AREA 3
+			light = CreateLightContext( _Surface, LIGHT_TYPE_AREA );
+			while ( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					COMPUTE_AREA_LIGHT_SHADOW( light, _Surface, _quality );									// Area light shadow uses a paraboloid exponential shadow map
+					AreaLightContext	areaLight = CREATE_AREA_LIGHT_CONTEXT( _Surface, light, _quality );	// Transforms a standard light+surface context into an area light context
+					brdf.ComputeLightingArea( Result, _Surface, areaLight, light );							// The BRDF needs to process the area light in a special manner
+				}
+			}
+			// END: bmayaux (2015-01-19)
+
+			// =================================================================
+			// Build the final color
+			Result.Finalize();
+			return Result;
+		}
+	}
+}

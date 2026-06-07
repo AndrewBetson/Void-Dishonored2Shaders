@@ -1,0 +1,94 @@
+{
+	newstyle
+	state {
+		depthEnable		0
+		depthWrite		0					// No Z write
+ 		depthfunc		ALWAYS				// No Z read
+ 		cull			NONE
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			SRC_ALPHA	ONE_MINUS_SRC_ALPHA
+		alphaBlend		ONE			ONE_MINUS_SRC_ALPHA
+	}
+
+	hlsl_prefix {
+		#include <pixel>
+		#include <fogHelpers>
+
+		float FetchDepth(uint2 position, int2 offset) {
+			float Zproj = $(atm/distanceFog/TexDepth)[position + offset].x;
+			float Zscene = ComputeLinearZ( Zproj );
+			return Zscene;
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+
+		#if $(atm/distanceFog/EnableScatteringOption) || $(atm/distanceFog/EnableVaryingDensityOption)
+			// Build the camera ray in world space
+			float3		csView = float3( $globalViewInfos.xy * $vertex_position.xy, -1.0 );	// Remember we look at -Z!
+			float4		View = mul( $inverseViewMatrix, float4( csView, 0.0 ) );	// Now in WORLD space...
+			@vsPosition = View.xyz;
+		#endif
+	}
+
+	hlsl_fp_main {
+		// Standard volumes use the volume's thickness
+		float2	UV = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float3	ZMinMaxAcc;
+		ZMinMaxAcc = $(atm/distanceFog/TexMinMaxAcc).SampleLevel( $linearClamp, float3( UV, 0 ), 0.0 ).xyw;
+		clip( ZMinMaxAcc.z - 1e-3 );
+		ZMinMaxAcc.y = 1.0 - ZMinMaxAcc.y;
+
+		// Compute distance
+		float	Distance = saturate( (ZMinMaxAcc.z - $(env/atm/distanceFog/InterpolationInfos).x) * $(env/atm/distanceFog/InterpolationInfos).y );	// Normalized distance
+
+		// Compute fog color
+		float3	FogDistanceColor = lerp( $(env/atm/distanceFog/ColorStart).xyz, $(env/atm/distanceFog/ColorEnd).xyz, Distance );
+
+		#if $(atm/distanceFog/EnableScatteringOption) || $(atm/distanceFog/EnableVaryingDensityOption)
+			float	ZtoDistance = length( $vsPosition );
+			float3	View = $vsPosition / ZtoDistance;
+		#endif
+
+		// Compute extinction
+		float	ExtinctionCoeff = $(env/atm/distanceFog/InterpolationInfos).z;
+		#if $(atm/distanceFog/EnableVaryingDensityOption)
+			// Account for exponential density falloff
+			float	StartZ = ZMinMaxAcc.x < ZMinMaxAcc.y ? ZMinMaxAcc.x : 0.0;		// Start at 0 if inside the volume
+			float	StartDistance = ZtoDistance * StartZ;
+			float	CameraAltitude = $wsCamPos.z;
+			float	Altitude = CameraAltitude + StartDistance * View.z;
+ 			float	dy = View.z;
+			Distance *= $(env/atm/distanceFog/DensityFactor);
+
+			float	Falloff = $(env/atm/distanceFog/DensityFalloffSpeed);
+
+			// this version has precision problem when x is big with exp(x)
+			// if x < -200 => exp(x) == 0
+			//dy *= Falloff;	// We're only going to use dy multiplied by falloff after that anyway...
+			//float	TotalDensity = (ExtinctionCoeff / dy) * exp( -Falloff * Altitude ) * (1.0 - exp( -dy * Distance ));
+
+			//this version is better
+			float	TotalDensity = ExtinctionCoeff * (exp( -Falloff * Altitude ) - exp( -Falloff * (Altitude + dy * Distance) )) / (Falloff * dy);
+			float	Extinction = exp( -TotalDensity );
+
+		#else
+			float	Extinction = exp( -ExtinctionCoeff * Distance );
+		#endif
+
+		#if $(atm/distanceFog/EnableScatteringOption)
+			// Change fog color based on angle with Sun direction
+			float	PhaseAngle = dot( $(env/atm/distanceFog/ScatteringDirection), View );
+			float	Phase = PhaseFunctionMie( PhaseAngle, $(env/atm/distanceFog/ScatteringPhase) );
+			float3	ScatteringColor = ($(env/atm/distanceFog/ScatteringIntensity) * Phase) * $(env/atm/distanceFog/ScatteringColor);
+			float	ScatteringAlpha = min( 1.0, max( ScatteringColor.r, max( ScatteringColor.g, ScatteringColor.b ) ) );
+			FogDistanceColor += ScatteringColor * ScatteringAlpha;
+		#endif
+
+		// Alpha-pre multiply
+		float	Alpha = Extinction;
+		@sv_target = float4( FogDistanceColor.rgb, 1.0 - Alpha );
+	}
+}

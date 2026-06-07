@@ -1,0 +1,51 @@
+{
+	newstyle
+
+	state {
+		blend		ONE ZERO
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+	
+	hlsl_prefix {
+		#include <dof>
+		
+		float2 sphereDistortion(float2 actualUV, float2 pointUV, float radius, float strength)
+		{
+			float2 vecToPoint = pointUV - actualUV;
+			float distToPoint = length(vecToPoint);
+			
+			float mag = (1.0 - (distToPoint / radius)) * strength;
+			mag *= step(distToPoint, radius);
+			
+			return actualUV + (mag * vecToPoint);
+			
+		}		
+	}	
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoords.xy = 0.5f.xx * float2(1.f,-1.f) * $vertex_position.xy + 0.5f.xx;
+		@texcoords.zw = @texcoords.xy;
+		@texcoords.x = (@texcoords.x - 0.2 ) * $(PostFX/lensDistortionParams).z;
+	}
+	
+	hlsl_fp_main {
+		float2 texCoords = $texcoords.xy;		
+		const float k = $(PostFX/lensDistortionParams).x;
+		const float kcube = $(PostFX/lensDistortionParams).y;		
+		const float2 center = float2(0.5,0.5);
+		float2 texCoordBent = cubicLensDistortion($texcoords.xy, center, k, kcube);
+		float2 texCoordSphere = sphereDistortion($texcoords.zw, center, 0.5, 1.0);
+		
+		float4 colorBent = $viewColorMap.Sample( $bilinearBorderClamp, texCoordBent );		
+		float4 colorSphere = $viewColorMap.Sample( $bilinearBorderClamp, texCoordSphere );		
+		
+		float dist = dot( (texCoordBent - texCoordSphere), (texCoordBent - texCoordSphere) );
+		float4 color = lerp( colorBent, colorSphere, dist );
+				
+		@sv_target = color;
+	}
+}

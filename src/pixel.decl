@@ -1,0 +1,204 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef PIXEL_INCLUDED
+		#define	PIXEL_INCLUDED
+
+		float2 ComputeStaticDecalUV( float2 _uv, float4 _decalPos, float _decalRot ) {
+			float sinRot;
+			float cosRot;
+			sincos( _decalRot.x, sinRot, cosRot );
+            float2x2 rotationMatrix = float2x2( cosRot, -sinRot, sinRot, cosRot);
+            rotationMatrix = (rotationMatrix * 0.5 * float2x2(_decalPos.x,_decalPos.y,_decalPos.x,_decalPos.y) + 0.5)*2.0 - 1.0;					// apply local scale
+            return mul ( (_uv - 0.5).xy+(_decalPos.zw*float2( -0.5, 0.5)), rotationMatrix ) + 0.5;		// apply absolute translate
+		}
+		
+		#include <sphericalHarmonics>		// We need SH_COEFFS_COUNT defined
+
+		struct arkPixelContext_t {
+			float4	m_ssPosition;			// screen space position (xy = pixel coords, z = depth z/w, w = 1/w)
+			float3	m_wsPosition;			// world space position
+			float3	m_wsView;				// bmayaux (2015-06-12) world space view pointing TOWARD camera (i.e. away from surface)
+			float	m_distance;				// bmayaux (2015-06-12) Distance between camera and world position
+			float	m_frontFaceFactor;		// bmayaux (2015-12-02) Stored for materials requiring it (used by vegetation to reverse translucency)
+			float3	m_wsVertexTangent;		// world space tangent (keep it normalized !)
+			float3	m_wsVertexBiTangent;	// world space bi-tangent (keep it normalized !)
+			float3	m_wsVertexNormal;		// world space normal (keep it normalized !)
+			float3	m_wsTangent;			// world space tangent modified by parallax mapping or normal mapping (keep it normalized !)
+			float3	m_wsBiTangent;			// world space bi-tangent modified by parallax mapping or normal mapping (keep it normalized !)
+			float3	m_wsNormal;				// world space normal modified by parallax mapping or normal mapping (keep it normalized !)
+			float4	m_texCoords;			// texture coordinates
+			float2	m_maskTexCoords[3];		// texture coordinates scaled/biased for layer masks
+			float2	m_layerTexCoords[3];	// texture coordinates scaled/biased for layers
+			float4	m_vertexColor;			// vertex color
+			float3	m_irradiance[4];		// bmayaux (2015-02-11) Irradiance along 4 principal directions
+			float	m_IBLLuminanceFactor;
+			#if $useMultiInstancing || $(tool/usePerVertexSH)
+				uint3	m_IBLCubeMapIndex;	// 3 IBL indices coming from the the 3 vertices of the triangle (to interpolate with barycentric coordinates)
+				float3	m_barycentric;		// Barycentric coordinates used to interpolate the IBL cube maps
+			#else
+				uint	m_IBLCubeMapIndex;	// A single IBL cube map index for dynamic primitives
+			#endif
+			uint	m_decalIndex;			// only used for decals
+			float3	m_masks;
+			float	m_wrinkle;
+			float4	m_diffuseAlbedo;
+			#if $isAlpha
+				float m_opaqueZproj;
+				float m_opaqueZscene;
+			#endif
+			#if $hasDynamicDecals
+				float4 m_dynamicDecal;
+			#endif
+			#if $hasAnimatedEmissive
+				float m_animatedEmissiveMask;
+			#endif
+
+			#if $staticDecalCount > 0
+				float4 m_staticDecalDiffuse;
+				float2 m_staticDecalTSnormal;
+				float m_staticDecalGloss;
+			#endif
+			
+			//////////////////////////////////////////////////////////////////////////////////////////////////////////
+			// Functions
+			void initOpaqueDepthForAlpha() {
+				#if $isAlpha
+					m_opaqueZproj = $(fx/depthFull).SampleLevel( $linearClamp, m_ssPosition.xy*$positionToViewTexture.zw * $resolutionScale.xy, 0.0 ).x;
+					m_opaqueZscene = ComputeLinearZ( m_opaqueZproj );
+				#endif
+			}
+			
+			void initDynamicDecalFetch() {
+				#if $hasDynamicDecals
+					m_dynamicDecal = $decalMap.Sample( $trilinearSampler, m_texCoords.zw );
+				#endif
+			}
+
+			void initStaticDecalFetch() {
+				#if $staticDecalCount > 0
+					m_staticDecalGloss = $decal_Gloss.x;
+					
+					float2 decal1UV = ComputeStaticDecalUV( m_texCoords.xy, $decal1_Pos, $decal1_Rot );
+					m_staticDecalDiffuse = $decal1_DiffuseMap.Sample( $decalSampler, decal1UV );
+					m_staticDecalTSnormal =  $decal1_NormalMap.Sample( $decalSampler, decal1UV ).xy;
+					#if $hasDecal1Gloss
+						m_staticDecalGloss = $decal1_GlossMap.Sample( $decalSampler, decal1UV ).x;
+					#endif
+					#if $staticDecalCount > 1
+						float2 decal2UV = ComputeStaticDecalUV( m_texCoords.xy, $decal2_Pos, $decal2_Rot );
+						float4 decalDiffuse2 = $decal2_DiffuseMap.Sample( $decalSampler, decal2UV );
+						m_staticDecalDiffuse = lerp( m_staticDecalDiffuse, decalDiffuse2, decalDiffuse2.a);
+						m_staticDecalTSnormal = lerp( m_staticDecalTSnormal, $decal2_NormalMap.Sample( $decalSampler, decal2UV ).xy, decalDiffuse2.a);
+						#if $hasDecal2Gloss
+							m_staticDecalGloss = lerp( m_staticDecalGloss, $decal2_GlossMap.Sample( $decalSampler, decal2UV ).x, decalDiffuse2.a);
+						#endif
+						#if $staticDecalCount > 2
+							float2 decal3UV = ComputeStaticDecalUV( m_texCoords.xy, $decal3_Pos, $decal3_Rot );
+							float4 decalDiffuse3 = $decal3_DiffuseMap.Sample( $decalSampler, decal3UV );
+							m_staticDecalDiffuse = lerp( m_staticDecalDiffuse, decalDiffuse3, decalDiffuse3.a);
+							m_staticDecalTSnormal =  lerp( m_staticDecalTSnormal, $decal3_NormalMap.Sample( $decalSampler, decal3UV ).xy, decalDiffuse3.a);
+							#if $hasDecal3Gloss
+								m_staticDecalGloss = lerp( m_staticDecalGloss, $decal3_GlossMap.Sample( $decalSampler, decal3UV ).x, decalDiffuse3.a);
+							#endif
+						#endif
+					#endif
+				#endif
+			}
+
+			void initAnimatedEmissive() {
+				#if $hasAnimatedEmissive
+					float gradientValue = $emissiveGradientMap.Sample( $anisotropicSampler, m_texCoords.xy ).x;
+					float threshold = $emissiveRevealParams.x;
+					float transitionWidth = $emissiveRevealParams.y;
+					float transitionHalfWidth = transitionWidth * 0.5;
+					float transitionValue = ( ( 1.0 + transitionWidth ) * threshold ) - transitionHalfWidth;
+					float minVal = transitionValue-transitionHalfWidth;
+					float maxVal = transitionValue+transitionHalfWidth;
+					m_animatedEmissiveMask = smoothstep( minVal, maxVal, gradientValue );
+				#endif
+			}
+			
+			void initLayeredTexcoord() {
+				#if $Layer0_UVset == 0
+					float2 layer0_uv = m_texCoords.xy;
+				#else
+					float2 layer0_uv = m_texCoords.zw;
+				#endif
+				m_layerTexCoords[0] = layer0_uv*$Layer0_ScaleBias.xy + $Layer0_ScaleBias.zw;
+				#if( $extraLayer > 0 )
+					#if $Layer1_UVset == 0
+						float2 layer1_uv = m_texCoords.xy;
+					#else
+						float2 layer1_uv = m_texCoords.zw;
+					#endif
+					m_layerTexCoords[1] = layer1_uv*$Layer1_ScaleBias.xy + $Layer1_ScaleBias.zw;
+					#if( $extraLayer > 1 )
+						#if $Layer2_UVset == 0
+							float2 layer2_uv = m_texCoords.xy;
+						#else
+							float2 layer2_uv = m_texCoords.zw;
+						#endif
+						m_layerTexCoords[2] = layer2_uv*$Layer2_ScaleBias.xy + $Layer2_ScaleBias.zw;
+					#else
+						m_layerTexCoords[2] = m_layerTexCoords[0];
+					#endif
+				#else
+					m_layerTexCoords[1] = m_layerTexCoords[0];
+					m_layerTexCoords[2] = m_layerTexCoords[0];
+				#endif
+
+				#if $Layer0_Mask_UVset == 0
+					float2 layer0_mask_uv = m_texCoords.xy;
+				#else
+					float2 layer0_mask_uv = m_texCoords.zw;
+				#endif
+				m_maskTexCoords[0] = layer0_mask_uv*$Layer0_MaskScaleBias.xy + $Layer0_MaskScaleBias.zw;
+				#if( $extraLayer > 0 )
+					#if $Layer1_Mask_UVset == 0
+						float2 layer1_mask_uv = m_texCoords.xy;
+					#else
+						float2 layer1_mask_uv = m_texCoords.zw;
+					#endif
+					m_maskTexCoords[1] = layer1_mask_uv*$Layer1_MaskScaleBias.xy + $Layer1_MaskScaleBias.zw;
+					#if( $extraLayer > 1 )
+						#if $Layer2_Mask_UVset == 0
+							float2 layer2_mask_uv = m_texCoords.xy;
+						#else
+							float2 layer2_mask_uv = m_texCoords.zw;
+						#endif
+						m_maskTexCoords[2] = layer2_mask_uv*$Layer2_MaskScaleBias.xy + $Layer2_MaskScaleBias.zw;
+					#else
+						m_maskTexCoords[2] = m_maskTexCoords[0];
+					#endif
+				#else
+					m_maskTexCoords[1] = m_maskTexCoords[0];
+					m_maskTexCoords[2] = m_maskTexCoords[0];
+				#endif
+			}
+			
+			float4 OutlineSeed() {
+				#if $alphaTest 
+					float alpha = $diffusemap.Sample( $anisotropicSampler, m_layerTexCoords[0] ).a; 
+					clip( alpha - $DefaultAlphaTest );
+				#endif
+				float outlineSeedColor;
+
+				if( $outlinePulseWhenFocused.x > 0.5 ) {
+					outlineSeedColor =  ($outlineFocus > 0.5) ? $outlineFocusedSeedPower.x * (lerp($outlinePulseFrequencyRange.y, $outlinePulseFrequencyRange.z, (sin($localTime.x * $outlinePulseFrequencyRange.x)+1)/2.0 )) : $outlineSeedPower.x;
+				} else {
+					outlineSeedColor =  ($outlineFocus < 0.5) ? $outlineSeedPower.x * (lerp($outlinePulseFrequencyRange.y, $outlinePulseFrequencyRange.z, (sin($localTime.x * $outlinePulseFrequencyRange.x)+1)/2.0 )) : $outlineFocusedSeedPower.x;
+				}
+				
+				float Zscene = ComputeLinearZ( m_ssPosition.z );
+				float distanceFactor = 1.0 - smoothstep( $outlineDistances.x, $outlineDistances.y, Zscene );
+				outlineSeedColor *= distanceFactor;
+				
+				return outlineSeedColor.xxxx * $outlinePrecisionFactor.y;
+			}
+			
+		};
+
+		#endif	// #ifndef PIXEL_INCLUDED
+	}
+}

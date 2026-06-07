@@ -1,0 +1,19 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	DEBUG_AREA_LIGHTS_COUNT = 32;
+
+		void	DEBUG_DisplayAreaLightTextures( float2 _UV, inout float3 _Color )
+		{
+			float	sliceIndex = floor( DEBUG_AREA_LIGHTS_COUNT * _UV.x );
+			_UV.x = frac( DEBUG_AREA_LIGHTS_COUNT * _UV.x );
+			float	Multiplier = DEBUG_AREA_LIGHTS_COUNT * 9.0 / 16.0;
+			float	mipIndex = floor( Multiplier * _UV.y );
+			_UV.y = frac( Multiplier * _UV.y );
+			if ( mipIndex < 9 )
+				_Color = $texPoolAreaLights.SampleLevel( $trilinearSampler, float3( _UV, sliceIndex ), mipIndex ).xyz;
+		}
+	}
+}

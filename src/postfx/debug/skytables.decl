@@ -1,0 +1,44 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	SKY_TABLES_INSET_SIZE = 0.4;	// Size of the histogram inset in UV space (1 means the entire screen!)
+
+		#include <atm/common>
+		
+		// Displays the sky tables (transmittance, irradiance and scattering)
+		//
+		void	DEBUG_DisplaySkyTables( float2 _UV, inout float3 _Color ) {
+			if ( _UV.x > SKY_TABLES_INSET_SIZE || _UV.y < 1.0-SKY_TABLES_INSET_SIZE )
+				return;
+
+			float	W = 0.5 * (1.0 + sin( $time.x ) );
+
+			const float	HSPLIT = 0.4;
+
+			// Renormalize UVs
+			_UV.x /= SKY_TABLES_INSET_SIZE;
+			_UV.y = (_UV.y - 1.0+SKY_TABLES_INSET_SIZE) / SKY_TABLES_INSET_SIZE;
+
+			if ( _UV.x < HSPLIT ) {
+				_UV.x /= HSPLIT;
+				if ( _UV.y < 0.5 ) {
+					// Debug transmittance table
+					_UV.y *= 2.0;
+					_Color = $(atm/sky/precompute/texTransmittance).SampleLevel( $linearClamp, _UV, 0.0 ).xyz;
+				} else {
+					// Debug irradiance table
+					_UV.y = 2.0 * (_UV.y-0.5);
+//					_Color = $(atm/sky/SunIntensity).xyz * $(atm/sky/texIrradiance).SampleLevel( $linearClamp, float3( _UV, W ), 0.0 ).xyz;
+					_Color = 10.0 * $(atm/sky/texIrradiance).SampleLevel( $linearClamp, float3( _UV, W ), 0.0 ).xyz;
+				}
+			} else {
+				// Debug scattering table
+				_UV.x = (_UV.x-HSPLIT) / (1.0-HSPLIT);
+				_Color = $(atm/sky/precompute/texScattering).SampleLevel( $linearClamp, float3( _UV, W ), 0.0 ).xyz;										// Rayleigh
+//				_Color = 1000.0 * GetMieFromRayleighAndMieRed( $(atm/sky/precompute/texScattering).SampleLevel( $linearClamp, float3( _UV, W ), 0.0 ) );	// Mie
+			}
+		}
+	}
+}

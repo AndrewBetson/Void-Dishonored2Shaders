@@ -1,0 +1,186 @@
+{
+	newstyle
+
+	parms {
+		stageSort			sortPerturber
+	}
+	state {
+		blend		ONE	ONE
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+	hlsl_prefix {
+		#include <vertex>
+		#include <noise>
+	}
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz/float3( $resolutionScale.xy, 1 ), 1 );
+	}
+	hlsl_fp_main {
+		const float sqrthalf = sqrt(0.5);
+		float4 final = 0.0f.xxxx;
+
+		//Eye Infinity patch
+		const float ratioAuthoring = 16.0/9.0;
+		const float ratioScreen = ((1.0/$positionToViewTexture.z) * ($positionToViewTexture.w)) / ($resolutionScale.x/$resolutionScale.y);
+		float ratio = ratioAuthoring / ratioScreen;
+		
+		//Resolution scaling
+		float resolutionFactor = max($positionToViewTexture.z*$resolutionScale.x*ratio, $positionToViewTexture.w*$resolutionScale.y*ratio);
+		
+		//Pixel factor
+		float pixelFactor = 450.0f * resolutionFactor;	//used for value defined in pixels for an half vertical resolution of 450 (vertical resolution beeing the less)
+		float2 size = 1.0f / $positionToViewTexture.zw;
+		float2 center = size * 0.5f;
+
+		float2 pixelPosition = ($sv_position.xy - center) / $resolutionScale.xy + center;
+
+		#if $(FSdisto/opt/use_cam_blur) || $(FSdisto/opt/use_sand_storm)
+			float Zproj = $(fx/depthFull).SampleLevel( $linearClamp, $sv_position.xy*$positionToViewTexture.zw*$resolutionScale.xy, 0.0 ).x;
+			float Zscene = ComputeLinearZ( Zproj );
+		#endif
+		
+		#if $(FSdisto/opt/use_sand_storm)
+			float3 wsDirection = SafeNormalize( $(FSdisto/sandStorm/WorldWind).xyz );
+			float3 wsCamForwardDir = -float3( $inverseViewMatrix[0].z, $inverseViewMatrix[1].z, $inverseViewMatrix[2].z );
+			
+			float4 directionToProject = float4( wsDirection + (wsCamForwardDir * 0.01), 0.0 );
+			float4 projectedDirection = mul( $viewProjectionMatrix, directionToProject );
+			projectedDirection.xy /= float2(projectedDirection.w, -projectedDirection.w);
+
+			float2 sandStormCenter = ((0.5*projectedDirection.xy / $resolutionScale.xy)+0.5) / ($positionToViewTexture.zw);
+		
+			float2 sandStormDistoVec = (pixelPosition - sandStormCenter) * $positionToViewTexture.zw * $resolutionScale.xy;
+			
+			float dotSign = -sign( dot( wsDirection, wsCamForwardDir) );
+			
+			sandStormDistoVec = resolutionFactor * dotSign * normalize( sandStormDistoVec );
+
+			const float sandStormDeadZone = $(FSdisto/sandStorm/DeadZone).x / pixelFactor;	// means 100 pixels for a vertical resolution of 900
+			sandStormDistoVec *= smoothstep( 0.0, sandStormDeadZone, length(pixelPosition - sandStormCenter) );
+
+			float range = $(FSdisto/sandStorm/EndDepth).x - $(FSdisto/sandStorm/StartDepth).x;
+			float linearZreranged = saturate( (Zscene - $(FSdisto/sandStorm/StartDepth).x) / (range) );
+			
+			float4 depthFactor = lerp( $(FSdisto/sandStorm/StartValue), $(FSdisto/sandStorm/EndValue), linearZreranged );
+
+			float noise = abs( frac(sin(dot(pixelPosition*$positionToViewTexture.zw/$resolutionScale.xy + frac($localTime.x), float2(12.9898, 78.233)))* 43758.5453) );
+			float2 sandStormDisto = sandStormDistoVec * resolutionFactor * noise * $resolutionScale.xy;
+
+			final += depthFactor * sandStormDisto.xyxy;
+		#endif //(FSdisto/opt/use_sand_storm)
+
+		#if $(FSdisto/opt/use_cam_blur)
+			// compute pixel velocity introdued by camera motion
+			float4 currentPos = float4( screenPosToNdc( $sv_position.xy ), Zproj, 1.f );
+			
+			float4 wsPos = mul( $inverseViewProjectionMatrix, currentPos );
+			wsPos /= wsPos.w;
+
+			float4 previousPos = mul( $previousViewProjectionMatrix, wsPos );
+			previousPos /= abs(previousPos.w); // this abs avoid huge angular motion singularity
+
+			float2 pixelVelocity = clamp( (currentPos.xy - previousPos.xy)*float2(-0.5, 0.5), -1, 1 );
+			
+			float camBlurDepthRange = $(FSdisto/cameraBlur/EndDepth).x - $(FSdisto/cameraBlur/StartDepth).x;
+			float camBlurDepthFactor = saturate( (Zscene - $(FSdisto/cameraBlur/StartDepth).x) / (camBlurDepthRange) );
+
+			pixelVelocity*=$positionToViewTexture.zw * $(FSdisto/cameraBlur/Strength).x * camBlurDepthFactor * $resolutionScale.xy;
+
+			final.xy += pixelVelocity * $resolutionScale.xy;
+		#endif //(FSdisto/opt/use_cam_blur)
+
+		#if $(FSdisto/opt/use_radial_blur) ||  $(FSdisto/opt/use_wobble_disto)
+			float2 radialVector = (pixelPosition - center) * $positionToViewTexture.zw * $resolutionScale.xy;
+			radialVector = -normalize( radialVector );
+			radialVector *= resolutionFactor;
+		#endif //(FSdisto/opt/use_radial_blur) || (FSdisto/opt/use_wobble_disto)
+
+		#if $(FSdisto/opt/use_radial_blur)
+			const float radialBlurDeadZone = $(FSdisto/radialBlurDeadZone).x / pixelFactor;	// means 100 pixels for a vertical resolution of 900
+
+			//float2 distortion = radialVector * $(FSdisto/radialBlurStrength).xx * clamp(length(pixelPosition - radialCenter) - radialBlurDeadZone,0,10000) * resolutionFactor;
+			//final = ComputeDistortionMV( distortion, 1.0f );	//1.0 is blur value and may be exposed
+
+			float2 distortion = radialVector * clamp(length(pixelPosition - center) - radialBlurDeadZone,0,1.0/resolutionFactor) * resolutionFactor * $resolutionScale.xy;
+			final.xy += $(FSdisto/radialBlurStrength).xx * distortion;
+			final.zw += $(FSdisto/radialDistoStrength).xx * distortion;
+		#endif //(FSdisto/opt/use_radial_blur)
+
+		#if $(FSdisto/opt/use_wobble_disto)
+			float phase = $(FSdisto/wobbleStrength).x * lerp( $(FSdisto/wobbleLowBound).x, $(FSdisto/wobbleHighBound).x, sin( $(time).x*$(FSdisto/wobbleSpeed).x )*0.5 + 0.5 );
+
+			float deadZoneFactor = clamp( length( (pixelPosition - center) * $positionToViewTexture.zw * $resolutionScale.xy ) - 0.15 ,0,sqrthalf) / sqrthalf;
+			deadZoneFactor *= deadZoneFactor;
+
+			float2 wobbleDisto = radialVector * phase * deadZoneFactor / (resolutionFactor * $resolutionScale.xy);
+
+			final.zw += wobbleDisto.xy * $resolutionScale.xy;
+		#endif //(FSdisto/opt/use_wobble_disto)
+
+		#if $(FSdisto/opt/use_lens)
+			const float FishEyeExtRadius		= 250.0f / pixelFactor;	// means 250 pixels for a vertical resolution of 900
+			const float FishEyeTransitionSize	= 100.0f / pixelFactor;	// means 50 pixels for a vertical resolution of 900
+			float FishEyeStrength				= 0.05;
+
+			const float MainRippleExtRadius		= 250.0f / pixelFactor;	// means 250 pixels for a vertical resolution of 900
+			const float MainRippleSize			= 40.0f / pixelFactor;	// means 20 pixels for a vertical resolution of 900
+			float MainRippleStrength			= 0.005;
+
+			const float SecRippleExtRadius		= 250.0f / pixelFactor;	// means 250 pixels for a vertical resolution of 900
+			const float SecRippleSize			= 8.0f / pixelFactor;	// means 10 pixels for a vertical resolution of 900
+			float SecRippleStrength				= -0.02;
+
+			const float RippleBlurFactor		= 1.0;
+
+			FishEyeStrength *= $(FSdisto/lensStrength).x;
+			MainRippleStrength *= $(FSdisto/lensStrength).x;
+			SecRippleStrength *= $(FSdisto/lensStrength).x;
+
+
+			float2 centerToFrag = (center - pixelPosition);
+			float distToCenter = length(centerToFrag);
+
+			
+			float4 lensContribution = 0;
+			if( distToCenter < FishEyeExtRadius ) {
+				float fisheyeStart = FishEyeExtRadius - FishEyeTransitionSize;
+				float fisheyeCosZone = FishEyeExtRadius - fisheyeStart;
+				float fisheyeRangeParam = clamp(distToCenter-fisheyeStart,0,fisheyeCosZone) / fisheyeCosZone;
+				float fisheyeFactor = (cos( fisheyeRangeParam * 3.141592 ) + 1.0)/2.0;
+				fisheyeFactor *= (FishEyeStrength);
+				float2 fishDisto = centerToFrag * $positionToViewTexture.zw * fisheyeFactor;
+				lensContribution += float4( 0.0f, 0.0f, fishDisto.x, fishDisto.y );
+			}
+
+			float2 rippleDir = cross( float3(centerToFrag, 0), float3(0,0,1) ).xy;
+
+			float mainRippleStart = MainRippleExtRadius - MainRippleSize;
+			if( distToCenter > mainRippleStart && distToCenter < MainRippleExtRadius ) {
+				float mainRippleZone = MainRippleExtRadius - mainRippleStart;
+				float mainRippleRangeParam = clamp(distToCenter-mainRippleStart,0,mainRippleZone) / mainRippleZone;
+				float mainRipplefactor = (-cos( mainRippleRangeParam * 2.0 * 3.141592 ) + 1.0)/2.0;
+				float2 mainRipple = normalize( rippleDir ) * mainRipplefactor * MainRippleStrength;
+				lensContribution += float4( mainRipple.x*RippleBlurFactor, mainRipple.y*RippleBlurFactor, mainRipple.x, mainRipple.y );
+			}
+
+			float secRippleStart = SecRippleExtRadius - SecRippleSize;
+			if( distToCenter > secRippleStart && distToCenter < SecRippleExtRadius ) {
+				float secRippleZone = SecRippleExtRadius - secRippleStart;
+				float secRippleRangeParam = clamp(distToCenter-secRippleStart,0,secRippleZone) / secRippleZone;
+				float secRipplefactor = (-cos( secRippleRangeParam * 2.0 * 3.141592 ) + 1.0)/2.0;
+				float2 secRipple = normalize( rippleDir ) * secRipplefactor * SecRippleStrength;
+				lensContribution += float4( secRipple.x*RippleBlurFactor, secRipple.y*RippleBlurFactor, secRipple.x, secRipple.y );
+			}
+			final += lensContribution*$resolutionScale.xyxy;
+		#endif //(FSdisto/opt/use_lens)
+
+		if( abs(dot(final,1.0)) == 0.0 ) {
+			discard;
+		}		
+
+		@sv_target = final;
+	}
+}

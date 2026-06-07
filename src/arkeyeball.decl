@@ -1,0 +1,250 @@
+{
+
+	newstyle
+
+	options {
+		useSelfShadowedBumpMap	1	// We always use SSBump for iris self-shadowing
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <BRDF_eye>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+		#include <fogHelpers>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+
+		#if ( $alphaTest || ( !$isShadow && !$isZPrePass && !$isOutline ) )
+			@texcoords = vout._texcoords;
+			@texcoords.xy = (((vout._texcoords.xy-0.5) *$(eye/Refraction).w) + 0.5).xy;
+		#endif
+
+		#if $isZPrePass && !$isAlpha && !$isZPrePassAlpha
+			//The motion vector generation for motion blur & temporalAA is done here
+			VertexOutContext previousFrameVout = TransformVertex( victx, true );
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+		
+		#if !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit)
+			@wsPosition = vout._worldPosition;
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+
+			@eye_EyeDir = float3( vout._localSpace[0][0], vout._localSpace[1][0], vout._localSpace[2][0] );
+//#if DEBUG_ON_STATIC
+//			@eye_EyeDir = float3( vout._localSpace[0][1], vout._localSpace[1][1], vout._localSpace[2][1] );
+//#endif
+	//		@texcoords.zw = $vertex_tangent.w; //take bitangent sign to ps
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		#if $isZPrePass
+			#if $isZPrePassDithering
+				ClipZfromDistance( pixelCtx );
+			#endif
+			//Motion vector
+			#if !$isAlpha && !$isZPrePassAlpha
+				float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+				psMotionVector -= $jitterRelativeToPreviousFrame;
+				psMotionVector *= 0.5f;
+				psMotionVector.y *= -1.0f;
+				@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+			#endif
+			return;
+		#elif $isShadow
+			//@sv_target = 1.0f;
+		#elif $isMasking
+			@sv_target = $(rendering/masking/bendTimeFactor).x;
+		#elif $(tool/unlit)
+			// Compute diffuse albedo
+			@sv_target = $diffusemap.Sample( $anisotropicClamp, pixelCtx.m_texCoords.xy ); 
+		#elif $isOutline
+			#if $outlineable
+				@sv_target = pixelCtx.OutlineSeed();
+			#endif
+
+		// =======================================================================
+		// Standard Pass
+		#else
+			float2	UV = pixelCtx.m_texCoords.xy;
+			float3	wsView = pixelCtx.m_wsView;		// Pointing toward the camera
+
+			// Build the flat tangent space for the iris plane that stands slightly below the cornea
+			float3	wsEyeDir = $eye_EyeDir;
+			float3 wsIrisBitangent = -normalize( cross( wsEyeDir, pixelCtx.m_wsVertexTangent ) );// * $texcoords.w;
+			float3 wsIrisTangent = normalize( cross( wsEyeDir, wsIrisBitangent ) );
+			
+			// ======= Read cornea normal map ("exterior normal") =======
+			float3	tsCorneaNormal = UnpackBC5NormalMap( $Layer1_bumpMap.Sample( $anisotropicSampler, UV ).xy );
+			float3	wsExteriorNormal = normalize( tsCorneaNormal.x * pixelCtx.m_wsVertexTangent + tsCorneaNormal.y * pixelCtx.m_wsVertexBiTangent + tsCorneaNormal.z * pixelCtx.m_wsVertexNormal );
+
+			// Build second tangent space used for specular lighting
+			float3	wsExteriorTangent = normalize( cross( pixelCtx.m_wsVertexBiTangent, wsExteriorNormal ) );
+			float3	wsExteriorBiTangent = cross( wsExteriorNormal, wsExteriorTangent );
+
+
+			//////////////////////////////////////////////////////////////////////////////////////////////////
+			// Here is representation for our eye:
+			//
+			//					| T    iris distance UV
+			//				----+----	  :
+			//			---     |     --- :
+			//		  _*........|.........*_ <== Iris plane
+			//		-			|			-
+			//	   /			|			 \
+			//	  |				| C 		  |
+			//	  *.............+.............* <== Hemisphere plane
+			//	  							  :
+			//	  							  :
+			//	  					hemisphere distance UV
+			//
+			// It's almost mapped in planar mode and the texture is slightly larger than the spherical orb of the eye
+			// The point T is at UV = (0.5, 0.5)
+			// The circle forming the iris plane is at "distanceIrisUV" units in UV space and is provided by the user
+			// The circle forming the hemisphere plane is at "distanceHemisphereUV" units in UV space and is provided by the user
+			//
+			float	distanceIrisUV = $(eye/UvSettings).x;						// Distance to the iris plane (in UV space) (cf. figure above)
+			float	distanceHemisphereUV = $(eye/UvSettings).y;					// Distance to the hemisphere plane (in UV space) (cf. figure above)
+			float	irisTransitionRangeUV = $(eye/UvSettings).w;				// A small transition range (in UV space) where we pass from the iris to the sclera region (different lighting)
+	
+			float3	wsRefracted = refract( -wsView, wsExteriorNormal, $(eye/Refraction).x );	// Refracted ray through cornea
+			
+			float	distanceUV = length( UV - 0.5 );							// Distance to iris center (in UV space)
+			float	normDistance = distanceUV / distanceHemisphereUV;			// Normalized distance to iris center (when the distance reaches the hemisphere, it's equal to 1)
+			float	normDistanceIris = distanceIrisUV / distanceHemisphereUV;	// Normalized distance of the iris border
+			float	mask = smoothstep( distanceIrisUV + irisTransitionRangeUV, distanceIrisUV - irisTransitionRangeUV, distanceUV );	// Mask value used to isolate the iris from the sclera region
+			float2	causticUV = UV;
+			
+			float	height = sqrt( 1.0 - normDistance*normDistance )			// Current height on the eye
+						   - sqrt( 1.0 - normDistanceIris*normDistanceIris );	// minus height of the iris
+					height = saturate( height );
+
+			// Compute the intersection of the refracted ray with the iris plane
+			float	hitDistance = -height / dot( wsView, wsRefracted );
+			float3	wsIrisHitPosition = hitDistance * wsRefracted;
+
+			// Compute the UVs of the iris after refraction through the cornea
+			float2	irisUV = UV + mask * $(eye/UvSettings).z * float2( dot( wsIrisHitPosition, wsIrisTangent ), dot( wsIrisHitPosition, wsIrisBitangent) );
+
+			// Dilate the iris UVs to simulate eye adaptation
+			float2	directionUV = irisUV - 0.5;
+			float	UVLength = length( directionUV );
+					directionUV /= UVLength;
+
+			float2	dilatedUV = 0.5 + distanceIrisUV * directionUV * pow( saturate( UVLength / distanceIrisUV ), 1.0 / (1.0 - 0.875 * $(eye/Refraction).y) );
+			irisUV = lerp( irisUV, dilatedUV, mask );
+
+			// Compute diffuse albedo
+			float4 albedo = $diffusemap.Sample( $anisotropicClamp, irisUV ); 
+
+			// Boost albedo for veins
+			float veins = 1.0 - albedo.z;
+			albedo.x = lerp( albedo.x, max( albedo.x, veins ), $(eye/Refraction).z * pow( (1.0 - mask), 10 ) );
+			
+
+			// ==== Compute gloss ====
+			float	Gloss = $wardRoughness.y;	// Default is max value
+
+			// ==== Compute AO + SSBump ====
+			float AO = 1.0;
+// LATER	fetch plannar occlusion texture using head transform
+//				#if($hasOcclusionMap)
+//					AO = $occlusionMap.Sample( $anisotropicSampler, pixelCtx.m_texCoords.xy ).r;
+//				#endif
+	
+ 			float3	SSBump = 2.0 * $bumpmap.Sample( $anisotropicSampler, irisUV ).xyz - 1.0;
+
+			// =================================================================
+			// Compute lighting
+			float4 currentPos = float4( pixelCtx.m_ssPosition.x*$positionToViewTexture.z*2.0-1.0, 1.0-pixelCtx.m_ssPosition.y*$positionToViewTexture.w*2.0, pixelCtx.m_ssPosition.z, 1.0 );
+			float4 wsPos = mul( $inverseViewProjectionMatrix, currentPos );
+				
+			SurfaceContext	surf;
+			surf.Clear();
+			surf.pixelIndex			= uint2( $sv_position.xy );
+			surf.wsPosition			= $wsPosition.xyz;
+			surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+			
+			surf.wsView				= wsView;
+			surf.distance			= pixelCtx.m_distance;
+			surf.wsNormal			= wsExteriorNormal;		// Specular will always use the exterior tangent space (only the outer layer of the eye is specular)
+			surf.wsTangent			= wsExteriorTangent;
+			surf.wsBiTangent		= wsExteriorBiTangent;
+			surf.diffuseAlbedo		= albedo.xyz;
+			surf.roughness			= 1.0 - lerp( $(eye/glossParm).x, $(eye/glossParm).y, mask );
+			surf.sheen				= $sheen.x;
+			surf.sheenImportance	= $sheenImportance.x;
+			surf.anisotropy			= $wardRoughness.z;
+			surf.anisotropyAngle	= 0.0;
+			surf.IOR				= 1.38;		// Cornea thin layer refraction index
+			surf.fresnelStrength	= 1.0;
+			surf.translucency		= 0.0;
+			surf.emissive			= HQ_FetchEmissive( pixelCtx );	
+			surf.AO					= float4( AO, SSBump );
+
+			// Build HL2 basis for self-shadowing of the iris details
+			float3	 wsInteriorTangent		= normalize( lerp( wsExteriorTangent, 		wsIrisTangent	, mask ) );	// This tangent space follows the "interior surface" of the eye : sclera + iris. Not the exterior we're using for specular
+			float3	 wsInteriorBiTangent	= normalize( lerp( wsExteriorBiTangent,		wsIrisBitangent	, mask ) );
+			float3	 wsInteriorNormal		= normalize( lerp( wsExteriorNormal, 		wsEyeDir		, mask ) );
+			surf.wsVertexNormal				= wsInteriorNormal;
+			surf.wsVertexTangent 			= wsInteriorTangent;
+			surf.wsVertexBiTangent 			= wsInteriorBiTangent;
+
+			const float3 tsHL2Basis_R = float3(  sqrt(2.0/3.0),            0.0, sqrt(1.0/3.0) );				
+			const float3 tsHL2Basis_G = float3( -sqrt(1.0/6.0),  sqrt(1.0/2.0), sqrt(1.0/3.0) );
+			const float3 tsHL2Basis_B = float3( -sqrt(1.0/6.0), -sqrt(1.0/2.0), sqrt(1.0/3.0) );
+
+			surf.wsHL2Basis_R = tsHL2Basis_R.x * wsInteriorTangent + tsHL2Basis_R.y * wsInteriorBiTangent + tsHL2Basis_R.z * wsInteriorNormal;
+			surf.wsHL2Basis_G = tsHL2Basis_G.x * wsInteriorTangent + tsHL2Basis_G.y * wsInteriorBiTangent + tsHL2Basis_G.z * wsInteriorNormal;
+			surf.wsHL2Basis_B = tsHL2Basis_B.x * wsInteriorTangent + tsHL2Basis_B.y * wsInteriorBiTangent + tsHL2Basis_B.z * wsInteriorNormal;
+			surf.wsHL2Basis_N = wsInteriorNormal;
+
+			// Additional infos for indirect lighting
+			FetchIndirectLightingData( pixelCtx, surf );
+
+			// Eye-specific data
+			surf.userData.irisMask			= mask;
+ 			surf.userData.irisUV			= irisUV;
+			surf.userData.causticUV			= causticUV;
+ 			surf.userData.wsEyeDir			= wsEyeDir;
+ 			surf.userData.specularFactor	= lerp( $(eye/glossParm).z, $(eye/glossParm).w, mask );
+			surf.userData.wsIrisTangent		= wsInteriorTangent;
+			surf.userData.wsIrisBiTangent	= wsInteriorBiTangent;
+
+			effectCtx.ApplyMaterialEffect( pixelCtx, surf );
+
+			ComputeLightingResult result = IntegrateLighting( surf, HIGH_QUALITY );
+
+			// Compute fog
+			result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+			@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+			@sv_target.w = albedo.w;
+
+		#endif
+	}
+}

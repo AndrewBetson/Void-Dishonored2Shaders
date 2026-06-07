@@ -1,0 +1,98 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			ONE	ONE_MINUS_SRC_ALPHA
+		alphaBlend		ONE	ONE_MINUS_SRC_ALPHA
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+		#include <arkWaterHelpers>
+
+		float3 ReconstructWorldSpacePosition( float2 _ndcPixelPos, float _linearDepth )
+		{
+			float4 wsZFarPos = mul( $inverseViewProjectionMatrix, float4( _ndcPixelPos, 0, 1 ) );  //ARKANE (2015-06-12) - depth inversion
+			wsZFarPos /= wsZFarPos.w;
+
+			float3 wsRayDir = wsZFarPos.xyz - $wsCamPos;
+			return $wsCamPos + wsRayDir * _linearDepth;
+		}
+
+		float4 ComputeUnderWaterScattering( float2 _texCoords, float2 _psPosition )
+		{
+
+			const float3 sunIntensity = $parallelLightColor.xyz;
+
+			float3 extinctionCoeff = ( 1.0f - $(water/WaterColor) ) * $(water/Extinction);
+			extinctionCoeff /= $(water/UnderwaterVisibilityBoost);
+			float3 radiance = $(water/HDRBuffer).SampleLevel( $linearClamp, _texCoords, 0.0 ).rgb;
+			radiance = RangeExpandColorFromR11G11B10( radiance );
+
+			//Rebuil world-space position
+			float opaqueRawZ = $(water/OpaqueDepthBuffer).SampleLevel( $linearClamp, _texCoords, 0.0 ).x; //no water 0-7000m
+			float opaqueLinZ = ComputeLinearZ( opaqueRawZ );
+			float waterLinZ = $(water/DownsampledDepthBuffer2).SampleLevel( $linearClamp, _texCoords, 0.0 ).y; //water 0-7000m
+			float3 wsOpaquePos = ReconstructWorldSpacePositionFromLinearZ( _psPosition, opaqueLinZ );
+			float3 wsWaterPos = ReconstructWorldSpacePositionFromLinearZ( _psPosition, waterLinZ );
+
+			//Shadow
+			float4x4 worldToShadowMat_unused;
+			float4x4 shadowToWorldMat_unused;
+			float3 wsNormal_unused = float3(0.0, 1.0, 0.0);
+			uint sliceIdx_unused;
+			float shadow = ComputeParallelShadow( wsWaterPos, wsNormal_unused, worldToShadowMat_unused, shadowToWorldMat_unused, sliceIdx_unused, LOW_QUALITY );
+
+			//Caustics projected on sea-floor
+			float causticTime = fmod( $localTime.x * $(water/CausticsSpeed), 32.0f );
+			float2 causticsUV = ( wsOpaquePos.xy + wsOpaquePos.z * $(water/wsRefractedLightDir).xy ) * $(water/CausticsTiling);
+			float3 caustics;
+			caustics.r = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV - $(water/CausticsChromaticAberration), causticTime ), 0.0 ).x;
+			caustics.g = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV,                                        causticTime ), 0.0 ).x;
+			caustics.b = $(water/CausticsTex).SampleLevel( $bilinearSampler, float3( causticsUV + $(water/CausticsChromaticAberration), causticTime ), 0.0 ).x;
+
+			//Scattering
+			float camVerticalDepth = max( $(water/WaterLevel) - $wsCamPos.z, 0.0f );
+			float pointDistToCam = distance( $wsCamPos, wsWaterPos );
+			float pointVerticalDepth = max( $(water/WaterLevel) - wsWaterPos.z, 0.0f );
+			float3 inscattering = WaterInscattering( camVerticalDepth, pointVerticalDepth, pointDistToCam, extinctionCoeff ) * ( $(water/Inscattering) / $(water/UnderwaterVisibilityBoost) );
+
+			// ADD - Caustics
+			radiance += sunIntensity * caustics * $(water/CausticsFade);
+
+			// ADD - Scattering Vertical
+			radiance *= exp( - extinctionCoeff * pointVerticalDepth ) * max( 0.25, shadow );
+
+			// ADD - Scattering Horizontal
+			radiance *= exp( - extinctionCoeff * pointDistToCam );
+			radiance += inscattering * sunIntensity;
+
+			float alphaExtinction = max( extinctionCoeff.r, max( extinctionCoeff.g, extinctionCoeff.b ) );
+			float alphaScattering = max(inscattering.r, max( inscattering.g, inscattering.b ));
+			float alphaDispertion = lerp(1.0, shadow, smoothstep($(water/WaterLevel) - $(water/Extinction), $(water/WaterLevel), wsWaterPos.z) );
+			float alphaVertical = exp( - alphaExtinction * pointVerticalDepth ) * alphaDispertion;
+			float alphaHorizontal = exp( - alphaExtinction * pointDistToCam );
+			float alpha = 1.0 - ( alphaVertical * alphaHorizontal + alphaScattering );
+			
+			return float4(radiance, alpha );
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0f );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+		float2 ndcPos = screenPosToNdc( $sv_position.xy );
+		@sv_target = ComputeUnderWaterScattering( $texcoord*$resolutionScale.xy, ndcPos );
+	}
+}

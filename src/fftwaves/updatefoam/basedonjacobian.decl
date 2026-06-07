@@ -1,0 +1,28 @@
+{
+	newstyle
+	options {	
+		NUMTHREADX 16
+		NUMTHREADY 16
+		NUMTHREADZ 1
+	}
+	
+	hlsl_prefix {		
+	}
+
+	hlsl_cp_main {
+		uint2 DTid = $sv_dispatchThreadID.xy;
+		
+		float foam = @(FFTWaves/FoamMask)[ DTid ];
+		
+		float jacobian = $(FFTWaves/FFTGradientsAndJacobian)[ DTid ].w;
+		jacobian = smoothstep( 0.7f, 1.3f, jacobian );
+		
+		foam += jacobian * $(FFTWaves/FoamSpawnRate).x * $localTime.y;
+		foam = min( foam, 1.0f );
+		
+		foam -= foam * $(FFTWaves/FoamDecayRate).x * $localTime.y;
+		foam = max( foam, 0.0f );
+		
+		@(FFTWaves/FoamMask)[ DTid ] = foam;
+	}
+}

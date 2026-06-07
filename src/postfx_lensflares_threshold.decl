@@ -1,0 +1,42 @@
+{
+	newstyle
+
+	state {
+		blend		ONE	ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+
+		@legacy_texcoord.xy = $vertex_texcoord + (float2(-1.0f, -1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord.zw = $vertex_texcoord + (float2( 1.0f, -1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord1.xy = $vertex_texcoord + (float2(-1.0f,  1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord1.zw = $vertex_texcoord + (float2( 1.0f,  1.0f) * $(Downscale/TexelSize));
+	}
+
+	hlsl_fp_main {
+		float4 color0 = $(PostFX/LensFlares/texLensFlares).SampleLevel( $bilinearClamp, $legacy_texcoord.xy, 0.0f );
+		float4 color1 = $(PostFX/LensFlares/texLensFlares).SampleLevel( $bilinearClamp, $legacy_texcoord.zw, 0.0f );
+		float4 color2 = $(PostFX/LensFlares/texLensFlares).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0f );
+		float4 color3 = $(PostFX/LensFlares/texLensFlares).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0f );
+
+		float3 colorScaled;
+		colorScaled  = max(0.0, color0.rgb - $(PostFX/LensFlares/ThresholdBias) ) * $(PostFX/LensFlares/ThresholdScale);
+		colorScaled += max(0.0, color1.rgb - $(PostFX/LensFlares/ThresholdBias) ) * $(PostFX/LensFlares/ThresholdScale);
+		colorScaled += max(0.0, color2.rgb - $(PostFX/LensFlares/ThresholdBias) ) * $(PostFX/LensFlares/ThresholdScale);
+		colorScaled += max(0.0, color3.rgb - $(PostFX/LensFlares/ThresholdBias) ) * $(PostFX/LensFlares/ThresholdScale);
+
+		float alphaScale = 0.25 * ( color0.a + color1.a + color2.a + color3.a );
+
+		@sv_target = float4( colorScaled * 0.25, alphaScale );
+	}
+}

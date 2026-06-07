@@ -1,0 +1,29 @@
+{ newstyle
+	parms {
+	}
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+	}
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+		@wsNormal = vout.m_wsNormal;
+		@wsPosition = vout._worldPosition;
+		@legacy_color = $vertex_color;
+	}
+	hlsl_fp_main {
+
+		float3 viewDir = normalize( $wsCamPos - $wsPosition );
+//		float fakeLighting = saturate( 0.25 + abs( dot( $wsNormal, viewDir ) ) );
+
+		float4 color = $legacy_color;
+//		color.rgb *= fakeLighting;		// bmayaux (2016-03-11) NOPE!!! When I call debugDraw I expect it to draw EXACTLY the color I specified!
+		@sv_target = color;
+	}
+}

@@ -1,0 +1,454 @@
+{
+	newstyle
+	hlsl_prefix {
+	#ifndef INTERSECTION_TEST
+	#define INTERSECTION_TEST
+		#define epsilon 0.001
+		
+		bool SolveQuadratic(float a, float b, float c, out float minT, out float maxT)
+		{
+			float discriminant = b*b - 4.0*a*c;
+
+			if (discriminant < 0.0)
+			{
+				// no real solutions so return a degenerate result
+				maxT = 0.0;
+				minT = 0.0;
+				return false;
+			}
+			else
+			{
+				// numerical recipes 5.6 (this method ensures numerical accuracy is preserved)
+				float t = -0.5 * (b + sign(b)*sqrt(discriminant));
+				float closestT = t / a;
+				float furthestT = c / t;
+
+				minT = min(closestT ,furthestT);
+				maxT = max(closestT ,furthestT);
+				return true;
+			}
+		}
+		
+		bool IntersectRayPlane(float3 rayOrigin, float3 rayDirection, float3 posOnPlane, float3 planeNormal, out float3 intersectionPoint)
+		{
+			float rDotn = dot(rayDirection, planeNormal);
+ 
+			//parallel to plane or pointing away from plane?
+			if (rDotn < epsilon )
+				return false;
+ 
+			float s = dot(planeNormal, (posOnPlane - rayOrigin)) / rDotn; 
+			intersectionPoint = rayOrigin + s * rayDirection;
+ 
+			return true;
+		}
+
+		bool IntersectRayPlane(float3 rayOrigin, float3 rayDirection, float3 posOnPlane, float3 planeNormal)
+		{
+			float rDotn = dot(rayDirection, planeNormal); 
+			return (rDotn < epsilon );
+		}
+
+		bool IntersectRayCircle(float3 rayOrigin, float3 rayDirection, float3 circleCenter, float3 circleNormal, float circleRadius, out float3 intersectionPoint)
+		{
+			float rDotn = dot(rayDirection, circleNormal);
+ 
+			//parallel to plane or pointing away from plane?
+			if (rDotn < epsilon )
+				return false;
+ 
+			float s = dot(circleNormal, (circleCenter - rayOrigin)) / rDotn; 
+			intersectionPoint = rayOrigin + s * rayDirection;
+			
+			if( distance(intersectionPoint, circleCenter) > circleRadius)
+				return false;
+ 
+			return true;
+		}
+
+		bool IntersectRayCircle(float3 rayOrigin, float3 rayDirection, float3 circleCenter, float3 circleNormal, float circleRadius)
+		{
+			float3 intersectionPoint;
+			return IntersectRayCircle(rayOrigin, rayDirection, circleCenter, circleNormal, circleRadius, intersectionPoint);
+		}
+
+		bool IntersectRaySphere(float3 rayOrigin, float3 rayDirection, float3 sphereCenter, float sphereRadius, out float3 h0, out float3 h1)
+		{
+			float3 L = rayOrigin - sphereCenter;
+			float a = dot(rayDirection,rayDirection);
+			float b = 2.0 * dot(rayDirection, L);
+			float c = dot(L,L) - (sphereRadius*sphereRadius);
+
+			float t0, t1;
+			if(!SolveQuadratic(a, b, c, t0, t1))
+			{
+				h0 = rayOrigin;
+				h1 = rayOrigin;
+				return false;
+			}
+
+			h0 = rayOrigin + rayDirection*t0;
+			h1 = rayOrigin + rayDirection*t1;
+			return true;
+		}
+
+		void IntersectRaySphere(float3 rayOrigin, float3 rayDirection, float3 sphereCenter, float sphereRadius, out float h0, out float h1)
+		{
+			float3 diff = rayOrigin - sphereCenter;
+			float a0 = dot(diff, diff) - (sphereRadius*sphereRadius);
+			float a1 = dot(rayDirection, diff);
+			float discr = max(0.0, (a1*a1) - a0 );
+			float root = sqrt(discr);
+			h0 = (-a1 - root);
+			h1 = (-a1 + root);
+			h0 = max(h0, 0.f); // clamp when rayOrigin is inside the sphere
+			//float3 hitPoint0 = rayOrigin + h0 * rayDirection;
+			//float3 hitPoint1 = rayOrigin + h1 * rayDirection;
+			//float l = distance(hitPoint1,hitPoint0);
+		}
+		
+		bool IntersectRaySphere(float3 rayOrigin, float3 rayDirection, float3 sphereCenter, float sphereRadius)
+		{
+			float3 L = rayOrigin - sphereCenter;
+			float a = dot(rayDirection,rayDirection);
+			float b = 2.0 * dot(rayDirection, L);
+			float c = dot(L,L) - (sphereRadius*sphereRadius);
+			float t0, t1;
+			return SolveQuadratic(a, b, c, t0, t1);
+		}
+		
+		bool IntersectRayHemiSphere(float3 rayOrigin, float3 rayDirection, float3 sphereCenter, float3 sphereAxis, float sphereRadius, out float3 hitPoint0, out float3 hitPoint1)
+		{
+			bool hit = IntersectRaySphere(rayOrigin,rayDirection,sphereCenter,sphereRadius,hitPoint0,hitPoint1);
+			float d0 = dot(hitPoint0-sphereCenter, sphereAxis);
+			float d1 = dot(hitPoint1-sphereCenter, sphereAxis);
+			return hit && ((d0 >= 0.0) || (d1 >= 0.0));	
+		}
+			
+		void IntersectRayCone(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float tanTheta, out float minT, out float maxT)
+		{
+			float3		Y = lightDir;
+			float3		Z = normalize( cross( Y, float3( 0, 1, 0 ) ) );
+			float3		X = cross( Y, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+
+			float3 localOrigin = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 localDir = mul(  Spot2World, rayDir );	
+			
+			//float4 localOrigin = mul( float4(rayOrigin, 1.0), invConeTransform);
+			//float4 localDir = mul( float4(rayDir, 0.0), invConeTransform);
+			
+			// could perform this on the cpu
+			//float tanTheta = tan(aperture);
+			tanTheta *= tanTheta;
+
+			float a = localDir.x*localDir.x + localDir.z*localDir.z - localDir.y*localDir.y*tanTheta;
+			float b = 2.0*(localOrigin.x*localDir.x + localOrigin.z*localDir.z - localOrigin.y*localDir.y*tanTheta);
+			float c = localOrigin.x*localOrigin.x + localOrigin.z*localOrigin.z - localOrigin.y*localOrigin.y*tanTheta;
+						
+			SolveQuadratic(a, b, c, minT, maxT);
+
+			float y1 = localOrigin.y + localDir.y*minT;
+			float y2 = localOrigin.y + localDir.y*maxT;
+
+			// should be possible to simplify these branches if the compiler isn't already doing it	
+			if (y1 > 0.0 && y2 > 0.0)
+			{
+				// both intersections are in the reflected cone so return degenerate value
+				minT = 0.0;
+				maxT = -1.0;
+			}
+			else if (y1 > 0.0 && y2 < 0.0)
+			{
+				// closest t on the wrong side, furthest on the right side => ray enters volume but doesn't leave it (so set maxT arbitrarily large)
+				minT = maxT;
+				maxT = 10000.0;
+			}
+			else if (y1 < 0.0 && y2 > 0.0)
+			{
+				// closest t on the right side, largest on the wrong side => ray starts in volume and exits once
+				maxT = minT;
+				minT = 0.0;		
+			}
+		}
+
+		bool IntersectRayCone(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float tanTheta)
+		{
+			float3		Y = lightDir;
+			float3		Z = normalize( cross( Y, float3( 0, 1, 0 ) ) );
+			float3		X = cross( Y, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+
+			float3 localOrigin = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 localDir = mul(  Spot2World, rayDir );	
+
+			//float4 localOrigin = mul( float4(rayOrigin, 1.0), invConeTransform);
+			//float4 localDir = mul( float4(rayDir, 0.0), invConeTransform);
+
+			// could perform this on the cpu
+			//float tanTheta = tan(aperture);
+			tanTheta *= tanTheta;
+
+			float a = localDir.x*localDir.x + localDir.z*localDir.z - localDir.y*localDir.y*tanTheta;
+			float b = 2.0*(localOrigin.x*localDir.x + localOrigin.z*localDir.z - localOrigin.y*localDir.y*tanTheta);
+			float c = localOrigin.x*localOrigin.x + localOrigin.z*localOrigin.z - localOrigin.y*localOrigin.y*tanTheta;
+			float minT, maxT;
+
+			bool result = SolveQuadratic(a, b, c, minT, maxT);
+			float y1 = localOrigin.y + localDir.y*minT;
+			float y2 = localOrigin.y + localDir.y*maxT;
+
+			// should be possible to simplify these branches if the compiler isn't already doing it	
+			if ( result == false || (y1 > 0.0 && y2 > 0.0)) {
+				return false;
+			}
+			if (y1 > 0.0 && y2 < 0.0) {
+				maxT = 10000.0;
+			}
+			else if (y1 < 0.0 && y2 > 0.0) {
+				maxT = minT;
+			}
+			return (maxT > 0.0);
+		}
+		
+		void IntersectRayTruncatedCone(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float tanTheta, float apex, float base, out float minT, out float maxT)
+		{
+			float3		Y = lightDir;
+			float3		Z = normalize( cross( Y, float3( 0, 1, 0 ) ) );
+			float3		X = cross( Y, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+
+			float3 localOrigin = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 localDir = mul(  Spot2World, rayDir );	
+			
+			//float4 localOrigin = mul( float4(rayOrigin, 1.0), invConeTransform);
+			//float4 localDir = mul( float4(rayDir, 0.0), invConeTransform);
+			
+			// could perform this on the cpu
+			//float tanTheta = tan(aperture);
+			tanTheta *= tanTheta;
+
+			float a = localDir.x*localDir.x + localDir.z*localDir.z - localDir.y*localDir.y*tanTheta;
+			float b = 2.0*(localOrigin.x*localDir.x + localOrigin.z*localDir.z - localOrigin.y*localDir.y*tanTheta);
+			float c = localOrigin.x*localOrigin.x + localOrigin.z*localOrigin.z - localOrigin.y*localOrigin.y*tanTheta;
+						
+			SolveQuadratic(a, b, c, minT, maxT);
+
+			float y1 = localOrigin.y + localDir.y*minT;
+			float y2 = localOrigin.y + localDir.y*maxT;
+
+			// top, bottom
+			float2 zcap = -float2(apex,base);
+			float2 cap = ( zcap - localOrigin.y) / localDir.y;
+			if ( y1 < zcap.y ) {
+				minT = cap.y;
+			}
+			if ( y1 > zcap.x ) {
+				minT = cap.x;
+			}
+			
+			if ( y2 < zcap.y ) {
+				maxT = cap.y;
+			}
+			if ( y2 > zcap.x ) {
+				maxT = cap.x;
+			}
+			
+			// should be possible to simplify these branches if the compiler isn't already doing it	
+			if (y1 > 0.0 && y2 > 0.0)
+			{
+				// both intersections are in the reflected cone so return degenerate value
+				minT = 0.0;
+				maxT = -1.0;
+			}
+			else if (y1 > 0.0 && y2 < 0.0)
+			{
+				// closest t on the wrong side, furthest on the right side => ray enters volume but doesn't leave it (so set maxT arbitrarily large)
+				minT = maxT;
+				maxT = 10000.0;
+			}
+			else if (y1 < 0.0 && y2 > 0.0)
+			{
+				// closest t on the right side, largest on the wrong side => ray starts in volume and exits once
+				maxT = minT;
+				minT = 0.0;
+			}
+		}		
+
+		bool IntersectSphereCone(float3 sphereCenter, float sphereRadius, float3 conePos, float3 coneDir, float coneRadius, float coneAperture)
+		{
+			float radius = sphereRadius;
+			float3 diff = sphereCenter - conePos;
+			float dist_sq = dot(diff,diff);
+			float dist_max = coneRadius+radius;
+			if (dist_sq<=dist_max*dist_max)
+			{
+				float p = dot(diff,coneDir);
+				if (p<-radius)
+					return false; // Sphere behind the cone
+
+				//else if (p<=radius)
+				//	return true; // TO FIX Cone origin inside sphere
+
+				float dmax = (radius+p*sin(coneAperture))/cos(coneAperture);
+				float d_sq = dist_sq - p*p;
+
+				if (d_sq<=dmax*dmax)
+					return true;
+			}
+
+			return false;
+		}
+		
+		void IntersectRayCylinder(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float radius, float top, float bottom, out float near, out float far)
+		{
+			float3		Y = lightDir;
+			float3		Z = normalize( cross( Y, float3( 0, 1, 0 ) ) );
+			float3		X = cross( Y, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+			float3 org = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 dir = mul(  Spot2World, rayDir );
+
+			// quadratic x^2 + y^2 = 0.5^2 => (org.x + t*dir.x)^2 + (org.y + t*dir.y)^2 = 0.5
+			float a = dot(dir.xy, dir.xy);
+			float b = dot(org.xy, dir.xy);
+			float c = dot(org.xy, org.xy) - (radius*radius);
+
+			float delta = b * b - a * c;
+			if( delta < 0.0 ) {
+				far = -1.0;
+				near = 0.0;
+				return;
+			}
+
+			// 2 roots
+			float deltasqrt = sqrt(delta);
+			float arcp = 1.0 / a;
+			near = (-b - deltasqrt) * arcp;
+			far = (-b + deltasqrt) * arcp;
+
+			// order roots
+			float temp = min(far, near);
+			far = max(far, near);
+			near = temp;
+
+			float znear = org.z + near * dir.z;
+			float zfar = org.z + far * dir.z;
+
+			// top, bottom
+			float2 zcap = float2(top, bottom);	// 5.0, -5.0
+			float2 cap = (zcap - org.z) / dir.z;
+
+			if ( znear < zcap.y )
+				near = cap.y;
+			else if ( znear > zcap.x )
+				near = cap.x;
+
+			if ( zfar < zcap.y )
+				far = cap.y;
+			else if ( zfar > zcap.x )
+				far = cap.x;
+
+			if( far <= 0.0 ||far < near ) {
+				far = -1.0;
+				near = 0.0;
+			}
+		}
+
+		void InstersectRayFrustum(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float aperture, float nearPlane, float farPlane, float3 xAxis, float scale, out float near, out float far)
+		{
+			float3		X = -lightDir;
+			float3		Z = normalize( cross( X, xAxis ) );
+			float3		Y = cross( X, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+			float3x3	matScale = float3x3( 	1.0, 0.0, 0.0,
+											0.0, 1.0/scale, 0.0,
+											0.0, 0.0, 1.0 );
+			Spot2World = mul( matScale, Spot2World );
+			float3 org = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 dir = mul(  Spot2World, rayDir );
+
+			float2 dirf = float2(0.5, aperture/(PI) ); //0.3 = aperture
+			float3 tbot, ttop;
+			
+			// intersection with near and far planes
+			float invdirx = 1.0 / dir.x;
+			tbot.x = invdirx * (nearPlane - org.x);
+			ttop.x = invdirx * (farPlane - org.x);
+
+			float temp = dirf.y * org.x;
+			
+			// intersection with inclined planes on y
+			tbot.y = (-temp - dirf.x * org.y) / (dirf.x * dir.y + dirf.y * dir.x);
+			ttop.y = ( temp - dirf.x * org.y) / (dirf.x * dir.y - dirf.y * dir.x);
+
+			// intersection with inclined planes on z
+			tbot.z = (-temp - dirf.x * org.z) / (dirf.x * dir.z + dirf.y * dir.x);
+			ttop.z = ( temp - dirf.x * org.z) / (dirf.x * dir.z - dirf.y * dir.x);
+
+			// if intersecting behind the apex, set t to ray's end
+			float4 tempt = float4(tbot.yz, ttop.yz);
+			tempt = org.xxxx + tempt * dir.xxxx > 0.0 ? tempt : 7000.0 * sign(dir.xxxx);
+			tbot.yz = tempt.xy;
+			ttop.yz = tempt.zw;
+
+			// re-order intersections to find smallest and largest on each axis
+			float3 tmin = min(ttop, tbot);
+			float3 tmax = max(ttop, tbot);
+
+			// find the largest tmin and the smallest tmax
+			float2 t0 = max(tmin.xx, tmin.yz);
+			near = max(t0.x, t0.y);
+			t0 = min(tmax.xx, tmax.yz);
+			far = min(t0.x, t0.y);
+
+			if( far <= 0.0 ||far < near ) {
+				far = -1.0;
+				near = 0.0;
+			}
+		}
+
+		void IntersectRayCube(float3 rayOrigin, float3 rayDir, float3 lightPos, float3 lightDir, float3 xAxis, float radius, float scaleX, float scaleY, out float near, out float far)
+		{
+			float3		X = -lightDir;
+			float3		Z = normalize( cross( X, xAxis ) );
+			float3		Y = cross( X, Z );
+			float3x3	Spot2World = float3x3( X, Y, Z );
+			float3x3	matScale = float3x3(1.0/scaleX, 0.0, 0.0,
+											0.0, 1.0/scaleY, 0.0,
+											0.0, 0.0, 1.0 );
+			Spot2World = mul( matScale, Spot2World );
+
+			float3 org = mul(  Spot2World, rayOrigin - lightPos  );
+			float3 dir = mul(  Spot2World, rayDir );
+
+			// compute intersection of ray with all six bbox planes
+			radius = radius/sqrt(2.0);
+			float3 invR = 1.0/dir;
+			float3 tbot = invR * (-radius - org);
+			float3 ttop = invR * (radius - org);
+
+			// re-order intersections to find smallest and largest on each axis
+			float3 tmin = min (ttop, tbot);
+			float3 tmax = max (ttop, tbot);
+
+			// find the largest tmin and the smallest tmax
+			float2 t0 = max(tmin.xx, tmin.yz);
+			near = max(t0.x, t0.y);
+			t0 = min(tmax.xx, tmax.yz);
+			far = min(t0.x, t0.y);
+
+			// check for hit
+			if( far <= 0.0 || far < near ) {
+				//out of box
+				far = -1.0;
+				near = 0.0;
+			} else if( near <= 0.0 ) {
+				//inside box
+				near = 0.0;
+			}
+		}
+		
+	#endif	//INTERSECTION_TEST
+	}
+}

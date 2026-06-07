@@ -1,0 +1,146 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef SURFACE_CONTEXT_INCLUDED
+		#define SURFACE_CONTEXT_INCLUDED
+		
+		// =======================================================================
+		// Surface Context Structure
+		//
+		struct	SurfaceContext
+		{
+			uint2		pixelIndex;
+			float3		wsPosition;
+			float3		wsPositionHacked;			// For shadow fetch (in case of objects using depth hack, e.g. player hands)
+			float3		wsView;
+			float		distance;					// bmayaux(2015-06-12) Distance from camera to pixel
+
+			// Tangent space
+			#if $twoSidedLighting
+			float		frontFaceFactor;			// bmayaux (2015-12-02) Stored for materials requiring it (used by vegetation to reverse translucency)
+			#endif
+			float3		wsNormal;					// This normal is always the one we must use for specular lighting
+			float3		wsTangent;
+			float3		wsBiTangent;
+			float3		wsVertexNormal;
+			float3		wsVertexTangent;			// bmayaux (2015-02-11)
+			float3		wsVertexBiTangent;
+
+			// Diffuse
+			float3		diffuseAlbedo;
+
+			// Specular
+			float		roughness;					// Roughness in [0,1]
+			float		metallic;					// Metallic in [0,1] (DEBUG PURPOSE)
+			float		anisotropy;					// Anisotropy value in [0,1]
+			float		anisotropyAngle;
+			float		sheen;						// Sheen in [-1,1] saturation/desaturation of velvet appearance
+			float		sheenImportance;			// Sheen exponent to increase the area inside the object covered by the sheen effect
+			float3		IOR;						// Index of refraction for R,G,B wavelengths
+			float		fresnelStrength;			// Artificial Fresnel strength control in [0,1]
+
+			// Fuzz
+			#if $(fuzz/enable) && $(fuzz/hasMask)
+				float fuzzMask;
+			#endif
+			
+			// Translucency
+			float		translucency;				// Translucency weight (either based on a map or vertex color alpha)
+
+			// Emissive
+			float3		emissive;
+
+			// Ambient & Directional Occlusion
+			#if $useSelfShadowedBumpMap
+				float4		AO;						// X=AO, YZW = directional occlusion
+				// World-space HL2 basis
+				float3		wsHL2Basis_R;
+				float3		wsHL2Basis_G;
+				float3		wsHL2Basis_B;
+				float3		wsHL2Basis_N;			// Additional vector in the direction of the original geometric normal where we KNOW the lighting is unoccluded
+			#else
+				float		AO;
+			#endif
+
+			// IBL & Indirect Lighting using Spherical Harmonics
+			#if $useMultiInstancing || $(tool/usePerVertexSH)
+				uint3		IBLCubeMapIndex;		// Index of the IBL cube map to use
+				float3		barycentric;			// barycentric coordinates
+			#else			
+				uint		IBLCubeMapIndex;		// Index of the IBL cube map to use
+			#endif
+			float			IBLLuminanceFactor;		// ARKANE: bmayaux (2014-10-31) IBL is now also influenced by SH bounce factors
+			float3			Irradiance[4];			// bmayaux (2015-02-11) 4 irradiance values along principal directions used for indirect lighting and diffuse IBL
+			float3			coarseIL;				// Result of vertex SH evaluation for low quality rendering
+
+
+			// 8===========================================================D
+			// Optional additional surface info required by the BRDF
+			#if BRDF_SURFACE_INFO_OK
+				BRDFSurfaceInfo	userData;
+			#endif
+
+
+			//////////////////////////////////////////////////////////////
+			// Methods
+			void Clear() {
+				pixelIndex = uint2(0,0);
+				wsPositionHacked = float3(0,0,0);
+				wsPosition = float3(0,0,0);
+				wsView = float3(0,0,1);
+				distance = 0.0;
+				#if $twoSidedLighting
+				frontFaceFactor = 1.0;
+				#endif
+				wsNormal = float3(0,0,1);
+				wsTangent = float3(1,0,0);
+				wsBiTangent = float3(0,1,0);
+				wsVertexNormal = float3(0,1,0);
+				wsVertexTangent = 0.0;
+				wsVertexBiTangent = 0.0;
+				diffuseAlbedo = float3(0,0,0);
+				roughness = 0.0;
+				metallic = 0.0;	// (DEBUG PURPOSE)
+				anisotropy = 0.0;
+				anisotropyAngle = 0.0;
+				sheen = 0.0;
+				sheenImportance = 0.0;
+				IOR = float3(0,0,0);
+				fresnelStrength = 0.0;
+				translucency = 0.0;
+				emissive = float3(0,0,0);
+
+				#if $(fuzz/enable) && $(fuzz/hasMask)
+					fuzzMask = 0.0f;
+				#endif
+			
+				#if $useSelfShadowedBumpMap
+					AO = float4(0,0,0,0);
+					wsHL2Basis_R = float3(1,0,0);
+					wsHL2Basis_G = float3(0,1,0);
+					wsHL2Basis_B = float3(0,0,1);
+					wsHL2Basis_N = float3(0,1,0);
+				#else
+					AO = 0.0;
+				#endif
+
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					IBLCubeMapIndex = uint3(0,0,0);
+					barycentric = float3(0,0,0);
+				#else			
+					IBLCubeMapIndex = 0;
+				#endif
+				IBLLuminanceFactor = 0.0;
+				Irradiance[0] = Irradiance[1] = Irradiance[2] = Irradiance[3] = 0.0;
+				coarseIL = float3(0,0,0);
+
+				// =============== Clear any additional info required by the BRDF ===============
+				#if BRDF_SURFACE_INFO_OK
+					userData.Clear();
+				#endif
+			}
+		};
+
+		#endif //SURFACE_CONTEXT_INCLUDED
+	}
+}

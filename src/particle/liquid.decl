@@ -1,0 +1,214 @@
+{
+	newstyle
+	options {
+		noshadow	1
+		isParticle	1
+	}
+
+	parms {
+		stageSort sortTrans
+	}
+
+	state {
+		blend SRC_ALPHA ONE
+	}
+
+	hlsl_prefix {
+		#include <particles>
+		#include <particles_instancing>
+		#include <indirectLighting/common>
+	}
+
+	hlsl_vp_main {
+
+		#inlinefile <includes/arkVertex.inc>
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+
+		// Convert back from 16 bit vertex elements.
+		@texcoords.xyzw = GetParticleTextureCoordinates( victx, $vertex_texcoord4 );
+		@legacy_color = GetParticleColor( victx, $vertex_color );
+
+		#if (!$isShadow && !$isZPrePass && !$isMasking) && $(fx/opt/use_reflexion)
+			@wsNormal = vout.m_wsNormal;
+		#endif
+
+		// Soft contact
+		#if ($(fx/opt/use_softcontact) >= SOFT_CONTACT_CUBIC) && (!$isShadow && !$isZPrePass)
+			#if $useDirectInstancing
+				@particleCenterSize = float4( GetTranslation( vout ), GetParticleRadius( victx ) );
+			#else
+				@particleCenterSize = $vertex_texcoord5;
+			#endif
+		#endif
+
+		#if $isZPrePass && !$isZPrePassAlpha && !$isAlpha
+			//The motion vector generation for motion blur & temporalAA is done here
+			VertexOutContext previousFrameVout = TransformVertex( victx, true );
+			@psPosition = vout._projPosition;
+			@psPreviousPosition = previousFrameVout._projPosition;
+		#endif
+	}
+
+	hlsl_fp_main {
+
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+
+		float2 uv = 0.0;
+		float2 uv_flow = 0.0;
+		float4 color = 0.0;
+
+		float alpha = 0;
+		float alpha_outer = 0;
+		float alpha_mask = 1;
+
+		float fresnel = 0;
+
+		#if $isZPrePass && !$isZPrePassAlpha && !$isAlpha 
+			//Motion vector
+			float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+			psMotionVector -= $jitterRelativeToPreviousFrame;
+			psMotionVector *= 0.5f;
+			psMotionVector.y *= -1.0f;
+			@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+		#endif
+
+		// read the flowmap to get the texture uv offset
+		//----------------------------------------------------------------------------------------------
+		#if  $(fx/opt/use_flow_map)
+			float2 FlowMap_offset_uv = 	pow ( $(fx/flowmap).Sample( $trilinearSampler, $texcoords.xy ), 1/2.2 ) * 2 - 1;
+			uv_flow.xy = ( FlowMap_offset_uv.xy ) * $flowmap_strength.xx * ( $legacy_color.xx * 2 - 1 );
+		#endif
+		//----------------------------------------------------------------------------------------------
+
+
+		// read the alpha mask texture, controls a vertical scroll and set the inner alpha
+		//----------------------------------------------------------------------------------------------
+
+		#if $(fx/opt/use_flow_mask)
+			float2 uv_alpha_mask;
+			#if $(fx/opt/use_reflexion)
+				uv_alpha_mask.x = $texcoords.x;
+				uv_alpha_mask.y = $texcoords.y + $legacy_color.y;
+				alpha_mask = $(fx/liquid_mask).Sample( $trilinearSampler, uv_alpha_mask ).x;
+			#else
+				uv_alpha_mask.x = $texcoords.x;
+				uv_alpha_mask.y = $texcoords.y * 0.5 + $legacy_color.y;
+				alpha_mask = $(fx/liquid_mask).Sample( $trilinearSampler, uv_alpha_mask ).x;
+			#endif
+		#endif
+		//----------------------------------------------------------------------------------------------
+
+
+		// read the opacity texture with the flow map uv offset and set the inner alpha
+		//----------------------------------------------------------------------------------------------
+		uv = $texcoords.xy;
+		uv.x = pow ( $(fx/opacity).Sample( $trilinearSampler, $texcoords.xy + uv_flow.xy ).x, 2.2 ) - 0.01f;
+		uv.x = uv.x - ( 1 - pow ( $legacy_color.w, 0.5 ) );
+		alpha = clamp ( uv.x * 1, 0, 1 );
+		//----------------------------------------------------------------------------------------------
+
+
+		// use the opacity.x to read in the lookup and build the final alpha
+		//----------------------------------------------------------------------------------------------
+		uv.x *= pow ( $legacy_color.w, 0.5 );
+		uv.y = 0.5;
+		color.xyz = $(fx/lookup).Sample( $trilinearSampler, uv ).xyz;
+
+		color.x = clamp ( color.x, 0, 1 );
+		color.y = clamp ( color.y, 0, 1 );
+
+		alpha_outer = abs( ( color.y + color.x ) * $liquid_outer_alpha );
+		alpha = alpha * ( $liquid_inner_alpha +  alpha_outer * $liquid_outer_alpha );
+		alpha = clamp ( alpha * 10, 0, 1 ) * alpha_mask;
+		//----------------------------------------------------------------------------------------------
+
+
+		// read and tweak the normals using the lookup values
+		//----------------------------------------------------------------------------------------------
+		float3 tsNormal = UnpackBC5NormalMap( $(fx/normals).Sample( $trilinearSampler, $texcoords.xy + uv_flow.xy ).xy );
+
+		float a = /*1 - */ abs ( tsNormal.x );
+		float b = /*1 - */ abs ( tsNormal.y );
+
+		fresnel = ( clamp ( pow ( (a * a + b * b), $fresnel_power), 0, 1 ) ) * alpha;
+		tsNormal.xy = tsNormal.xy * ( color.x - color.y );
+		tsNormal.z = 1.0f;
+		//----------------------------------------------------------------------------------------------
+
+		float clipPlaneDot = dot( $(fx/ClipPlane).xyz, pixelCtx.m_wsPosition ) + $(fx/ClipPlane).w;
+		clip( sign( clipPlaneDot ) );
+		alpha *= smoothstep( 0.0, $(fx/ClipPlaneFadeDistance).x, clipPlaneDot );
+
+		#if $isShadow || $isZPrePass
+			ClipAlpha( alpha );
+			return;
+		#else
+			// distord the color uv with the normal map
+			uv.xy = $texcoords.xy + tsNormal.xy * $liquid_Disto_amount;
+
+			// read the color
+			color.xyz = $(fx/diffuse).Sample( $trilinearSampler, uv ).xyz + fresnel.xxx * $fresnel_intensity.xxx * $fresnel_color.xyz;
+
+			float4 overbright = $legacy_color;
+			color = AdjustColor( overbright.xxxx, color );
+
+
+			// reflection, placed here to keep the screen default brightness in the reflexion
+			#if $(fx/opt/use_reflexion)
+				// get the reflexion vector
+				//--------------------------------
+				float3 view_vect = normalize( -$wscamPos.xyz - $wsPosition.xyz );
+				float3 normals;
+
+				//normals = normalize( normals);
+//				normals = normalize($wsNormal);
+				normals = normalize ( $wsNormal + tsNormal );
+//				float3 reflected_vetor = normalize ( reflect ( view_vect, normals ) );
+
+
+				//--------------------------------
+				// here we need to use the vector to read in the IBL
+				// instead we read in the screen texture
+				float4 reflexion;
+				float2 uv_refrac;
+				//uv_refrac.xy = $texcoords.xy + /*reflected_vetor.xz*/normals.xy * $liquid_Disto_reflx.xx;
+				uv_refrac.xy = $texcoords.xy + normals.xy * $liquid_Disto_reflx.xx;
+				reflexion.xyz = $(fx/reflexion).Sample( $trilinearSampler, uv_refrac ).xyz;
+
+//				float3   reflexion = SampleCubeMap( reflected_vetor, 0, $instance_IBLProbeIndex.x ).xyz;
+
+				color.xyz += reflexion.xyz * $liquid_rflx_intensity.xxx;
+			#endif
+
+			color.a = alpha;
+			#if ($(fx/opt/use_softcontact) != SOFT_CONTACT_NONE) && (!$isShadow && !$isZPrePass)
+				color.a *= SoftContact(pixelCtx, $particleCenterSize);
+			#endif
+			
+			// View dependent fade out
+			#if $(fx/opt/view_dependent_fade)
+				diffuseAlbedo.a *= ViewDependentFade( $sv_position.w );
+			#endif
+			
+			
+			#if $isMasking
+				ClipAlpha(color.a);
+				@sv_target = color.a * $(rendering/masking/bendTimeFactor).x;
+			#else
+				float3 result  = color.rgb * ComputeAutoExposure();
+
+				#if $isAlpha && !$isMainPassAlpha
+					writePixel( result.rgb, color.rgb, color.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target = float4(result.rgb, color.a);
+				#endif
+			#endif
+		#endif
+	}
+}

@@ -1,0 +1,45 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	options {
+		forcePixelShader 1
+	}
+
+	hlsl_prefix {
+		#include <dof>
+	}
+
+	hlsl_vp_main {
+		float farDof = 0.0;
+		const float EPSILON = 0.01;
+		float focusDist = 0.0;
+		#if $(PostFX/DOF/AUTOFOCUS)
+			focusDist = $(PostFX/DOF/ZbufferAutofocus)[uint2(0,0)].x;
+		#endif
+
+		float4 focusCS = mul( $projectionMatrix, float4( 0.f, 0.f, -max( $(PostFX/DOF/ZNear), focusDist + $(PostFX/DOF/ZPosClipSpace) - EPSILON ), 1.f ) );
+		focusCS /= focusCS.w;
+		farDof = focusCS.z;
+
+		@sv_position = float4( float3($vertex_position.xy, farDof ), 1.0 );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+		float depth = $(PostFX/DOF/dofBlurMap).SampleLevel( $pointClamp, $texcoord, 0.0f ).g;
+		if(depth == 0.0)
+		{
+		#ifdef PC_MANTLE
+			clip( $alwaysOne - 2 ); /// ugly workaround. Mantle pipeline creation fail in this context with only the discard....
+		#else
+			discard;
+		#endif
+		}
+	}
+}

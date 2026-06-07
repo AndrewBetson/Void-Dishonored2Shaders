@@ -1,0 +1,8 @@
+{
+	newstyle
+	hlsl_prefix {
+		static const float one_centimeter = 0.01f;
+		static const float shred = 31.999f;
+		#include <lightContext>
+	}
+}

@@ -1,0 +1,27 @@
+{
+	newstyle
+
+	state {
+		blend		ONE	ZERO
+		depthWrite	0
+		depthEnable	1
+		depthfunc	GEQUAL
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position.xy = $vertex_position.xx * $(OcclusionQuery/Transform1).xy + $vertex_position.yy * $(OcclusionQuery/Transform1).zw + $(OcclusionQuery/Transform2).xy;
+		@sv_position.z  = $(OcclusionQuery/Transform2).z;
+		@sv_position.w  = 1.0;
+	}
+
+	hlsl_fp_main {
+		#if $(OcclusionQuery/DebugDraw)
+			@sv_target = float4(1.0,0.0,0.5,1.0);
+		#endif
+	}
+}

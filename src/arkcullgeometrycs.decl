@@ -1,0 +1,139 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 64
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+
+		groupshared uint groupOutputSlot;
+		groupshared uint groupOutputNumIndices;
+
+		bool CullTriangle( float4 vertices[ 3 ], uint inverted, uint doubleSided ) {
+			bool culled = false;
+
+			// backface
+			if ( !doubleSided ) {
+				float3x3 m = { vertices[ 0 ].xyw, vertices[ 1 ].xyw, vertices[ 2 ].xyw };
+				const float det = determinant( m ) * ( inverted ? -1.0 : 1.0 );
+				culled = culled || ( det > 0 );
+			}
+
+			// Transform vertices[i].xy into normalized 0..1 screen space
+			int verticesInFrontOfNearPlane = 0;
+			for ( uint i = 0; i < 3; ++i ) {
+				vertices[ i ].xy /= vertices[ i ].w;
+				vertices[ i ].xy /= 2;
+				vertices[ i ].xy += float2( 0.5, 0.5 );
+				if ( vertices[ i ].w < 0 ) {
+					++verticesInFrontOfNearPlane;
+				}
+			}
+
+			if ( verticesInFrontOfNearPlane == 3 ) {
+				culled = true;
+			}
+
+			if ( verticesInFrontOfNearPlane == 0 ) {
+				const float minx = min ( min ( vertices[ 0 ].x, vertices[ 1 ].x ), vertices[ 2 ].x );
+				const float miny = min ( min ( vertices[ 0 ].y, vertices[ 1 ].y ), vertices[ 2 ].y );
+				const float maxx = max ( max ( vertices[ 0 ].x, vertices[ 1 ].x ), vertices[ 2 ].x );
+				const float maxy = max ( max ( vertices[ 0 ].y, vertices[ 1 ].y ), vertices[ 2 ].y );
+
+				culled = culled || ( maxx < 0 ) || ( maxy < 0 ) || ( minx > 1 ) || ( miny > 1 );
+			}
+
+			return culled;
+		}
+	}
+
+	hlsl_cp_main {
+
+		if ( $sv_groupThreadID.x == 0 ) {
+			groupOutputNumIndices = 0;
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		bool triangleCulled = true;
+		uint threadOutputSlot = 0;
+
+		const uint instanceIndex = $(arkCullGeometry/groupsData)[ $sv_groupID.x ];
+		$(arkCullGeometry/instanceData_t) instanceData = $(arkCullGeometry/instanceData)[ instanceIndex ];
+		const uint localGroupId = $sv_groupID.x - instanceData.firstGroupId;
+		const uint triangleId = localGroupId * NUMTHREADX + $sv_groupThreadID.x;
+		
+		const uint inverted = ( instanceData.packedData >> 31 ) & 0x1;
+		const uint doubleSided = ( instanceData.packedData >> 30 ) & 0x1;
+		const uint instanceId = instanceData.packedData & 0x3FFFFFFF;
+
+		const uint idx[ 3 ] = {
+			triangleId * 3 + 0 + instanceData.indexBufferOffset,
+			triangleId * 3 + 1 + instanceData.indexBufferOffset,
+			triangleId * 3 + 2 + instanceData.indexBufferOffset
+		};
+
+		const uint indices[3] = {
+			$(arkCullGeometry/indexData)[ idx[ 0 ] ],
+			$(arkCullGeometry/indexData)[ idx[ 1 ] ],
+			$(arkCullGeometry/indexData)[ idx[ 2 ] ]
+		};
+
+		if ( triangleId < instanceData.numTriangles ) {
+
+			const float4 verts[ 3 ] = {
+				float4( $(arkCullGeometry/vertexData)[ indices[ 0 ] + instanceData.vertexBufferOffset ], 1.0f ),
+				float4( $(arkCullGeometry/vertexData)[ indices[ 1 ] + instanceData.vertexBufferOffset ], 1.0f ),
+				float4( $(arkCullGeometry/vertexData)[ indices[ 2 ] + instanceData.vertexBufferOffset ], 1.0f )
+			};
+
+			const uint matrixInstanceIndex = $instanceBufferIndex[ instanceData.matrixInstanceIndex + instanceId ] & MAX_INSTANCE_MATRICES_BITMASK;
+			$MatrixInstanceType matrixInstanceData = $instanceBuffer[ matrixInstanceIndex ];
+
+			float4 modelVerts[ 3 ];
+			[unroll]
+			for (int i = 0; i < 3; ++i ) {
+				modelVerts[ i ].x = dot( verts[ i ], matrixInstanceData.modelMatrixX );
+				modelVerts[ i ].y = dot( verts[ i ], matrixInstanceData.modelMatrixY );
+				modelVerts[ i ].z = dot( verts[ i ], matrixInstanceData.modelMatrixZ );
+				modelVerts[ i ].w = 1.0f;
+			}
+
+			const float4 worldVerts[ 3 ] = {
+				mul( $viewProjectionMatrix, modelVerts[ 0 ] ),
+				mul( $viewProjectionMatrix, modelVerts[ 1 ] ),
+				mul( $viewProjectionMatrix, modelVerts[ 2 ] )
+			};
+
+			triangleCulled = CullTriangle( worldVerts, inverted, doubleSided );
+
+			if ( !triangleCulled ) {
+				InterlockedAdd( groupOutputNumIndices, 3, threadOutputSlot );
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( $sv_groupThreadID.x == 0 ) {
+			InterlockedAdd( @(arkCullGeometry/indirectArgs)[ instanceData.indirectArgsIndex * 5 + 0 ], groupOutputNumIndices, groupOutputSlot ); // The number of indices to draw for each instance.
+		}
+
+		AllMemoryBarrierWithGroupSync();
+
+		if ( !triangleCulled ) {
+			@(arkCullGeometry/filteredIndices)[ instanceData.outputIndexOffset + groupOutputSlot + threadOutputSlot + 0 ] = indices[ 0 ];
+			@(arkCullGeometry/filteredIndices)[ instanceData.outputIndexOffset + groupOutputSlot + threadOutputSlot + 1 ] = indices[ 1 ];
+			@(arkCullGeometry/filteredIndices)[ instanceData.outputIndexOffset + groupOutputSlot + threadOutputSlot + 2 ] = indices[ 2 ];
+		}
+
+		if ( localGroupId == 0 && $sv_groupThreadID.x == 0 ) {
+			@(arkCullGeometry/indirectArgs )[ instanceData.indirectArgsIndex * 5 + 1 ] = 1;												// The number of instances to draw.
+			@(arkCullGeometry/indirectArgs )[ instanceData.indirectArgsIndex * 5 + 2 ] = instanceData.outputIndexOffset;				// An offset into the index buffer where drawing should begin.
+			@(arkCullGeometry/indirectArgs )[ instanceData.indirectArgsIndex * 5 + 3 ] = instanceData.vertexBufferOffset;				// An offset added to each vertex index.
+			@(arkCullGeometry/indirectArgs )[ instanceData.indirectArgsIndex * 5 + 4 ] = instanceId;									// An offset added to each instance index.
+		}
+	}
+}

@@ -1,0 +1,47 @@
+{
+	newstyle
+
+	options {
+		NUMTHREADX 64
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+
+	hlsl_prefix {
+		#include <arkOceanHelpers>
+	}
+
+	hlsl_cp_main {
+
+		if( $sv_dispatchThreadID.x >= $(ocean/PhysicEval/Count) )
+			return;
+
+		float2 wsPos = $(ocean/PhysicEval/In)[ $sv_dispatchThreadID.x ];
+
+		$(ocean/PhysicEval_t) result;
+
+		const float epsilon = 0.098f; // fft_size / fft_res (TODO don't hardcode it)
+		float foamUnused;
+
+		float camDist = 0.0f; //TODO...
+		float perlinBlendFactor = 0.0f;
+
+		float2 globalMapsUV = wsPos / $(ocean/MasksExtent).x;
+		globalMapsUV += 0.5f;
+		globalMapsUV.x = 1.0 - globalMapsUV.x;
+
+		float waveAmplitudeMask = $(ocean/WaveAmplitudeMask).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+
+		float foamTex = 0.0f;
+
+		result.mHeight = ComputeOceanSurfaceDisplacement( wsPos,                        camDist, perlinBlendFactor, waveAmplitudeMask, true, foamTex, foamUnused ).z;
+		float hdx      = ComputeOceanSurfaceDisplacement( wsPos + float2( epsilon, 0 ), camDist, perlinBlendFactor, waveAmplitudeMask, true, foamTex, foamUnused ).z;
+		float hdy      = ComputeOceanSurfaceDisplacement( wsPos + float2( 0, epsilon ), camDist, perlinBlendFactor, waveAmplitudeMask, true, foamTex, foamUnused ).z;
+
+		result.mNormal = normalize( float3( result.mHeight - hdx, result.mHeight - hdy, epsilon ) );
+
+		result.mHeight += $(ocean/WaterLevel);
+
+		@(ocean/PhysicEval/Out)[ $sv_dispatchThreadID.x ] = result;
+	}
+}

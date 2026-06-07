@@ -1,0 +1,317 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <helper>
+
+		#ifndef BRDF_HAIR_INCLUDED
+		#define BRDF_HAIR_INCLUDED
+
+		#define BRDF_OK 1					// Every BRDF include file must define this so we can easily spot the shader that forgot to include a BRDF model!
+		#define	BRDF_HAIR 1
+		#define	BRDF_SURFACE_INFO_OK	1	// We need additional info for the surface
+		#define TRANSLUCENCY_2SIDED 1
+
+		// Translucency needs both shadow transforms!
+		#if $(translucency_hq/enable)
+			#define	SHADOW_INVERSE_TRANSFORM_REQUIRED	1
+		#endif
+
+		//////////////////////////////////////////////////////////////
+		// Retrieves the values of the pre-integrated BRDF (cf. http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)
+		//	_VdotN, dot( View, Normal )
+		//	_SurfaceRoughness, the surface roughness in [0,1]
+		//
+		// Returns a scale (X) and bias (Y) value to use in the following manner:
+		//
+		//	float3	PreFilteredIrradiance = SampleIBL( Direction, Roughness );	// Or any other source of irradiance
+		//	float3	CorrectedPreFilteredIrradiance = PreFilteredIrradiance * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y);
+		//
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness ) {
+			return $texPreIntegratedBRDF_Ward.SampleLevel( $bilinearClamp, float2( _VdotN, _SurfaceRoughness ), 0.0 ).xy;
+		}
+
+		// ================================================================================================
+		// Hair additional surface info
+		struct BRDFSurfaceInfo {
+
+			// Secondary specular parameters
+			float3		specularMask;
+			float		IblRoughness;
+			float3		fresnelLUT;
+			float		specularNoiseShift;
+			float		specularNoiseMask;
+			float		primarySpecularPower;
+			float		primarySpecularIntensity;
+			float		primarySpecularShift;
+			float		secondarySpecularPower;
+			float		secondarySpecularIntensity;
+			float		secondarySpecularShift;
+			float3		ScatteredIrradiance;
+			float3		transmittance;
+
+			void	Clear() {
+				specularMask = float3(0,0,0);
+				IblRoughness = 0.0;
+				fresnelLUT = float3(0,0,0);
+				specularNoiseShift = 0.0;
+				specularNoiseMask = 0.0;
+				primarySpecularPower = 0.0;
+				primarySpecularIntensity = 0.0;
+				primarySpecularShift = 0.0;
+				secondarySpecularPower = 0.0;
+				secondarySpecularIntensity = 0.0;
+				secondarySpecularShift = 0.0;
+				ScatteredIrradiance = float3(0,0,0);
+				transmittance = float3(1,1,1);
+			}
+		};
+
+		#include <surfaceContext>	// Contains information about the surface
+		#include <lightContext>		// Contains information about the light
+		#include <areaLight>
+		#include <fresnel>
+		#include <colorimetry>
+		#include <translucency>
+		#include <orenNayar>
+
+		// ================================================================================================
+		// Hair specifics
+		float3 ShiftTangent(float3 _wsTangent, float3 _wsNormal, float _shiftAmount) {
+			return normalize(_wsTangent + _shiftAmount * _wsNormal);
+		}
+
+		struct KajiyaKayContext	{
+			float3	wsTangent;
+		};
+
+		// Any BRDF structure must provide the following methods so it's compatible with the IntergrateLighting() function found in lighting.mrpr:
+		//		void	Init( in SurfaceContext _surface );
+		//		void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light );
+		//		void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight );	// bmayaux (2015-07-30) Special for area lights
+		//		void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality );
+		//
+		struct BRDF {
+
+			KajiyaKayContext			m_Kajiya;
+			float3						m_sheenColor;
+
+			//////////////////////////////////////////////////////////////
+			// BRDF Initialization
+			void	Init( in SurfaceContext _Surface ) {
+				// Tangent/Ax, Bitangent/Ay
+				float2	sinCosAnisotropy;
+				sincos( _Surface.anisotropyAngle, sinCosAnisotropy.x, sinCosAnisotropy.y );
+				m_Kajiya.wsTangent = (sinCosAnisotropy.y * _Surface.wsTangent + sinCosAnisotropy.x * _Surface.wsBiTangent);
+
+				// Compute sheen color
+				m_sheenColor = ComputeSheenColor( _Surface.diffuseAlbedo, _Surface.sheen );	// A sheen of -1 will show desaturated color, a sheen of +1 will show fully saturated color
+			}
+
+			//float DiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+			//	return saturate(0.75 *  dot( _Light.m_wsToLight, _Surface.wsNormal ) + 0.25);
+			//}
+
+			float DiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+				return ComputeOrenNayar( _Surface.wsNormal, _Light.m_wsToLight, _Surface.wsView, _Surface.roughness );
+			}
+
+			//Kajiya-Kay Model
+			float SpecularTerm(float3 _wsTangent, float3 _wsToLight, float3 _wsView, float _specularExp) {
+				float3 H = normalize( _wsToLight + _wsView );
+				float3 T = _wsTangent;
+				float dotTH = dot(T, H);
+				float sinTH = sqrt( max( 0.0, 1.0 - dotTH*dotTH ));
+				float dirAtten = smoothstep( -1.0, 0.0, dotTH);
+				return dirAtten * pow(sinTH, _specularExp);
+			}
+
+			float3	ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+				#if $useDiffuseLUT
+					float ndotl = DiffuseTerm( _Surface, _Light );
+					return $hairDiffuseLUT.SampleLevel( $bilinearClamp, float2( ndotl, 0.5 ), 0 ).rgb;
+				#else
+					return DiffuseTerm( _Surface, _Light );
+				#endif
+			}
+
+			void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light ) {
+				#if $(translucency/enable)
+					bool isTranslucent = true;
+				#else
+					bool isTranslucent = false;
+				#endif
+
+				if ( _Light.m_attenuation > 0.0 && (isTranslucent || _Light.m_shadow > 0.0) ) {
+					float3	View = _Surface.wsView;
+					float3	Light = _Light.m_wsToLight;
+					float3	Normal = _Surface.wsNormal;
+					float3	Half_unorm = View + Light;
+					float3	Half = normalize( Half_unorm );
+
+					float	LdotN = saturate( dot( Light, Normal ) );
+					float	VdotN = saturate( dot( View, Normal ) );
+					float	LdotH = dot( Light, Half );
+
+					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+
+					// =================================================================
+					// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+					float3	FresnelSpecular;
+					float3	FresnelDiffuse;
+					float3  diffuseTerm;
+					float3	Irradiance_shadowed;
+
+						FresnelSpecular = FresnelDisney( LdotN, VdotN, LdotH, float3(0,0,0), 0.0 );
+
+						// ====== Fresnel Diffuse with sheen ======
+						FresnelDiffuse = FresnelSpecular * INVPI * lerp( _Surface.diffuseAlbedo, m_sheenColor, _Surface.roughness * pow( FresnelSchlick(VdotN), _Surface.sheenImportance ) );
+						FresnelDiffuse *= 1.0 -  FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength ); // Diffuse Fresnel is always left with what has not been specularly reflected...
+
+						// ====== Diffuse lighting ======
+						#if !$isMainPassAlpha
+						Irradiance_shadowed =  _Light.m_attenuation *_Light.m_shadow * Irradiance;
+						diffuseTerm = ComputeDiffuseTerm( _Surface, _Light );
+						#else // single pass version for underwater
+							Irradiance_shadowed = _Light.m_attenuation * _Light.m_shadow * Irradiance;
+							diffuseTerm = ComputeDiffuseTerm( _Surface, _Light );
+						#endif
+
+					// =================================================================
+					// Should be moved in a real BRDF for hair!
+					float lightLuminance = dot( _Light.m_color, LUMINANCE );
+					float maskLuminance = dot( _Surface.userData.specularMask, LUMINANCE );
+					float Luminance_Irradiance_Shadowed = _Light.m_attenuation * _Light.m_shadow * lightLuminance;
+					//_Surface.sheen *= lightLuminance;
+
+					#if $useFresnelLUT
+						_Result.accumDiffuse += _Surface.userData.fresnelLUT * Irradiance_shadowed * diffuseTerm;
+					#else
+						_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * diffuseTerm;
+					#endif
+
+					// ====== Specular lighting ======
+					// Primary specular
+					float3 wsTangent = ShiftTangent( m_Kajiya.wsTangent, _Surface.wsNormal, _Surface.userData.specularNoiseShift + _Surface.userData.primarySpecularShift );
+					float primarySpecularTerm = SpecularTerm( wsTangent, Light, View, _Surface.userData.primarySpecularPower );
+
+					float3 primarySpecularShadowed = maskLuminance * Irradiance_shadowed;
+					float3 primarySpecularColor = FresnelSpecular * primarySpecularShadowed * primarySpecularTerm;
+
+					// Secondary specular
+					wsTangent = ShiftTangent( m_Kajiya.wsTangent, _Surface.wsNormal, _Surface.userData.specularNoiseShift + _Surface.userData.secondarySpecularShift );
+					float secondarySpecularTerm = SpecularTerm( wsTangent, Light, View, _Surface.userData.secondarySpecularPower );
+
+					float3 secondarySpecularShadowed = _Surface.userData.specularMask * Luminance_Irradiance_Shadowed;
+					float3 secondarySpecularColor = FresnelSpecular * secondarySpecularShadowed * secondarySpecularTerm * _Surface.userData.specularNoiseMask;
+
+					float3 specularCombined = _Surface.userData.primarySpecularIntensity * primarySpecularColor + _Surface.userData.secondarySpecularIntensity * secondarySpecularColor;
+					specularCombined *= _Light.m_SpecularAttn; // Apply attenuation factor from artist settings. (cf. dlaurent for more infos)
+					_Result.accumSpecular += specularCombined;
+
+					#if $(fuzz/enable)
+						float fuzz = pow( 1.0f - VdotN, $(fuzz/fresnel) ) * $(fuzz/intensity);
+						#if $(fuzz/hasMask)
+							fuzz *= _Surface.fuzzMask;
+						#endif
+						_Result.accumSpecular += Irradiance_shadowed * fuzz * LdotN * _Surface.userData.specularNoiseMask;
+					#endif
+
+					// =================================================================
+					// Translucency
+					#if $(translucency/enable)
+
+						float	LdotN_translucency = -dot( Light, _Surface.wsVertexNormal );
+						float	TranslucencyFactor = smoothstep( -$translucencyCoef.w, 0.1, LdotN_translucency ) * _Surface.translucency;
+						float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+						float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * _Surface.diffuseAlbedo;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+						float3	LightVec = Light + $(translucency/distortion) * _Surface.wsVertexNormal;
+						float	LdotV = exp2( saturate( -dot( View, LightVec ) ) * $(translucency/power) - $(translucency/power) );	// Cheap/fast approx. from http://colinbarrebrisebois.com/2012/04/09/approximating-translucency-revisited-with-simplified-spherical-gaussian/
+
+						// Compute simple translucency using bent normal
+						float	Translucency = $(translucency/intensity) * ($(translucency/min) + TranslucencyFactor * LdotV);
+
+						#if $twoSidedLighting
+							_Result.accumEmissive += _Surface.userData.transmittance * Irradiance_shadowed * Translucency;
+						#else
+						if ( _Light.m_ShadowSetup != 0xFFFFFFFF ) {
+							// Copmute complex translucency from depth between zbuffer and shadow
+							float	shadowCoordZ, shadowMapZ; float3	shadowWSPos;
+							GetShadowMapZandPos( _Surface.wsPosition, _Light.m_shadowInfo.mWorldToShadowMat, _Light.m_shadowInfo.mShadowToWorldMat, SHADOW_SLICE_INDEX(_Light.m_shadowInfo.mInfo), _Light.m_isDirectionalLight, shadowCoordZ, shadowMapZ, shadowWSPos );
+							float	depth = LinearStep( $translucencyCoef.z, 0.0, abs(shadowCoordZ -  shadowMapZ) );
+							float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+							_Result.accumEmissive += INVPI * Rho_t * _Surface.userData.transmittance * Irradiance * Translucency * depth * cloudShadow;
+						}
+						#endif
+
+					#endif
+				}
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Area light lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the area light
+			//	_BaseLight, standard information about the original light
+			//
+			void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight ) {
+
+				// Standard lighting
+				COMPUTE_AREA_LIGHT_LIGHTING( _Result, _Surface, _Light );
+
+				// =================================================================
+				// Translucency
+				#if $(translucency/enable)
+					float3	Light = _Light.m_wsLight;
+					float3	View = _Surface.wsView;
+					float	LdotN_translucency = -dot( Light, _Surface.wsVertexNormal );
+					float	TranslucencyFactor = smoothstep( -$translucencyCoef.w, 0.1, LdotN_translucency ) * _Surface.translucency;
+					float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+					float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * _Surface.diffuseAlbedo;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+					float3	LightVec = Light + $(translucency/distortion) * _Surface.wsVertexNormal;
+					float	LdotV = exp2( saturate( -dot( View, LightVec ) ) * $(translucency/power) - $(translucency/power) );	// Cheap/fast approx. from http://colinbarrebrisebois.com/2012/04/09/approximating-translucency-revisited-with-simplified-spherical-gaussian/
+
+					// Compute simple translucency using bent normal
+					float	Translucency = $(translucency/intensity) * ($(translucency/min) + TranslucencyFactor * LdotV);
+
+					#if $twoSidedLighting
+						float3	Irradiance_shadowed = _Light.m_attenuation * _Light.m_shadow * _Light.m_color * _Light.m_irradianceDiffuse;
+						_Result.accumEmissive += _Surface.userData.transmittance * Irradiance_shadowed * Translucency;
+					#else
+					if ( _BaseLight.m_ShadowSetup != 0xFFFFFFFF ) {
+						// Copmute complex translucency from depth between zbuffer and shadow
+						float	shadowCoordZ, shadowMapZ; float3	shadowWSPos;
+						GetShadowMapZandPos( _Surface.wsPosition, _BaseLight.m_shadowInfo.mWorldToShadowMat, _BaseLight.m_shadowInfo.mShadowToWorldMat, SHADOW_SLICE_INDEX(_BaseLight.m_shadowInfo.mInfo), _BaseLight.m_isDirectionalLight, shadowCoordZ, shadowMapZ, shadowWSPos );
+						float	depth = LinearStep( $translucencyCoef.z, 0.0, abs(shadowCoordZ -  shadowMapZ) );
+
+						float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+						_Result.accumEmissive += INVPI * Rho_t * _Surface.userData.transmittance * Irradiance * Translucency * depth;
+					}
+					#endif
+				#endif
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Indirect/Ambient lighting computation
+			void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality ) {
+				float AO = ComputeAmbientOcclusion( _Surface, _Surface.AO.x, _ssao );
+				_Result.accumAmbient += COMPUTE_AMBIENT_LIGHTING( _Surface, AO, _quality );
+
+				#if !$buildingEnvironmentProbe
+					float	roughness = _Surface.userData.IblRoughness * _Surface.userData.IblRoughness;
+					float3	specularRadiance = HQ_ComputeIBL( _Surface, roughness );
+
+					float3	wsNormal = _Surface.wsNormal;
+					float3	wsView = _Surface.wsView;
+					float3	ReflectedView = reflect( -wsView, wsNormal );	// Perfect specular reflection
+					float3	wsTangent = ShiftTangent( m_Kajiya.wsTangent, wsNormal, _Surface.userData.specularNoiseShift + _Surface.userData.primarySpecularShift );
+					float	specularTermFactor = SpecularTerm( wsTangent, ReflectedView, wsView, _Surface.userData.primarySpecularPower );
+
+					_Result.accumSpecular += AO * specularTermFactor * specularRadiance;
+				#endif
+			}
+
+		};
+	#endif	// BRDF_HAIR_INCLUDED
+	}
+}

@@ -1,0 +1,62 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA 
+		blendOp ADD
+		alphaBlend ONE ONE
+		alphaBlendOp MAX
+		
+		depthfunc	ALWAYS
+		depthEnable	0
+		cull none
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+				
+		@sv_position = float4( $vertex_texcoord1.xy * 2 - 1, 0, 1 ); //vout._projPosition;
+		@sv_position.y *= -1;
+		@wsPosition = vout._worldPosition;
+		@wsNormal = vout.m_wsNormal; 
+	}
+
+	hlsl_fp_main {
+
+		float4x4 decalMatrix = float4x4( $decalUVMatrixX, $decalUVMatrixY, $decalUVMatrixZ, $decalUVMatrixW );
+	
+		float4 decalUV = mul( decalMatrix, float4( $wsPosition, 1 ) );
+		
+		clip( $decalCylinderRadius.x - length(decalUV.xz) ); //clip if outside cylinder radius
+		
+		clip( dot( $wsNormal, $wsPosition - $decalCylinderBase.xyz ) ); //clip if normal is pointing toward cylinder
+		
+		decalUV.x = atan2( decalUV.x, decalUV.z );
+		decalUV.x = (decalUV.x + PI) / (2.0f * PI);
+		
+		decalUV.x *= $decalUVTiling.x; //U-Tile
+		
+		clip( decalUV.y );   //clip if above or below the cylinder
+		clip( 1.0 - decalUV.y );
+
+		float4 decal = $decalMap.Sample( $dynamicDecalSampler2, decalUV.xy );
+
+		clip( decal.a - 0.0000001f ); //clip if alpha is 0
+
+		@sv_target = decal;	
+		
+	}
+}

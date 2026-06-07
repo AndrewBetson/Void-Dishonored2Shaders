@@ -1,0 +1,67 @@
+{
+	newstyle
+
+	parms {
+	}
+	
+	state {
+		depthWrite	0
+		depthEnable	1
+		depthfunc	NOTEQUAL
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		float4 DWAO_Blur( float2 texCoords, float4 texCoordOffset0, float4 texCoordOffset1, float4 sampleWeights, float depthThreshold, float centerWeight ) {
+
+			float4 Sample0 = $(SSAO/AODepthBuffer).SampleLevel( $pointClamp, texCoordOffset0.xy, 0.0 );
+			float4 Sample1 = $(SSAO/AODepthBuffer).SampleLevel( $pointClamp, texCoordOffset0.zw, 0.0 );
+			float4 Sample2 = $(SSAO/AODepthBuffer).SampleLevel( $pointClamp, texCoords,          0.0 );
+			float4 Sample3 = $(SSAO/AODepthBuffer).SampleLevel( $pointClamp, texCoordOffset1.xy, 0.0 );
+			float4 Sample4 = $(SSAO/AODepthBuffer).SampleLevel( $pointClamp, texCoordOffset1.zw, 0.0 );
+
+			float CenterDepth = unpack_2byte(Sample2.zw);
+			float4 Depths  = float4( unpack_2byte(Sample0.zw), unpack_2byte(Sample1.zw), unpack_2byte(Sample3.zw), unpack_2byte(Sample4.zw) );
+			float4 Samples = float4( Sample0.x, Sample1.x, Sample3.x, Sample4.x );
+			float4 Shadows = float4( Sample0.y, Sample1.y, Sample3.y, Sample4.y );
+
+			float4 DepthDiff = abs( CenterDepth.xxxx - Depths.xyzw );
+			float ScaledDepthThreshold = depthThreshold * CenterDepth;
+			float4 RejectedSamples = DepthDiff.xyzw > ScaledDepthThreshold.xxxx;
+
+			float4 BlurredValue = lerp( Samples.xyzw, Sample2.xxxx, RejectedSamples.xyzw );
+			float4 BlurredShadow = lerp( Shadows.xyzw, Sample2.yyyy, RejectedSamples.xyzw );
+
+			const float3	SAMPLE_WEIGHTS = float3( 0.251379132, 0.221841291, 0.152469158 );
+			BlurredValue.x = dot( BlurredValue, SAMPLE_WEIGHTS.zyyz );
+			BlurredValue.x += Sample2.x * SAMPLE_WEIGHTS.x;
+
+			BlurredShadow.z = dot( BlurredShadow, SAMPLE_WEIGHTS.zyyz );
+			BlurredShadow.z += Sample2.y * SAMPLE_WEIGHTS.x;
+
+			float4 color = float4( BlurredValue.x, BlurredShadow.z, Sample2.zw );
+			return color;
+		}
+	}
+	
+	hlsl_vp_main {
+		//draw quad on far plane (0 -far don't forget we are greater-equal)
+		@sv_position = float4( $vertex_position.xy, 0.0, 1.0 );
+
+		float4 SampleOffsets0 = ($(DWAO/BlurOffsets0));
+		float4 SampleOffsets1 = ($(DWAO/BlurOffsets1));
+
+		float2 scaledTexCoord = $vertex_texcoord * $resolutionScale;
+		@texcoord = scaledTexCoord;
+		@legacy_texcoord1 = scaledTexCoord.xyxy + SampleOffsets0;
+		@legacy_texcoord2 = scaledTexCoord.xyxy + SampleOffsets1;
+	}
+	hlsl_fp_main {	
+		const float4 sampleWeights	= ($(DWAO/BlurWeights));
+		const float depthThreshold	= ($(DWAO/BlurParams).x);
+		const float centerWeight	= ($(DWAO/BlurParams).y);
+		
+		@sv_target = DWAO_Blur( $texcoord, $legacy_texcoord1, $legacy_texcoord2, sampleWeights, depthThreshold, centerWeight );
+	}
+}

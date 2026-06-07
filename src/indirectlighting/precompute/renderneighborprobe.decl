@@ -1,0 +1,68 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthwrite	1
+		cull		none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+
+		// Compute Neighbor->Probe direction that will serve as the plane normal
+		float3	PlaneNormal = $(indirectLighting/precompute/currentProbePosition) - $(indirectLighting/precompute/neighborProbePosition);
+		float	Distance2Neighbor = length( PlaneNormal );
+		PlaneNormal /= Distance2Neighbor;
+
+		// Rebuild tangent space
+		float3	PlaneTangent = cross( float3( 0, 0, 1 ), PlaneNormal );
+		float3	PlaneBiTangent;
+		float	L = length( PlaneTangent );
+		if ( L > 1e-6 ) {
+			PlaneTangent /= L;
+			PlaneBiTangent = cross( PlaneNormal, PlaneTangent );
+		} else {
+			// Arbitrary basis
+			PlaneTangent = float3( 1, 0, 0 );
+			PlaneBiTangent = float3( 0, 1, 0 );
+		}
+
+		// Expand unit quad from [-1,+1] to an actual world space quad whose size depends on the distance with the probe
+//		float	QuadSize = $(indirectLighting/precompute/quadScaleFactor);	// Old code, increasing size with distance
+//		float	QuadSize = $(indirectLighting/precompute/quadScaleFactor);	// New code: assume a constant surface quad for each probe, probes that are further away will show less area, as it should be...
+		float	QuadSize = $(indirectLighting/precompute/quadScaleFactor) * saturate( 0.25 * Distance2Neighbor );	// Reduce size when neighbors are close
+
+//		float4	wsPosition = float4( $(indirectLighting/precompute/neighborProbePosition) + QuadSize * ($vertex_position.x * PlaneTangent + $vertex_position.y * PlaneBiTangent - PlaneNormal), 1.0 );
+		float4	wsPosition = float4( $(indirectLighting/precompute/neighborProbePosition) + QuadSize * ($vertex_position.x * PlaneTangent + $vertex_position.y * PlaneBiTangent), 1.0 );
+
+		float4	ProjPosition = mul( $viewProjectionMatrix, wsPosition );
+
+		@sv_position = ProjPosition;
+		@wsPosition = wsPosition.xyz;
+		@wsNormal = PlaneNormal;
+		@texcoord = $vertex_position.xy;
+	}
+
+	hlsl_fp_main {
+		float	sqRadius = dot( $texcoord.xy, $texcoord.xy );
+		clip( 1.0 - sqRadius );	// Clip pixels out of the disc
+
+		float3	wsPosition = $wsPosition + 0.0001 * $wsNormal;
+//				wsPosition += $(indirectLighting/precompute/quadScaleFactor) * sqrt( saturate( 1.0 - sqRadius ) ) * $wsNormal;	// Extrude to a sphere
+
+		float	Distance2Plane = distance( wsPosition.xyz, $(indirectLighting/precompute/currentProbePosition) );
+		@sv_target = float4( asfloat( $(indirectLighting/precompute/neighborProbeID) ), Distance2Plane, 0, 0 );
+
+		// Write potentially extruded Z
+		float4	pPosition = mul( $viewProjectionMatrix, float4( wsPosition, 1 ) );
+		@sv_depth = pPosition.z / pPosition.w;
+	}
+}

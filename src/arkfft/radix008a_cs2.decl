@@ -1,0 +1,45 @@
+{
+	newstyle
+	options {
+		#define COHERENCY_GRANULARITY 128
+	
+		NUMTHREADX COHERENCY_GRANULARITY
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	
+	hlsl_prefix {
+		#include <arkFFT/Utility>
+		
+	}
+
+	hlsl_cp_main {
+		uint thread_id = $sv_dispatchThreadID.x;
+	
+		if (thread_id >= $(arkFFT/thread_count).x )
+			return;
+
+		// Fetch 8 complex numbers
+		uint i;
+		float2 D[8];
+		uint iaddr = thread_id << 3;
+		for (i = 0; i < 8; i++)
+			D[i] = $(arkFFT/SrcData)[iaddr + i];
+
+		// Math
+		FFT_forward_8(D);
+
+		// Store the result
+		uint omod = thread_id & ($(arkFFT/ostride).x - 1);
+		uint oaddr = ((thread_id - omod) << 3) + omod;
+		
+		@(arkFFT/DstData)[oaddr + 0 * $(arkFFT/ostride).x] = D[0];
+		@(arkFFT/DstData)[oaddr + 1 * $(arkFFT/ostride).x] = D[4];
+		@(arkFFT/DstData)[oaddr + 2 * $(arkFFT/ostride).x] = D[2];
+		@(arkFFT/DstData)[oaddr + 3 * $(arkFFT/ostride).x] = D[6];
+		@(arkFFT/DstData)[oaddr + 4 * $(arkFFT/ostride).x] = D[1];
+		@(arkFFT/DstData)[oaddr + 5 * $(arkFFT/ostride).x] = D[5];
+		@(arkFFT/DstData)[oaddr + 6 * $(arkFFT/ostride).x] = D[3];
+		@(arkFFT/DstData)[oaddr + 7 * $(arkFFT/ostride).x] = D[7];
+	}
+}

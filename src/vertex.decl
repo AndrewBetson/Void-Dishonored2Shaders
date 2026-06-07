@@ -1,0 +1,438 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+		#ifndef VERTEX_INCLUDED
+		#define VERTEX_INCLUDED
+
+		#if $isShadow == 2
+		#include <shadow_paraboloid>
+		#endif
+
+		#if $useLookatTarget && $useLookatNoisyRoll
+		#include <noise>
+		#endif
+		
+		#define DECAL_TYPE_NONE 0
+		#define DECAL_TYPE_CLIP_MODEL 1
+		#define DECAL_TYPE_CULL_MODEL 2
+		#define DECAL_TYPE_DEPTH_BOX 3
+
+		#define MAX_DECAL_INSTANCES_NUMBITS		8	// If you change this, make sure you also change it in //blacksparrow/idtech5/tech5/engine/renderer/jobs/render/Render_types.h
+		#define MAX_DECAL_INSTANCES				( 1 << MAX_DECAL_INSTANCES_NUMBITS )
+		#define MAX_DECAL_INSTANCES_BITSHIFT	( 32 - MAX_DECAL_INSTANCES_NUMBITS )
+		#define MAX_INSTANCE_MATRICES_BITMASK	( ( 1 << MAX_DECAL_INSTANCES_BITSHIFT ) - 1 )
+
+		struct VertexInContext {
+			float3		_localPosition;
+			#if $isCloth && $isZPrePass
+				float3		_previouslocalPosition;
+			#endif
+			float4		_normal;
+			float4		_tangent;
+			float4		_texcoords;
+			#if !$isCloth && ( $useSkinning || $useSkinning8 )
+				float4		_boneWeights;
+				uint4		_boneIndices;
+
+				#if $useSkinning8
+					float4	_boneWeights1;
+					uint4	_boneIndices1;
+				#endif
+			#endif
+			#if $useMultiInstancing || $useDirectInstancing
+				uint	_instanceID;
+			#endif
+			uint		_vertexID;
+			float3		_barycentricCoordinates;	// bmayaux (2016-07-22) Triplet is now reconstructed from normal's W component (W=-1 is (1,0,0), W=0 is (0,1,0) and W=+1 is (0,0,1))
+		};
+
+		struct VertexOutContext {
+			float3 _localPosition;
+			float3 _normal;
+			float3 _tangent;
+			float4 _texcoords;
+
+			float3 _worldPosition;
+			float3 _viewPosition;
+			float4 _projPosition;
+
+			float4 m_wsTangent;		// bmayaux (2016-07-22) W component is the sign of the tangent (same as provided by input context) => Now the PS must recompose the bi-tangent as the VS does
+			float3 m_wsBiTangent;
+			float3 m_wsNormal;
+
+			// Allow vertex program to access the world matrix
+			float3x4 _worldMat;
+			float3x4 _localSpace;
+
+			// Indirect Lighting Info
+			$(indirectLighting/tetrahedronInfo_t)	_tetrahedron;				// Tetrahedron info
+			#if $useMultiInstancing || $(tool/usePerVertexSH)
+ 				#if defined(PC)
+					float3					_vertexBarycentricCoordinates;		// Barycentric coordinates of this vertex (will be used in the pixel shader to interpolate IBL)
+ 				#endif
+				uint						_vertexInstanceOffset;				// Surface offset in the giant buffer of per-vertex data (add SV_VERTEXID to obtain actual vertex offset). Kept for DEBUG PURPOSE only. Stripped if not used anyway...
+			#else
+				uint						_probeIndexIBL;						// Index of the IBL probe within the texture cube array
+				float4						_tetrahedronBarycentricCoordinates;	// Will be used to blend SH between the 4 probes
+			#endif
+		};
+
+		// The code is W=-1 => (1,0,0), W=0 => (0,1,0) and W=+1 => (0,0,1)
+		float3	ExtractBarycentricsFromNormalW( float _normalW ) {
+			return float3(	saturate( -_normalW ),			// = 1 if W=-1
+							step( abs( _normalW ), 0.5 ),	// = 1 if W=0
+							saturate( _normalW )			// = 1 if W=+1
+						 );
+		}
+
+		// Needs to be included here as it requires the VertexOutContext structure to be defined...
+		#include <indirectLighting/vertex>
+
+		VertexOutContext TransformVertex( in VertexInContext ctx, bool _previousFrameTransform = false ) {
+			VertexOutContext result;
+
+			#if $useMultiInstancing
+				uint visibleInstanceID = $instanceBufferOffset + ctx._instanceID;								// This gives the index in the array of visible instances
+				uint instanceIndex = $instanceBufferIndex[ visibleInstanceID ] & MAX_INSTANCE_MATRICES_BITMASK;	// This remaps the visible instance ID to the index in the global array of all instances (visible or not)
+				$MatrixInstanceType instanceData = $instanceBuffer[ instanceIndex ];
+				float4 modelMatrixX = instanceData.modelMatrixX;
+				float4 modelMatrixY = instanceData.modelMatrixY;
+				float4 modelMatrixZ = instanceData.modelMatrixZ;
+			#elif $useDirectInstancing
+				uint instanceIndex = $instanceBufferOffset + ctx._instanceID;
+				$MatrixDirectInstanceType	instanceData = $directInstanceBuffer[ instanceIndex ];
+
+				float4 modelMatrixX;
+				float4 modelMatrixY;
+				float4 modelMatrixZ;
+
+				if( _previousFrameTransform )
+				{
+					modelMatrixX = instanceData.previousModelMatrixX;
+					modelMatrixY = instanceData.previousModelMatrixY;
+					modelMatrixZ = instanceData.previousModelMatrixZ;
+				}
+				else
+				{
+					modelMatrixX = instanceData.modelMatrixX;
+					modelMatrixY = instanceData.modelMatrixY;
+					modelMatrixZ = instanceData.modelMatrixZ;
+				}
+
+				// bmayaux (2015-02-11) Indirect Lighting Support
+				$IndirectLightingInstanceType	indirectLightingInstanceData = $indirectLightingInstanceBuffer[ instanceIndex ];
+			#else
+				float4 modelMatrixX;
+				float4 modelMatrixY;
+				float4 modelMatrixZ;
+
+				if( _previousFrameTransform )
+				{
+					modelMatrixX = $previousModelMatrixX;
+					modelMatrixY = $previousModelMatrixY;
+					modelMatrixZ = $previousModelMatrixZ;
+				}
+				else
+				{
+					modelMatrixX = $modelMatrixX;
+					modelMatrixY = $modelMatrixY;
+					modelMatrixZ = $modelMatrixZ;
+				}
+			#endif
+
+			#if $useLookatTarget
+				float3 origin = float3( modelMatrixX.w, modelMatrixY.w, modelMatrixZ.w );
+				float3 target = $lookatTarget.xyz;
+				
+				float3 direction = target-origin;
+				float dist = length( direction );
+				
+				float3 col0 = ( dist == 0 ) ? ( float3( 1.0, 0.0, 0.0 ) ) : (direction/dist);
+				float3 col1 = normalize( cross( float3( 0.0, 0.0, 1.0 ), col0 ) );
+				float3 col2 = normalize( cross( col0, col1 ) );
+				float3x3 lookAtMtx = float3x3(	float3( col0.x, col1.x, col2.x )
+											,	float3( col0.y, col1.y, col2.y )
+											,	float3( col0.z, col1.z, col2.z ) );
+				
+				float3x3 scaleMtx = float3x3( float3( $lookatExtraScale*modelMatrixZ.z, 0, 0 ), float3( 0, $lookatExtraScale*modelMatrixZ.z, 0 ), float3( 0, 0, $lookatExtraScale*modelMatrixZ.z ) );
+
+				#if $useLookatNoisyRoll
+					float3 random3 = NoiseHash3_InigoQuilez( origin );
+
+					float vibrationDistanceFactor = $vibrationDistanceFactorRange.x + ( $vibrationDistanceFactorRange.y - $vibrationDistanceFactorRange.x ) * smoothstep( $vibrationDistanceRange.x, $vibrationDistanceRange.y, dist );
+					
+					float initialRoll		 = 		  $initialRollRange.x + ( random3.x * ( $initialRollRange.y - $initialRollRange.x ) );
+					float vibrationAmplitude = $vibrationAmplitudeRange.x + ( random3.z * ( $vibrationAmplitudeRange.y - $vibrationAmplitudeRange.x ) );
+					float vibrationFrequency = $vibrationFrequencyRange.x + ( random3.y * ( $vibrationFrequencyRange.y - $vibrationFrequencyRange.x ) );
+					
+					float roll = initialRoll + vibrationDistanceFactor * vibrationAmplitude * sin( vibrationDistanceFactor * $localTime.x * vibrationFrequency );
+					
+					float sinRoll, cosRoll;
+					sincos( roll, sinRoll, cosRoll );
+
+					float3x3 rollMtx = float3x3(	float3( 1.0, 0.0, 0.0 )
+												,	float3( 0.0, cosRoll,-sinRoll )
+												,	float3( 0.0, sinRoll, cosRoll ) );
+					
+
+					float3x3 rolledMtx = mul( lookAtMtx, rollMtx );
+					float3x3 lookAtScaledMtx = mul( scaleMtx, rolledMtx );
+				#else
+					float3x3 lookAtScaledMtx = mul( scaleMtx, lookAtMtx );
+				#endif
+				
+				modelMatrixX = float4( lookAtScaledMtx[0], modelMatrixX.w );
+				modelMatrixY = float4( lookAtScaledMtx[1], modelMatrixY.w );
+				modelMatrixZ = float4( lookAtScaledMtx[2], modelMatrixZ.w );
+			#endif //useLookatTarget
+			
+			// =============== INDIRECT LIGHTING SUPPORT ===============
+				// ------- PER-VERTEX SH -------
+			#if $useMultiInstancing || $(tool/usePerVertexSH)
+
+				#if $useMultiInstancing
+					uint	instanceBufferOffset = $(indirectLighting/bufferPerVertexReferenceOffsets)[ instanceIndex ];	// Per-Vertex, instanced Indirect Lighting is fetched from a giant buffer. The offset within the giant buffer is found in a buffer of instance offsets.
+				#else	// if $(tool/usePerVertexSH)
+					#if $useDirectInstancing
+						uint	instanceBufferOffset = indirectLightingInstanceData.probeIndexIBL;			// Per-Vertex, instanced Indirect Lighting is fetched from a giant buffer. The offset within the giant buffer is found in the instance data
+																											// Remember the IBL index was used to store the offset within the array instead
+					#else
+						uint	instanceBufferOffset = $instanceBufferOffset;								// Per-Vertex, non-instanced Indirect Lighting is simply provided through a render parm common for the entire object
+					#endif
+				#endif
+
+				result._vertexInstanceOffset = instanceBufferOffset + ctx._vertexID;
+
+				$(indirectLighting/vertexReference_t)	reference = $(indirectLighting/bufferPerVertexReferences)[result._vertexInstanceOffset];
+
+				result._tetrahedron = ReadTetrahedronInfo( reference.indexTetrahedron );
+
+				#if defined(PC)
+					// bmayaux (2016-07-22) Previously passed as a float3 for each vertex, now packed as the W component of the normal
+					result._vertexBarycentricCoordinates = ExtractBarycentricsFromNormalW( ctx._normal.w );
+				#endif
+
+				// ------- PER-OBJECT SH -------
+			#elif $useDirectInstancing && $(tool/usePerVertexSH) == 0
+				// Per-object, instanced Indirect Lighting is provided through a single tetrahedron index and 4 barycentric coordinates found in the instance data
+				result._probeIndexIBL = indirectLightingInstanceData.probeIndexIBL;
+				#if $(indirectLighting/dynamicUseBBoxSHInterpolation) == 0	// When dealing with "large dynamic objects", we're only given the index of the BBox SH structure through the IBL probe index
+					result._tetrahedron = ReadTetrahedronInfo( indirectLightingInstanceData.tetrahedronIndex );
+					result._tetrahedronBarycentricCoordinates = indirectLightingInstanceData.barycentric;
+				#endif
+
+			#elif $useDirectInstancing == 0 && $(tool/usePerVertexSH) == 0
+				// Per-object, non-instanced Indirect Lighting is provided through simple render parms common for the entire object
+				result._probeIndexIBL = $(indirectLighting/dynamicIBLProbeIndex);
+				#if $(indirectLighting/dynamicUseBBoxSHInterpolation) == 0	// When dealing with "large dynamic objects", we're only given the index of the BBox SH structure through the IBL probe index
+					result._tetrahedron = ReadTetrahedronInfo( $(indirectLighting/dynamicTetrahedronIndex) );
+					result._tetrahedronBarycentricCoordinates = $(indirectLighting/dynamicTetrahedronBarycentrics);
+				#endif
+
+			#endif
+
+			result._worldMat = float3x4( modelMatrixX, modelMatrixY, modelMatrixZ );
+			result._localSpace = float3x4( modelMatrixX, modelMatrixY, modelMatrixZ );
+			
+			float4 localPosition = float4( ctx._localPosition, 1.0f );
+
+			#if $isCloth
+				#if $isZPrePass
+				if( _previousFrameTransform ) {
+					localPosition.xyzw = float4( ctx._previouslocalPosition, 1.0f );
+				}
+				#endif
+			#else
+				#if $useSkinning || $useSkinning8
+					Buffer joints;
+					if( _previousFrameTransform ) 
+						joints = $PreviousFrameSkinningMatrices;
+					else
+						joints = $matrices;
+				
+					float4 matX, matY, matZ;
+					uint joint = ctx._boneIndices.r * 3;
+					matX = joints[joint+0] * ctx._boneWeights.x;
+					matY = joints[joint+1] * ctx._boneWeights.x;
+					matZ = joints[joint+2] * ctx._boneWeights.x;
+
+					joint = ctx._boneIndices.g * 3;
+					matX += joints[joint+0] * ctx._boneWeights.y;
+					matY += joints[joint+1] * ctx._boneWeights.y;
+					matZ += joints[joint+2] * ctx._boneWeights.y;
+
+					joint = ctx._boneIndices.b * 3;
+					matX += joints[joint+0] * ctx._boneWeights.z;
+					matY += joints[joint+1] * ctx._boneWeights.z;
+					matZ += joints[joint+2] * ctx._boneWeights.z;
+
+					joint = ctx._boneIndices.a * 3;
+					matX += joints[joint+0] * ctx._boneWeights.w;
+					matY += joints[joint+1] * ctx._boneWeights.w;
+					matZ += joints[joint+2] * ctx._boneWeights.w;
+
+					#if $useSkinning8
+						joint = ctx._boneIndices1.r * 3;
+						matX += joints[joint+0] * ctx._boneWeights1.x;
+						matY += joints[joint+1] * ctx._boneWeights1.x;
+						matZ += joints[joint+2] * ctx._boneWeights1.x;
+
+						joint = ctx._boneIndices1.g * 3;
+						matX += joints[joint+0] * ctx._boneWeights1.y;
+						matY += joints[joint+1] * ctx._boneWeights1.y;
+						matZ += joints[joint+2] * ctx._boneWeights1.y;
+
+						joint = ctx._boneIndices1.b * 3;
+						matX += joints[joint+0] * ctx._boneWeights1.z;
+						matY += joints[joint+1] * ctx._boneWeights1.z;
+						matZ += joints[joint+2] * ctx._boneWeights1.z;
+
+						joint = ctx._boneIndices1.a * 3;
+						matX += joints[joint+0] * ctx._boneWeights1.w;
+						matY += joints[joint+1] * ctx._boneWeights1.w;
+						matZ += joints[joint+2] * ctx._boneWeights1.w;
+					#endif
+
+					float4 tempPosition = localPosition;
+					localPosition.x = dot( tempPosition, matX );
+					localPosition.y = dot( tempPosition, matY );
+					localPosition.z = dot( tempPosition, matZ );
+					localPosition.w = 1.0;
+
+					float3 tempNormal = ctx._normal.xyz;
+					ctx._normal.x = dot( tempNormal, matX.xyz );
+					ctx._normal.y = dot( tempNormal, matY.xyz );
+					ctx._normal.z = dot( tempNormal, matZ.xyz );
+
+					float3 tempTangent = ctx._tangent.xyz;
+					ctx._tangent.x = dot( tempTangent, matX.xyz );
+					ctx._tangent.y = dot( tempTangent, matY.xyz );
+					ctx._tangent.z = dot( tempTangent, matZ.xyz );
+
+					float4x4 trBone2Object	= float4x4( matX, matY, matZ, float4(0,0,0,1 ) );
+					float4x4 trObject2World	= float4x4( modelMatrixX, modelMatrixY, modelMatrixZ, float4(0,0,0,1) );
+					float4x4 trBone2World	= mul(trObject2World, trBone2Object);
+					result._localSpace		= float3x4(trBone2World[0],trBone2World[1],trBone2World[2]);
+
+				#endif
+			#endif
+
+			// local position
+			result._localPosition = localPosition.xyz;
+			result._normal = ctx._normal.xyz;
+
+			// world position
+			result._worldPosition.x = dot( localPosition, modelMatrixX );
+			result._worldPosition.y = dot( localPosition, modelMatrixY );
+			result._worldPosition.z = dot( localPosition, modelMatrixZ );
+			float4 worldPosition = float4( result._worldPosition.xyz, 1.0f );
+
+			// view & projected position
+			#if $useMultiInstancing || $useDirectInstancing || $decalType == DECAL_TYPE_DEPTH_BOX || $useLookatTarget
+				if( _previousFrameTransform )
+				{
+					result._viewPosition = mul( $previousViewMatrix, worldPosition ).xyz;
+					result._projPosition = mul( $previousViewProjectionMatrix, worldPosition );
+				}
+				else
+				{
+					result._viewPosition = mul( $viewMatrix, worldPosition ).xyz;
+					result._projPosition = mul( $viewProjectionMatrix, worldPosition );
+				}					
+			#if $useDirectInstancing
+				result._projPosition.z *= $modelDepthHack.x;
+			#endif
+			#else
+				if( _previousFrameTransform )
+				{
+					result._viewPosition = mul( $previousModelViewMatrix, localPosition ).xyz;
+
+					result._projPosition.x = dot( localPosition, $previousMvpMatrixX );
+					result._projPosition.y = dot( localPosition, $previousMvpMatrixY );
+					result._projPosition.z = dot( localPosition, $previousMvpMatrixZ ) * $modelDepthHack.x;
+					result._projPosition.w = dot( localPosition, $previousMvpMatrixW );
+				}
+				else
+				{
+					result._viewPosition = mul( $modelViewMatrix, localPosition ).xyz;
+
+					result._projPosition.x = dot( localPosition, $mvpMatrixX );
+					result._projPosition.y = dot( localPosition, $mvpMatrixY );
+					result._projPosition.z = dot( localPosition, $mvpMatrixZ ) * $modelDepthHack.x;
+					result._projPosition.w = dot( localPosition, $mvpMatrixW );
+				}
+			#endif
+
+			// texture coordinates
+			result._texcoords.xyzw = ctx._texcoords.xyzw;
+
+			// Transform matrix from vertex local space to world space
+			result.m_wsTangent.x = dot( ctx._tangent.xyz,	modelMatrixX.xyz );
+			result.m_wsTangent.y = dot( ctx._tangent.xyz,	modelMatrixY.xyz );
+			result.m_wsTangent.z = dot( ctx._tangent.xyz,	modelMatrixZ.xyz );
+			result.m_wsTangent.w = ctx._tangent.w;	// Keep sign to pass to PS
+
+			float3	lsBiTangent = cross( ctx._normal.xyz, ctx._tangent.xyz ) * ctx._tangent.w;
+
+			result.m_wsBiTangent.x = dot( lsBiTangent,		modelMatrixX.xyz );
+			result.m_wsBiTangent.y = dot( lsBiTangent,		modelMatrixY.xyz );
+			result.m_wsBiTangent.z = dot( lsBiTangent,		modelMatrixZ.xyz );
+
+			result.m_wsNormal.x = dot( ctx._normal.xyz,		modelMatrixX.xyz );
+			result.m_wsNormal.y = dot( ctx._normal.xyz,		modelMatrixY.xyz );
+			result.m_wsNormal.z = dot( ctx._normal.xyz,		modelMatrixZ.xyz );
+
+// bmayaux (2015-12-03) Fed up with NaNs? Emergency situation? Use Safe normalize!
+#if 1
+			result.m_wsTangent.xyz = normalize( result.m_wsTangent.xyz );
+			result.m_wsBiTangent = normalize( result.m_wsBiTangent );
+			result.m_wsNormal = normalize( result.m_wsNormal );
+#else
+			result.m_wsTangent.xyz = SafeNormalize( result.m_wsTangent.xyz );
+			result.m_wsBiTangent = SafeNormalize( result.m_wsBiTangent );
+			result.m_wsNormal = SafeNormalize( result.m_wsNormal );
+#endif
+
+
+			// =======================================================================
+			// BEGIN: bmayaux (2015-02-02) Added support for paraboloïd shadow mapping
+			#if $isShadow == 2
+				result._projPosition = ParaboloidProjectWorldPosition( result._worldPosition.xyz );
+			#endif
+			// END: bmayaux (2015-02-02)
+
+			// =======================================================================
+			#if $outlineable && $isOutline
+				float3	viewOriginToVertex = normalize( result._worldPosition.xyz - $wsCamPos );
+				result._worldPosition.xyz -= viewOriginToVertex * $outlineDepthBias.xxx;
+				worldPosition = float4( result._worldPosition.xyz, 1.0f );
+				result._projPosition = mul( $viewProjectionMatrix, worldPosition );
+			#endif
+
+			return result;
+		}
+
+		float3 GetTranslation( in VertexOutContext vout ) {
+				float3 result;
+				result.x = vout._worldMat[0].w;
+				result.y = vout._worldMat[1].w;
+				result.z = vout._worldMat[2].w;
+				return result;
+		};
+
+		float4 CalcPosition( float3 pos )
+		{
+			float4 localPosition = float4( pos, 1 );
+
+			float4 result;
+			result.x = dot( localPosition, $mvpMatrixX );
+			result.y = dot( localPosition, $mvpMatrixY );
+			result.z = dot( localPosition, $mvpMatrixZ );
+			result.w = dot( localPosition, $mvpMatrixW );
+			return result;
+		}
+
+		#endif	// VERTEX_INCLUDED
+	}
+}

@@ -1,0 +1,37 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+		
+		#if $decalType != DECAL_TYPE_DEPTH_BOX && !$isShadow && !$isMasking && !$isOutline
+			@sv_position.z -= $zbias.x;  //ARKANE (2015-06-12) - depth inversion
+		#endif
+
+		#if $decalType != DECAL_TYPE_DEPTH_BOX && ( $alphaTest || ( !$isShadow && !$isZPrePass && !$isOutline ) )
+			@texcoords = vout._texcoords;
+		#endif		
+	}
+
+	hlsl_fp_main {
+	#if ( !$isShadow && !$isZPrePass )
+		@sv_target = $debugColor;
+	#endif
+	}
+}

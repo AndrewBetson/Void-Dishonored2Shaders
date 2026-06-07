@@ -1,0 +1,121 @@
+{
+	newstyle
+
+	parms {
+
+	}
+
+	state {
+		blend		ONE ONE_MINUS_SRC_ALPHA
+		depthWrite 0
+		depthfunc	ALWAYS
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <lightContext>
+		#include <PostFX/Debug/DrawText>
+
+		#define g_uMaxNumLightsPerTile 15
+		static const float4 kRadarColors[g_uMaxNumLightsPerTile+1] =
+		{
+			{0,0,0,1},             // black			0
+			{0,0.9255,0.9255,1},   // cyan			1
+			{0,0.62745,0.9647,1},  // light blue	2
+			{0,0,0.9647,1},        // blue			3
+			{0,1,0,1},             // bright green	4
+			{0,0.7843,0,1},        // green			5
+			{0,0.5647,0,1},        // dark green	6
+			{1,1,0,1},             // yellow		7
+			{0.90588,0.75294,0,1}, // yellow-orange	8
+			{1,0.5647,0,1},        // orange		9
+			{1,0,0,1},             // bright red	10
+			{0.8392,0,0,1},        // red			11
+			{0.75294,0,0,1},       // dark red		12
+			{1,0,1,1},             // magenta		13
+			{0.6,0.3333,0.7882,1}, // purple		14
+			{0.847,0.745,0.921,1}, // light-purple  15
+								   // white			>15 lights
+		};
+
+		float IsGridLine(float2 fragCoord)
+		{
+			// Define the size we want each grid square in pixels
+			//float2 vPixelsPerGridSquare = float2($(tlf/tileDim), $(tlf/tileDim));
+			float2 vPixelsPerGridSquare = float2(16.0, 16.0);
+			
+			// fragCoord is an input to the shader, it defines the pixel co-ordinate of the current pixel
+			float2 vScreenPixelCoordinate = fragCoord.xy;
+			
+			// Get a value in the range 0->1 based on where we are in each grid square
+			// fract() returns the fractional part of the value and throws away the whole number part
+			// This helpfully wraps numbers around in the 0->1 range
+			float2 vGridSquareCoords = frac(vScreenPixelCoordinate / vPixelsPerGridSquare);
+			
+			// Convert the 0->1 co-ordinates of where we are within the grid square
+			// back into pixel co-ordinates within the grid square 
+			float2 vGridSquarePixelCoords = vGridSquareCoords * vPixelsPerGridSquare;
+			
+			// step() returns 0.0 if the second parmeter is less than the first, 1.0 otherwise
+			// so we get 1.0 if we are on a grid line, 0.0 otherwise
+			float2 vIsGridLine = step(vGridSquarePixelCoords, float2(1.0,1.0));
+			
+			
+			// Combine the x and y gridlines by taking the maximum of the two values
+			float fIsGridLine = max(vIsGridLine.x, vIsGridLine.y);
+
+			// return the result
+			return fIsGridLine;
+		}
+
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+
+		uint2 _pixelAddr = uint2( $sv_position.xy );
+		uint nNumLightsInThisTile = 0;
+
+		//Count Line
+		for ( uint lightType = 0; lightType < 4; ++lightType ) {
+			uint currentLightIndex = $(tlf/ll/heads)[ (_pixelAddr >> $(tlf/tileDimForLighting)) + lightType*uint2( $(tlf/invTileDimensions).z, 0 ) ];
+			
+			while(currentLightIndex != LC_END_OF_LIST)
+			{
+				$(tlf/ll/node_t) nodePacked = $(tlf/ll/pool)[currentLightIndex];
+				
+				LightNode node;
+				node.mLightIndex = nodePacked.pack & LC_INDEX_MASK;
+				node.mNext = nodePacked.pack >> LC_INDEX_BITS;
+
+				currentLightIndex = node.mNext;
+				nNumLightsInThisTile++;
+			}
+		}
+
+		//Fetch Color
+		float4 col = 0.0;
+		uint nbColor = min( nNumLightsInThisTile, g_uMaxNumLightsPerTile );
+		float4 color = kRadarColors[nbColor];
+		float2 pixelCoords = $sv_position.xy;
+
+		//Draw Digits
+		float2 vPixelsPerGridSquare = 16;// float2($(tlf/tileDim), $(tlf/tileDim));
+		float2 printPos = floor(pixelCoords/vPixelsPerGridSquare) * vPixelsPerGridSquare;
+		printPos.x += nNumLightsInThisTile < 10 ? STRWIDTH(1.0) * 0.5 : 1;
+		printPos.y += vPixelsPerGridSquare.y - (STRHEIGHT(1.0)-vPixelsPerGridSquare.y*0.5-1);
+
+		int zeros = nNumLightsInThisTile < 10 ? 1 : 2;
+		col += 0.5 * color * print_integer(nNumLightsInThisTile, zeros, printPos, pixelCoords);
+
+		//Draw Grid
+		col += 0.125 * color * IsGridLine($sv_position.xy);
+
+		@sv_target = col;
+	}
+}

@@ -1,0 +1,70 @@
+{
+	newstyle
+	parms {
+		stageSort	sortperturber
+	}
+	state {
+		blend		ONE ONE
+		blendOp		ADD
+		depthfunc	ALWAYS
+		alphaBlend	ONE ONE
+		alphaWrite	1
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <pixel>
+		#include <PostFX/screenProgs>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		@texcoords.xy = ComputeRatioAdaptedTexcoord( $vertex_position.xy );
+		@texcoords.zw = float2(0, 0);
+	}
+	hlsl_fp_main {
+
+		#if ( !$isShadow && !$isZPrePass )
+			float4 dist_Opacity = 0.0;
+			float2 dist_Vector = 0.0;
+			float2 dist_Vector_Blur = 0.0;
+
+			// get the blur and distortion Vectors from texture
+			dist_Vector = PanAndReadDistUV( $texcoords, $(fx/disto1), $disto1_RotationSpeed.x, $disto1_PanningSpeed, $disto1_Tilling.xy );
+
+			dist_Vector_Blur = dist_Vector * $disto1_Strength.zw;
+			dist_Vector *= $disto1_Strength.xy;
+
+			#if $(fx/opt/uv_disto2)
+				float2 vector2 = PanAndReadDistUV( $texcoords, $(fx/disto2), $disto2_RotationSpeed.x, $disto2_PanningSpeed, $disto2_Tilling.xy );
+
+				dist_Vector_Blur = ( dist_Vector_Blur + vector2 * $disto2_Strength.zw ) / 2.0;
+				vector2 *= $disto2_Strength.xy;
+
+				dist_Vector = ( dist_Vector + vector2 ) / 2.0;
+			#endif
+
+			// mask the distortion
+			float attenuation = PanAndReadDistUV( $texcoords, $(fx/opacity), $opacity_RotationSpeed.x, $opacity_PanningSpeed.xy, $opacity_Tilling.xy ).x;
+			#if $(fx/opt/DepthModulation)
+				float range = $(fx/opt/DepthModulation/EndDepth).x - $(fx/opt/DepthModulation/StartDepth).x;
+				float Zproj = $(fx/depthFull).SampleLevel( $linearClamp, $sv_position.xy*$positionToViewTexture.zw, 0.0 ).x;
+				float Zscene = ComputeLinearZ( Zproj );
+				float linearZreranged = saturate( (Zscene - $(fx/opt/DepthModulation/StartDepth).x) / (range) );
+				attenuation *= lerp( $(fx/opt/DepthModulation/StartValue).x, $(fx/opt/DepthModulation/EndValue).x, linearZreranged );
+			#endif
+			ClipAlpha(attenuation);
+
+			@sv_target = attenuation * float4( dist_Vector_Blur, dist_Vector ) * $(PostFX/screenQuadFade);
+
+			#if $(PostFX/ratioAdaptation/useClampColor)
+				if( $texcoords.x > 1.0 || $texcoords.x < 0.0 || $texcoords.y > 1.0 || $texcoords.y < 0.0 ) {
+					@sv_target = attenuation * $(PostFX/ratioAdaptation/ClampColor) * $(PostFX/screenQuadFade);
+				}
+			#endif
+		#endif
+	}
+}

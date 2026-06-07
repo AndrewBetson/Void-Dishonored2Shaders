@@ -1,0 +1,14 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <cubeMap/generateMips/Common>
+	}
+	hlsl_cp_main {
+		//@TODO!
+	}
+}

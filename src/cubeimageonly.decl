@@ -1,0 +1,56 @@
+{
+	newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	hlsl_prefix {
+		#include <testImage/common>
+	}
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+		@legacy_texcoord = $vertex_texcoord.xyxy;
+		@legacy_texcoord1 = $vertex_normal;
+	}
+	
+	hlsl_fp_main {
+		float3 UVW = $legacy_texcoord1.xyz;
+
+		if ( ($testImageIntParms0.y & 8) ) {
+			// Ball Mode
+			float2	XY = float2( 2.0 * $legacy_texcoord.x - 1.0, 1.0 - 2.0 * $legacy_texcoord.y );
+			float	sqRadius = dot( XY, XY );
+			clip( 1 - sqRadius );
+			float	Z = sqrt( 1.0 - sqRadius );
+
+			UVW = float3( XY, Z );
+
+			float2	SC;
+			sincos( 0.5 * $time.x, SC.x, SC.y );
+			float3x3	Rot = float3x3(
+				float3( -SC.x, SC.y, 0 ),
+				float3( 0, 0, 1 ),
+				float3( SC.y, SC.x, 0 )
+			);
+			UVW = mul( UVW, Rot );
+		}
+
+		if ( ($testImageIntParms0.y & 2) )
+		{	// Asuint version
+			float4	color = $envMap.SampleLevel( $pointClamp, UVW, $testImageLODAndSlice.x );
+			@sv_target = TransformColorAsUint( $sv_position.xy, asuint( color ) );
+		}
+		else
+		{
+			float4	color = $color * $envMap.SampleLevel( $linearClamp, UVW, $testImageLODAndSlice.x );
+			@sv_target = TransformColor( $sv_position.xy, color );
+		}
+
+		@sv_target.a = $testImageAlpha.x;
+	}
+}

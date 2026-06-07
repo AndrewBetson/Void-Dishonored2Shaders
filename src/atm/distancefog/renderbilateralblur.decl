@@ -1,0 +1,168 @@
+{
+	newstyle
+	state {
+		depthWrite	0
+		depthfunc	ALWAYS
+		depthEnable	0
+		cull		NONE
+		blend		ONE		ZERO
+	}
+
+	hlsl_prefix {
+		#include <helper>
+
+		float4 FetchColor(float2 texCoords)
+		{
+			float4 color = $(atm/distanceFog/TexSourceImage).SampleLevel( $bilinearClamp, texCoords, 0.0 ).rgba;
+			return color;
+		}
+
+		#if $(atm/worldFog/useGaussianBlur)
+			static const int nbSamples = 4;
+			static const float w[ nbSamples ] = { 0.1964825502, 0.2969069647, 0.0944703979, 0.0103813624 };
+			static const float offsets[ nbSamples ] = { 0.0000000000, 1.4117647059, 3.2941176471, 5.1764705882 };
+
+			float FetchDepth(float2 texCoords) {
+				float Zscene = $(water/DownsampledDepthBuffer2).SampleLevel( $linearClamp, texCoords, 0.0 ).x;
+				return Zscene;
+			}
+
+			float ComputeWeight(float2 depthCoords,
+								float radius,
+								float center,
+								float falloff,
+								float sharpness)
+			{
+				float depth = FetchDepth( depthCoords );
+				float avoidNaN = 0.001;
+				float ddiff = depth - center;
+				return exp(   -radius*radius*falloff-ddiff*ddiff*sharpness ) + avoidNaN;	// better quality, less performances
+			}
+
+			float4 BB_Blur_Gaussian( float2 texCoords,
+							float falloff,
+							float sharpness,
+							float2 aInvResolution,
+							float center )
+			{
+				float4 blur = 0.0;
+				float weight_total = 0.0;
+				falloff = 0.0;
+
+				blur += FetchColor(texCoords.xy) * w[0];
+				weight_total += w[0];
+				
+				for ( int i = 1; i < nbSamples; ++i ) {
+					float radius = float(i);
+					float weight1 = w[i] * ComputeWeight(texCoords + float2( aInvResolution.x * offsets[i], 0.0), float(radius), center, falloff, sharpness);
+					float weight2 = w[i] * ComputeWeight(texCoords - float2( aInvResolution.y * offsets[i], 0.0), float(radius), center, falloff, sharpness);
+				
+					blur += FetchColor(texCoords + aInvResolution * offsets[i]) * weight1;
+					blur += FetchColor(texCoords - aInvResolution * offsets[i]) * weight2;
+					weight_total += weight1 + weight2;
+				}
+
+				return blur/weight_total;
+			}
+		#else
+			float FetchDepth(float2 texCoords) {
+				float Zscene = $(water/DownsampledDepthBuffer2).SampleLevel( $pointClamp, texCoords, 0.0 ).y;
+				//float Zscene = SampleLevelDownsampledDepthBufferPoint( texCoords, 0.0 ).z;	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+				return Zscene;
+			}
+
+			float4 ComputeWeight(	float2 texCoords,
+									float radius,
+									float center,
+									float falloff,
+									float sharpness,
+									inout float weight_total	)
+			{
+				float depth = FetchDepth( texCoords );
+				float4 source = FetchColor( texCoords );
+
+				const float avoidNaN = 0.001;
+				float ddiff = depth - center;
+				// better quality, less performances
+				float weight = exp( -radius*radius*falloff -ddiff*ddiff*sharpness ) + avoidNaN;
+				weight_total +=  weight;
+
+				return  weight * source;
+			}
+
+			float4 BB_Blur( float2 texCoords,
+							float blurRadius,
+							float falloff,
+							float sharpness,
+							float2 aInvResolution,
+							float center )
+			{
+				float4 blur = 0.0;
+				float weight_total = 0.00;
+
+				#if !defined( PC )
+					[unroll]
+				#endif
+				for (float radius = -blurRadius; radius <= blurRadius; ++radius)
+				
+				{
+					float2 uv = texCoords.xy + (radius*aInvResolution*(1.0/$resolutionScale.xy));
+					blur += ComputeWeight(uv, radius, center, falloff, sharpness, weight_total);
+				}
+				return blur/weight_total;
+			}
+		#endif
+
+		#if !defined( PC )
+			static const float g_BlurRadius	= 4.0;
+		#endif
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		float4 color;
+		float2 texCoords		= screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+		float4 g_InvResolution	= $(atm/distanceFog/offset);
+		float  center 			= FetchDepth(texCoords);
+
+		#if defined( PC )
+			const float  g_BlurRadius	= $(atm/distanceFog/ratio).x;
+		#endif
+
+		const float  g_BlurFalloff		= $(atm/distanceFog/ratio).y;
+		const float  g_SharpnessNear	= $(atm/distanceFog/ratio).z;
+		const float  g_SharpnessFar		= $(atm/distanceFog/ratio).w;
+		const float  g_zFar				= $(atm/distanceFog/far).x;
+
+		//Sharpness from depth
+		float DepthRanged = LinearStep( 0.0, g_zFar, center );
+		float depthSharpness = lerp( g_SharpnessNear, g_SharpnessFar, DepthRanged );
+		float g_Sharpness = depthSharpness;
+
+		#if $(atm/worldFog/useGodRays)
+			float g_SharpnessGodRays= $(atm/distanceFog/misc).x;
+			float alpha = $(atm/distanceFog/TexShadow).SampleLevel( $linearClamp, texCoords, 0.0 ).r;
+			g_Sharpness = lerp( depthSharpness, g_SharpnessGodRays, alpha );
+		#endif
+		
+		#if $(atm/worldFog/useGaussianBlur)
+			#if $(ATM/DISTANCEFOG/BILATERAL/HORIZONTAL) == 1
+				color = BB_Blur_Gaussian( texCoords, g_BlurFalloff, g_Sharpness, float2(g_InvResolution.x, 0.0), center );
+			#else
+				color = BB_Blur_Gaussian( texCoords, g_BlurFalloff, g_Sharpness, float2(0.0, g_InvResolution.y), center );
+			#endif
+		#else
+			#if $(ATM/DISTANCEFOG/BILATERAL/HORIZONTAL) == 1
+				color = BB_Blur( texCoords, g_BlurRadius, g_BlurFalloff, g_Sharpness, float2(g_InvResolution.x, 0.0), center );
+			#else
+				color = BB_Blur( texCoords, g_BlurRadius, g_BlurFalloff, g_Sharpness, float2(0.0, g_InvResolution.y), center );
+			#endif
+
+		#endif
+		
+		@sv_target = color;
+	}
+}

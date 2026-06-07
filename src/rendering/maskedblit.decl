@@ -1,0 +1,25 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		blend ONE ONE
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float mask = $(rendering/Mask).SampleLevel( $bilinearClamp, $texcoord * $(rendering/ResolutionScale), 0.0f ).x;
+		float4 color = $(rendering/BufferIn).SampleLevel( $bilinearClamp, $texcoord * $(rendering/ResolutionScale), 0.0f ).x;
+		@sv_target = color * mask;
+	}
+}

@@ -1,0 +1,27 @@
+{
+	newstyle
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+	}
+	hlsl_prefix {
+		#include <vertex>
+	}
+	
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+	}	
+	
+	hlsl_fp_main {
+		uint2	Pixel = uint2( floor( $sv_position.xy ) );
+		bool	Odd = ((Pixel.x >> 2) ^ (Pixel.y >> 2)) & 1;
+		@sv_target = Odd ? float4(1.0,0.5,0.0,1.0) : float4(0.5,0.0,1.0,1.0);
+	}
+}

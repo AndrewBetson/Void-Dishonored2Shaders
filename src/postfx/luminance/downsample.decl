@@ -1,0 +1,171 @@
+{
+	newstyle
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+	
+	hlsl_prefix {
+		#include <colorimetry>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	hlsl_fp_main {
+
+		#if 1
+
+			float2	UV = $sv_position.xy * $positionToViewTexture.zw;
+
+			#if $(PostFX/Luminance/firstPass)
+
+				#if 1
+					// Single tap version is cheap but bloom flickers a lot!
+					float4 V;
+					V.xyz = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	// UV is in the middle of the pixel so it will use bilinear filtering of 4 pixels
+				#else
+					// Multi-tap is more expensive but bloom is much steadier
+					float3	dUV = float3( $positionToViewTexture.zw, 0.0 );	// This delta moves us one pixel in XY in our render target (so it's twice larger as the dUV of the source)
+					//dUV *= 0.5;
+				 	UV -= dUV.xy;	// Top-left corner
+
+					#if 1	// This fixes the black squares problem from degenerate tangent space: skips the -oo values
+						float3	V00 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.xz;	// Top-left
+						float3	V01 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.xz;	// Top
+						float3	V02 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.zy;	// Top-right
+						float3	V12 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.zy;	// Right
+						float3	V11 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV -= dUV.xz;	// Center
+						float3	V10 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV -= dUV.xz;	// Left
+						float3	V20 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.xz;	// Bottom-left
+						float3	V21 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );	UV += dUV.xz;	// Bottom
+						float3	V22 = max( 0.0, RangeExpandColorFromR11G11B10( $viewColorMap.Sample( $linearClamp, UV ).xyz ) );					// Bottom-right
+					#else
+						float3	V00 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.xz;	// Top-left
+						float3	V01 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.xz;	// Top
+						float3	V02 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.zy;	// Top-right
+						float3	V12 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.zy;	// Right
+						float3	V11 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV -= dUV.xz;	// Center
+						float3	V10 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV -= dUV.xz;	// Left
+						float3	V20 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.xz;	// Bottom-left
+						float3	V21 = $viewColorMap.Sample( $linearClamp, UV ).xyz;	UV += dUV.xz;	// Bottom
+						float3	V22 = $viewColorMap.Sample( $linearClamp, UV ).xyz;					// Bottom-right
+					#endif
+
+				 	float4	V;
+// 					V.xyz = ( 0.125 * (V00 + V02 + V20 + V22) +
+// 				 			  0.500 * (V01 + V10 + V12 + V21) +
+// 				 			  V11) * (1.0 / 3.5);
+
+					V.xyz = (1.0 / 9.0) * (V00 + V01 + V02 + V10 + V11 + V12 + V20 + V21 + V22);
+				#endif
+
+				V.w = dot( V.xyz, LUMINANCE );
+
+			#else
+
+				#if 0
+					// Cheap single sample
+					float4	V = $viewColorMap.Sample( $linearClamp, UV );
+
+				#elif 1
+					// 4-taps that soften rendering a lot!
+					float3	dUV = float3( $positionToViewTexture.zw, 0.0 );	// This delta moves us one pixel in XY in our render target (so it's twice larger as the dUV of the source)
+
+					#if 1
+						// Offset square
+ 						UV -= 0.5 * dUV.xy;	// Offset half pixel so we keep being centered and avoid biasing to any particular direction
+
+// const float	GAP = 0.5;
+// UV -= GAP * dUV.xy;
+// dUV *= 2.0 * GAP;
+
+						float4	V00 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.xz;
+						float4	V01 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.zy;
+						float4	V11 = $viewColorMap.Sample( $linearClamp, UV );	UV -= dUV.xz;
+						float4	V10 = $viewColorMap.Sample( $linearClamp, UV );
+
+						float4	V = 0.25 * (V00 + V01 + V10 + V11);
+					#else
+						// Cross shaped
+						float4	V = $viewColorMap.Sample( $linearClamp, UV );	UV -= 0.5 * dUV.zy;	// Center
+						float4	V00 = $viewColorMap.Sample( $linearClamp, UV );	UV += 2.0 * dUV.zy;	// Top
+						float4	V01 = $viewColorMap.Sample( $linearClamp, UV );	UV -= dUV.xy;		// Bottom
+						float4	V11 = $viewColorMap.Sample( $linearClamp, UV );	UV += 2.0* dUV.xz;	// Left
+						float4	V10 = $viewColorMap.Sample( $linearClamp, UV );						// Right
+
+						V = 0.5 * (V + 0.25 * (V00 + V01 + V10 + V11));
+					#endif
+
+				#else
+					// 8-tap is more expensive but bloom is much steadier
+					float3	dUV = float3( $positionToViewTexture.zw, 0.0 );	// This delta moves us one pixel in XY in our render target (so it's twice larger as the dUV of the source)
+
+				 	UV -= dUV.xy;	// Top-left corner
+
+				 	float4	V00 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.xz;	// Top-left
+				 	float4	V01 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.xz;	// Top
+				 	float4	V02 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.zy;	// Top-right
+				 	float4	V12 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.zy;	// Right
+				 	float4	V11 = $viewColorMap.Sample( $linearClamp, UV );	UV -= dUV.xz;	// Center
+				 	float4	V10 = $viewColorMap.Sample( $linearClamp, UV );	UV -= dUV.xz;	// Left
+				 	float4	V20 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.xz;	// Bottom-left
+				 	float4	V21 = $viewColorMap.Sample( $linearClamp, UV );	UV += dUV.xz;	// Bottom
+				 	float4	V22 = $viewColorMap.Sample( $linearClamp, UV );					// Bottom-right
+				 
+					// Gaussian weights
+				 	float4	V = ( 0.39024390243902439024390243902439 * (V00 + V02 + V20 + V22) +
+				 				  0.63414634146341463414634146341463 * (V01 + V10 + V12 + V21) +
+				 				  V11) * (1.0 / 5.0975609756097560975609756097561);
+
+//					float4	V = (1.0 / 9.0) * (V00 + V01 + V02 + V10 + V11 + V12 + V20 + V21 + V22);
+				#endif
+
+			#endif
+
+			@sv_target = V;
+
+		#else
+
+			uint2	PixelPosition = 2 * uint2( floor( $sv_position.xy ) );	// *2 because source is twice as large as target
+			float4	V00 = $viewColorMap[PixelPosition];	PixelPosition.x++;
+			float4	V01 = $viewColorMap[PixelPosition];	PixelPosition.y++;
+			float4	V11 = $viewColorMap[PixelPosition];	PixelPosition.x--;
+			float4	V10 = $viewColorMap[PixelPosition];	PixelPosition.y--;
+
+// Shouldn't we simply use a bilinear filter at the pixel's center instead??
+
+			#if $(PostFX/Luminance/firstPass)
+
+				// Initialize luminances from RGB
+				float4	Luminances = float4(
+					dot( V00.xyz, LUMINANCE ),
+					dot( V01.xyz, LUMINANCE ),
+					dot( V10.xyz, LUMINANCE ),
+					dot( V11.xyz, LUMINANCE )
+				);
+
+			#else
+				// Simply read alpha
+				float4	Luminances = float4( V00.w, V01.w, V10.w, V11.w );
+
+			#endif
+
+			// Compute average color
+			float3	AverageColor = 0.25 * (V00.xyz + V01.xyz + V10.xyz + V11.xyz);
+
+// 			// Compute max luminance
+// 			float2	MaxLuminance2 = max( Luminances.xy, Luminances.zw );
+// 			float	FinalLuminance = max( MaxLuminance2.x, MaxLuminance2.y );
+
+			// Compute average luminance
+			float	FinalLuminance = 0.25 * (Luminances.x + Luminances.y + Luminances.z + Luminances.w);
+
+			@sv_target.xyz = AverageColor;
+			@sv_target.w = FinalLuminance;
+
+		#endif
+	}
+}

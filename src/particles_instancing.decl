@@ -1,0 +1,55 @@
+{
+	newstyle
+
+	hlsl_prefix {
+	#ifndef PARTICLE_INSTANCING
+	#define PARTICLE_INSTANCING
+
+		void ApplyAxisFlip( inout float _axis, in uint _flip ) {
+			const float g_flipAxisScale[2] = { 1.0, -1.0f };
+			const float g_flipAxisOffsets[2] = { 0.0, 1.0f };
+			_axis = mad( _axis, g_flipAxisScale[ _flip ], g_flipAxisOffsets[ _flip ] );
+		}
+
+		float4 GetParticleTextureCoordinates( in VertexInContext ctx, in float4 texcoord4 ) {
+			#if $useDirectInstancing
+				const float g_inv14BitsSeed = 1.0f / 0x03fff;
+
+				uint instanceIndex = $instanceBufferOffset + ctx._instanceID;
+				$ParticleParametersInstanceType instanceData = $particleParametersBuffer[ instanceIndex ];
+				float4 coords;
+				coords.xy = ctx._texcoords.xy;
+				ApplyAxisFlip( coords.x,(instanceData.flipbook_seed_uv >> 30) & 1); 	// FLIP U (bit 30)
+				ApplyAxisFlip( coords.y, instanceData.flipbook_seed_uv >> 31 ); 		// FLIP V (bit 31)
+				coords.z = f16tof32( instanceData.flipbook_seed_uv ); // first 16bits is the flipbook half
+				coords.w = ((instanceData.flipbook_seed_uv >> 16) & 0x03fff) * g_inv14BitsSeed;
+				return coords;
+			#else
+				return texcoord4;
+			#endif
+		}
+
+		float4 GetParticleColor( in VertexInContext ctx, in float4 color ) {
+			#if $useDirectInstancing 
+				uint instanceIndex = $instanceBufferOffset + ctx._instanceID;
+				$ParticleParametersInstanceType instanceData = $particleParametersBuffer[ instanceIndex ];
+				return color * unpack4_u8tof32( instanceData.color );
+			#else
+				return color;
+			#endif
+		}
+
+		float GetParticleRadius( in VertexInContext ctx ) {
+			#if $useDirectInstancing 
+				uint instanceIndex = $instanceBufferOffset + ctx._instanceID;
+				$ParticleParametersInstanceType instanceData = $particleParametersBuffer[ instanceIndex ];
+				return f16tof32( instanceData.size );
+			#else
+				return 1.73f; // sqrt( 1+1+1 )
+			#endif 
+		}
+
+	//=============================================================================
+	#endif //PARTICLE_INSTANCING
+	}//hlsl_prefix
+}

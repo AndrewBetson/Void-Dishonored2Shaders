@@ -1,0 +1,48 @@
+{
+	newstyle
+	
+	state {
+		cull none
+		depthFunc always
+		depthWrite 0
+	}
+	
+	options {
+	}
+	
+	hlsl_prefix {		
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+
+		const int fftRes = 512;
+		
+		float2 uv = $sv_position.xy / fftRes;
+		
+		float3 displace_left  = $(FFTWaves/FFTDisplacement).Sample( $pointWrap, uv, int2( -1,  0 ) ).xyz;
+		float3 displace_right = $(FFTWaves/FFTDisplacement).Sample( $pointWrap, uv, int2(  1,  0 ) ).xyz;
+		float3 displace_back  = $(FFTWaves/FFTDisplacement).Sample( $pointWrap, uv, int2(  0, -1 ) ).xyz;
+		float3 displace_front = $(FFTWaves/FFTDisplacement).Sample( $pointWrap, uv, int2(  0,  1 ) ).xyz;
+		
+		// Do not store the actual normal value. Using gradient instead, which preserves two differential values.
+		float2 gradient = {-(displace_right.z - displace_left.z), -(displace_front.z - displace_back.z)};
+		
+		// Calculate Jacobian corelation from the partial differential of height field
+		
+		float g_GridLen = 512.0f / 50.0f; //TODO m_param.gpuResolution / m_param.patch_length;
+		
+		float scale = $(FFTWaves/Choppiness) * g_GridLen;
+		float2 Dx = (displace_right.xy - displace_left.xy) * scale;
+		float2 Dy = (displace_front.xy - displace_back.xy) * scale;
+		float J = (1.0f + Dx.x) * (1.0f + Dy.y) - Dx.y * Dy.x;
+
+		// Practical subsurface scale calculation: max[0, (1 - J) + Amplitude * (2 * Coverage - 1)].
+		float fold = max(1.0f - J, 0);
+		
+		@sv_target = float4( gradient, 0, fold );
+	}
+}

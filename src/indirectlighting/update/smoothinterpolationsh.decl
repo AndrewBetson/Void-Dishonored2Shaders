@@ -1,0 +1,54 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 256
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <indirectLighting/common>
+	}
+
+	hlsl_cp_main {
+		uint	ProbeIndex = $sv_dispatchThreadID.x;
+		if ( ProbeIndex >= $(indirectLighting/update/parmsUint).x )
+			return;
+
+		float	t = $(indirectLighting/update/parmsFloat).x;
+
+		#if defined(PC)
+			// PC VERSION
+//			$(indirectLighting/SH3_RGBE)	SHSource_RGBE = $(indirectLighting/update/bufferProbesSH_LastFrame_RGBE)[ProbeIndex];
+// 			$(indirectLighting/SH3)			SHSource;
+//			UnpackRGBE2SH( SHSource_RGBE, SHSource );
+			$(indirectLighting/SH3)			SHSource = $(indirectLighting/update/bufferProbesSH_LastFrame_RGBE)[ProbeIndex];
+			$(indirectLighting/SH3)			SHTarget = $(indirectLighting/update/bufferProbesSH_ImmediateTarget)[ProbeIndex];
+
+			// Interpolate
+			$(indirectLighting/SH3)	Result;
+			Result.__PADDING = 0.0;
+
+			[unroll]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				Result.SH[i] = lerp( SHTarget.SH[i], SHSource.SH[i], t );
+			}
+
+// 			PackSH2RGBE( Result, @(indirectLighting/bufferProbesSH_RGBE)[ProbeIndex] );
+ 			@(indirectLighting/bufferProbesSH_RGBE)[ProbeIndex] = Result;
+
+		#else
+			// CONSOLE VERSION
+			$(indirectLighting/SH3_Order2)	SHSource = $(indirectLighting/update/bufferProbesSH_LastFrame_Order2)[ProbeIndex];
+			$(indirectLighting/SH3)			SHTarget = $(indirectLighting/update/bufferProbesSH_ImmediateTarget)[ProbeIndex];
+
+			// Interpolate
+			$(indirectLighting/SH3_Order2)	Result;
+			[unroll]
+			for ( uint i=0; i < 4; i++ ) {
+				Result.SH[i] = lerp( SHTarget.SH[i], SHSource.SH[i], t );
+			}
+
+			@(indirectLighting/bufferProbesSH_Order2)[ProbeIndex] = Result;
+		#endif
+	}
+}

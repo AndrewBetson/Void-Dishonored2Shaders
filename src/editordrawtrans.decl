@@ -1,0 +1,49 @@
+{ newstyle
+	options {
+		noShadow 1
+	}
+	parms {
+		stageSort sortTrans
+	}
+	state {
+		blend	SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthWrite 0
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <oit>		
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+
+		@legacy_texcoord.xy = $vertex_texcoord.xy;
+		@legacy_texcoord.zw = 0;
+		@legacy_texcoord1 = $vertex_color;
+	}
+	hlsl_fp_main {
+	#if ( !$isShadow && !$isZPrePass )
+	
+		float4 result = $editorMap.Sample( $trilinearSampler, $legacy_texcoord.xy ) * $editorColor * $legacy_texcoord1;
+
+		#if !$(tool/unlit)
+			$(PostFX/Luminance/autoExposure_t)      Adaptation = ReadAutoExposureParameters();
+			result.xyz /= Adaptation.EngineLuminanceFactor;
+		#endif
+		
+		// Get the alpha value from the coverMap
+		#if $isAlpha && !$isMainPassAlpha
+			writePixel( result.rgb, result.rgb, result.a, $sv_position, @sv_target, @sv_target1 );
+		#else
+			@sv_target = result;
+		#endif			
+	#endif
+	}
+}

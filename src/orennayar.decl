@@ -1,0 +1,47 @@
+{
+	newstyle
+	hlsl_prefix {
+
+		// Simple OrenNayar implementation
+		//	_normal, surface normal (must be normalized!)
+		//	_light, vector pointing toward the light (must be normalized!)
+		//	_view, vector pointing toward the view (must be normalized!)
+		//	_roughness, Oren-Nayar roughness parameter in [0,1]
+		//
+		float	ComputeOrenNayar( in float3 _normal, in float3 _light, in float3 _view, in float _roughness ) {
+			float3	n = _normal;
+			float3	l = _light;
+			float3	v = _view;
+			 
+			// Compute the other aliases
+			float gamma   = dot(
+								v - n * dot( v, n ),
+								l - n * dot( l, n ) 
+							);
+				
+			float rough_sq = _roughness * _roughness;
+			float A = 1.0 - 0.5 * (rough_sq / (rough_sq + 0.57));
+			float B = 0.45 * (rough_sq / (rough_sq + 0.09));
+
+			#if 1	// bmayaux (2015-12-03) Optimized a bit by removing acos, sin and tan => all replaced by 2 sqrt instead
+				float cos_angle_vn = dot( v, n );
+				float cos_angle_ln = dot( l, n );
+				float cos_alpha = min( cos_angle_vn, cos_angle_ln );				// Here we reverse the min/max since acos() is a monotonically decreasing function
+				float cos_beta  = max( cos_angle_vn, cos_angle_ln );
+				float sin_alpha = sqrt( saturate( 1.0 - cos_alpha*cos_alpha ) );	// Saturate to avoid NaN if ever cos_alpha > 1 (it happens with floating-point precision)
+				float sin_beta = sqrt( saturate( 1.0 - cos_beta*cos_beta ) );
+				float C = sin_alpha * sin_beta / (1e-6 + cos_beta);
+			#else
+				float angle_vn = safeAcos( dot( v, n ) );
+				float angle_ln = safeAcos( dot( l, n ) );
+				float alpha = max( angle_vn, angle_ln );
+				float beta  = min( angle_vn, angle_ln );
+				float C = sin(alpha) * tan(beta);
+			#endif			 
+
+			float final = (A + B * max( 0.0, gamma ) * C);
+			return saturate( dot( n, l ) ) * final;
+		}
+
+	}
+}

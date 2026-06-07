@@ -1,0 +1,429 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <PostFX/Luminance/common>
+
+		#ifndef __PSSL__
+			#pragma warning(disable: 3571) // disable the pow with neg value warning
+			#pragma warning(disable: 4115)
+			#pragma warning(disable: 4008)
+		#endif
+
+		#define sign_fast(x)	(step(0.0, x) * 2.0 - 1.0)
+
+		float safeAcos( float val ) {
+			return acos( clamp(val, -1, 1) );
+		}
+
+		float Interpolate( float A, float B, float C, float3 barycentric ) {
+		   return A * barycentric.z + B * barycentric.x + C * barycentric.y;
+		}
+
+		uint f32tos8( float v )
+		{
+			//Note: this function doesn't clamp to [-1,1] for performance reasons
+			return (uint)( (v + 1.0f) * 127.0f );
+		}
+
+		uint f32tou8( float v )
+		{
+			//Note: this function doesn't clamp to [0,1] for performance reasons
+			return (uint)( v * 255.0f );
+		}
+
+		float s8tof32( uint v )
+		{
+			return ( (float)(v & 0xFF) / 127.0f ) - 1.0f;
+		}
+
+		float u8tof32( uint v )
+		{
+			return (float)(v & 0xFF) / 255.0f;
+		}
+
+		float2 unpack2_f16tof32( uint v ) {
+			float2 result;
+			result.x = f16tof32( v );
+			result.y = f16tof32( v>>16 );
+			return result;
+		}
+
+		float4 unpack4_u8tof32( uint v ) {
+			float4 result;
+			result.x = u8tof32( v );
+			result.y = u8tof32( v>>8 );
+			result.z = u8tof32( v>>16 );
+			result.w = u8tof32( v>>24 );
+			return result;
+		}
+
+#define g_iExpBias      127
+#define g_iMantissaBits  23
+
+		float ApproxLog2( float f ) // 2 clocks instead of 4
+		{
+			return ( float( asuint( f ) ) / ( 1 << g_iMantissaBits ) - g_iExpBias );
+		}
+
+		float ApproxExp2( float f ) // 2 clocks instead of 4
+		{
+			return asfloat( uint( ( f + g_iExpBias ) * ( 1 << g_iMantissaBits ) ) );
+		}
+
+		uint packR8G8B8A8( float4 value ) {
+			value = saturate( value );
+			return ( ( ( uint( value.x * 255.0 ) ) << 24 ) | ( ( uint( value.y * 255.0 ) ) << 16 ) | ( ( uint( value.z * 255.0 ) ) << 8 ) | ( uint( value.w * 255.0 ) ) );
+		}
+
+		float4 unpackR8G8B8A8( uint value ) {
+			return float4( ( value >> 24 ) & 0xFF, ( value >> 16 ) & 0xFF, ( value >> 8 ) & 0xFF, value & 0xFF ) / 255.0;
+		}
+		
+		uint packR11G11B10( float3 value ) {
+			value = saturate( value );
+			return ( ( uint( value.x * 2047.0 ) << 21 ) | ( uint( value.y * 2047.0 ) << 10 ) | ( uint( value.z * 1023.0 ) ) );
+		}
+
+		float3 unpackR11G11B10( uint value ) {
+			return float3( ( value >> 21 ) & 0x7FF, ( value >> 10 ) & 0x7FF, ( value ) & 0x3FF ) / float3( 2047.0, 2047.0, 1023.0 );
+		}
+		
+		#define HALF_PRECISION 257.0h
+
+		float2 pack_2byte( float Value ) {
+			Value *= HALF_PRECISION;	//Increase precision, but lose some range
+			float High8Bits = trunc( Value / 256.0h );
+			float Low8Bits = Value - ( High8Bits * 256.0h );
+			return float2( High8Bits / 255.0h, Low8Bits / 255.0h );
+		}
+
+		float unpack_2byte( float2 Value ) {
+			return dot( Value, float2( 255.0h * 256.0h, 255.0h ) / HALF_PRECISION );
+		}
+
+		// RGBE (ward 1984)
+		uint packRGBE( float3 value ) {  
+			const float sharedExp = ceil( ApproxLog2( max( max( value.r, value.g ), value.b ) ) );
+			return packR8G8B8A8( saturate( float4( value / ApproxExp2( sharedExp ), ( sharedExp + 128.0f ) / 255.0f ) ) );
+		}
+
+		float3 unpackRGBE( uint value ) {
+			const float4 rgbe = unpackR8G8B8A8( value );
+			return rgbe.rgb * ApproxExp2( rgbe.a * 255.0f - 128.0f );
+		}
+
+		#if defined(ORBIS)
+			#define COMP_FLOAT16 compressed_16_float
+			#define COMP_UINT16 compressed_16_uint
+			#define COMP_SINT16 compressed_16_sint
+			#define COMP_UNORM16 compressed_16_unorm
+			#define COMP_SNORM16 compressed_16_snorm
+			#define COMP_UNORM8
+			#define COMP_SNORM8
+
+			float3 GetBarycentricCoords() { float2 vivj = GetViVjPerspCenter(); return float3( vivj.x, vivj.y, 1.0f - vivj.x - vivj.y ); }
+
+			#define GetInterpolant0( x ) GetParameterP0( x )
+			#define GetInterpolant1( x ) GetParameterP1( x )
+			#define GetInterpolant2( x ) GetParameterP2( x )
+		#elif defined(DURANGO)
+			#define COMP_FLOAT16
+			#define COMP_UINT16
+			#define COMP_SINT16
+			#define COMP_UNORM16
+			#define COMP_SNORM16
+			#define COMP_UNORM8
+			#define COMP_SNORM8
+
+			#define custominterp
+
+			float3 GetBarycentricCoords() { float2 vivj = __XB_GetBarycentricCoords_Linear_Center(); return float3( vivj.x, vivj.y, 1.0f - vivj.x - vivj.y ); }
+
+			#define GetInterpolant0( x ) __XB_GetRawInterpoland( x, 0 )
+			#define GetInterpolant1( x ) __XB_GetRawInterpoland( x, 1 )
+			#define GetInterpolant2( x ) __XB_GetRawInterpoland( x, 2 )
+		#else
+			#define COMP_FLOAT16
+			#define COMP_UINT16
+			#define COMP_SINT16
+			#define COMP_UNORM16
+			#define COMP_SNORM16
+			#define COMP_UNORM8
+			#define COMP_SNORM8
+
+			float3 GetBarycentricCoords() { return 0; }
+
+			#define GetInterpolant0( x ) 0
+			#define GetInterpolant1( x ) 0
+			#define GetInterpolant2( x ) 0
+
+			#define __XB_GetShaderUserData( x ) 0
+		#endif
+
+		#define BRANCH [branch]
+		#define anyEqual( x, y )			any( (x) == (y) )
+		#define anyNotEqual( x, y )			any( (x) != (y) )
+		#define anyNotEqualZero( x )		any( (x) )
+		#define greaterThanEqual( x, y )	( (x) >= (y) )
+		#define SineCosine( x, s, c )		sincos( x, s, c );
+
+		#define SV_TRIANGLEDOMAINLOCATION SV_DOMAINLOCATION
+		#define SV_QUADDOMAINLOCATION SV_DOMAINLOCATION
+		#define SV_ISOLINEDOMAINLOCATION SV_DOMAINLOCATION
+
+		#define SV_TRIANGLETESSFACTOR SV_TESSFACTOR
+		#define SV_QUADTESSFACTOR SV_TESSFACTOR
+		#define SV_ISOLINETESSFACTOR SV_TESSFACTOR
+
+		// ARKANE_BEGIN: bmayaux (2013-05-28) Added a bunch of very useful constants
+		static const float	PI = 3.1415926535897932384626433832795;			// ...
+		static const float	TWOPI = 6.283185307179586476925286766559;		// 2PI
+		static const float	FOURPI = 12.566370614359172953850573533118;		// 4PI
+		static const float	HALFPI = 1.5707963267948966192313216916398;		// PI/2
+		static const float	INVPI = 0.31830988618379067153776752674503;		// 1/PI
+		static const float	INVHALFPI = 0.63661977236758134307553505349006;	// 1/(PI/2)
+		static const float	INVTWOPI = 0.15915494309189533576888376337251;	// 1/2PI
+		static const float	INVFOURPI = 0.07957747154594766788444188168626;	// 1/4PI
+
+		static const float	E = 2.7182818284590452353602874713527;			// exp(1)
+		static const float	LN2 = 0.69314718055994530941723212145818;		// ln(2)
+		static const float	INVLN2 = 1.4426950408889634073599246810019;		// 1/ln(2)
+
+		static const float	INFINITY = 1e6;
+		// ARKANE_END: bmayaux (2013-05-28)
+
+		// bmayaux (2015-06-12) Moved shader/shadow quality defines here to avoid depending on <shadows> inclusion
+		#define HIGH_QUALITY	(2)
+		#define AVERAGE_QUALITY	(1)
+		#define LOW_QUALITY		(0)
+
+
+		static float PAGE_SIZE = 128;
+		static float PAGE_BORDER = 4;
+		static float PAGE_SIZE_LOG2 = 7;
+		static float PAYLOAD_SIZE = PAGE_SIZE - 2 * PAGE_BORDER;
+		static float PAYLOAD_SIZE_LOG2 = 6.907;
+
+		float GetFrontFacingFactor( bool _isFrontFacing ) {
+			return _isFrontFacing ? 1.0f : -1.0f;
+		}
+
+		float4 swizzleColor( float4 color ) {
+			return color;
+		}
+		float2 screenPosToTexcoord( float2 pos, float4 bias_scale ) {
+			return ( pos * bias_scale.zw /*+ bias_scale.xy*/ ); //the bias is a lie !
+		}
+		float2 screenPosToTexcoord( float2 pos, float4 bias_scale, float2 resolutionScale ) {
+			return ( pos * bias_scale.zw * resolutionScale );
+		}
+		
+		float2 screenPosToNdc( float2 pos ) {
+			return float2(1.0,-1.0) * ( (pos - $viewport.xy - $viewport.zw*0.5 )/($viewport.zw*0.5) );
+		}
+
+		float4 DeprecatedShader(float2 pixelPosition) {
+			float4 color;
+			float u = pixelPosition.x * 0.125;
+			float v = pixelPosition.y * 0.125;
+			if (fmod(u, 2.0) <= 1.0 && fmod(v, 2.0) <= 1.0 || fmod(u, 2.0) > 1.0 && fmod(v, 2.0) > 1.0)
+				color = float4( 0.0f, 0.0f, 0.0f, 0.0f );
+			else
+				color = float4( 0.0f, 0.5f, 1.0f, 1.0f );
+			return color;
+		}
+
+		// this is for signed BC5
+		float3	UnpackBC5NormalMap( float2 _bc5Normal )
+		{
+			float3 n;
+			n.xy = _bc5Normal;
+			// http://rgba32.blogspot.fr/2011/02/improved-normal-map-distributions.html
+			n.z = 1.001f - saturate( dot( n.xy, n.xy ) );
+			return normalize(n);
+		}
+
+		float3	TransformTangentSpaceNormalToWorldSpace( float3 _tsNormal, float3 _localToGlobalX, float3 _localToGlobalY, float3 _localToGlobalZ )
+		{
+			float3 globalNormal;
+			globalNormal.x = dot( _tsNormal, _localToGlobalX );
+			globalNormal.y = dot( _tsNormal, _localToGlobalY );
+			globalNormal.z = dot( _tsNormal, _localToGlobalZ );
+			globalNormal = normalize( globalNormal );
+			return globalNormal;
+		}
+
+		float3	TransformTangentSpaceToWorldSpace( float3 _tsDir, float3 _wsTangent, float3 _wsBiTangent, float3 _wsNormal )
+		{
+			float3 wsDir = _tsDir.x * _wsTangent + _tsDir.y * _wsBiTangent + _tsDir.z * _wsNormal;
+			wsDir = normalize( wsDir );
+			return wsDir;
+		}
+
+		///////////////////////////////////////////////////////////////////////////////////////////////
+		// ARKANE: bmayaux (2013-10-29) Standard Helpers
+		float	square( float val )		{ return val * val; }
+		float2	square( float2 val )	{ return val * val; }
+		float3	square( float3 val )	{ return val * val; }
+		float4	square( float4 val )	{ return val * val; }
+		float	pow2( float val )		{ return square( val ); }
+		float2	pow2( float2 val )		{ return square( val ); }
+		float3	pow2( float3 val )		{ return square( val ); }
+		float4	pow2( float4 val )		{ return square( val ); }
+		float	pow3( float val )		{ return val * val * val; }
+		float2	pow3( float2 val )		{ return val * val * val; }
+		float3	pow3( float3 val )		{ return val * val * val; }
+		float4	pow3( float4 val )		{ return val * val * val; }
+		float	pow4( float val )		{ float temp = val * val; return temp * temp; }
+		float2	pow4( float2 val )		{ float2 temp = val * val; return temp * temp; }
+		float3	pow4( float3 val )		{ float3 temp = val * val; return temp * temp; }
+		float4	pow4( float4 val )		{ float4 temp = val * val; return temp * temp; }
+
+		// Normalize with check for 0
+		float3	SafeNormalize( float3 x ) {
+			float	L = length(x);
+			return L > 1e-8 ? x / L : x;
+		}
+
+		// This builds the rotation matrix that transforms the "_from" vector to the "_to" vector without using any trigonometry or normalization
+		// Code from http://iquilezles.org/www/articles/noacos/noacos.htm
+		// Apply the rotation doing:
+		//	float3x3	Rot = BuildRotationMatrix( From, To );	<== NOTE: _from and _to must be normalized!
+		//	V' = mul( Rot, V );
+		//
+		float3x3	BuildRotationMatrix( float3 _from, float3 _to ) {
+			float3	v = cross( _from, _to );
+			float	c = dot( _from, _to );
+			float	k = 1.0 / (1.0 + c);
+
+			return float3x3(	v.x*v.x*k + c,     v.y*v.x*k - v.z,    v.z*v.x*k + v.y,
+								v.x*v.y*k + v.z,   v.y*v.y*k + c,      v.z*v.y*k - v.x,
+								v.x*v.z*k - v.y,   v.y*v.z*k + v.x,    v.z*v.z*k + c    );
+		}
+
+		// bmayaux (2016-01-04) Builds the remaining 2 orthogonal vectors from a given vector (very fast! no normalization or square root involved!)
+		// Original code from http://orbit.dtu.dk/files/57573287/onb_frisvad_jgt2012.pdf
+		//
+		void	BuildOrthogonalVectors( float3 n, out float3 b1, out float3 b2 ) {
+// Normally, comes with a condition...
+// 			if ( n.z < -0.9999999 ) {
+// 				// Handle the singularity
+// 				b1 = float3( 0.0, -1.0, 0.0 );
+// 				b2 = float3( -1.0, 0.0, 0.0 );
+// 				return;
+// 			}
+
+			const float	a = n.z > -0.9999999 ? 1.0 / (1.0 + n.z) : 0.0;	// Instead of the condition, I used this ternary op but beware that b1=(1,0,0) and b2=(0,1,0) in the case n.z=-1 instead of the expected (0,-1,0), (-1,0,0)
+			const float	b = -n.x*n.y*a;
+			b1 = float3( 1.0 - n.x*n.x*a, b, -n.x );
+			b2 = float3( b, 1.0 - n.y*n.y*a, -n.y );
+		}
+
+		// Smooth minimum function by iQ (http://iquilezles.org/www/articles/smin/smin.htm)
+		float SmoothMin( float a, float b, float k=32.0 ) {
+			float res = exp( -k*a ) + exp( -k*b );
+			return -log( res ) / k;
+		}
+
+		// Computes a smoothed UV using a 3rd order polynomial interpolation (from iQ again http://www.iquilezles.org/www/articles/texture/texture.htm)
+		//	_textureSize is the size of the texture in pixels that you usually get from a GetDimensions()
+		float2	SmoothUV3( float2 _UV, float2 _textureSize ) {
+			float2	texelPos = _UV * _textureSize - 0.5;
+			float2	intTexelPos = floor( texelPos );
+			float2	uv = texelPos - intTexelPos;
+					uv = uv*uv*(3.0 - uv*2.0);		// 3x² - 2x^3 (classic smoothstep with continuous 1st derivative)
+			texelPos = intTexelPos + uv;
+			return (texelPos + 0.5) / _textureSize;
+		}
+
+		// Computes a smoothed UV using a 5th order polynomial interpolation
+		//	_textureSize is the size of the texture in pixels that you usually get from a GetDimensions()
+		float2	SmoothUV5( float2 _UV, float2 _textureSize ) {
+			float2	texelPos = _UV * _textureSize - 0.5;
+			float2	intTexelPos = floor( texelPos );
+			float2	uv = texelPos - intTexelPos;
+					uv = uv*uv*uv*(10.0 + uv*(-15.0 + uv*6.0));		// 10*x^3 - 15*x^4 + 6*x^5 (Perlin's equation for continuous 1st and 2nd derivatives)
+			texelPos = intTexelPos + uv;
+			return (texelPos + 0.5) / _textureSize;
+		}
+
+		// compute a linear Z on positive [near to far] range (while real viewspace is toward -Z)
+		float ComputeLinearZ( in float _rawZFromDepthBuffer ) {
+			// mathemathically safe version with every projection type including asymetric / shear / stereo translated projections - not needed for now
+			/* float4 unprojPos = mul( $inverseProjectionMatrix, float4( $texcoord.x * 2.f - 1.f, 1.f - ($texcoord.y * 2.f), _rawZFromDepthBuffer, 1.f ) );
+			return -unprojPos.z/unprojPos.w; */
+
+			// optimized version with standard projection
+			return -$inverseProjectionMatrix[2].w / ( $inverseProjectionMatrix[3][2] * _rawZFromDepthBuffer + $inverseProjectionMatrix[3][3] );  //ARKANE (2015-06-12) - depth inversion
+		}
+
+		// compute a proj Z on negative [near to far] range
+		float ComputeProjZ( in float _linearZFromDepthBuffer ) {
+			// de-linearize _linearZFromDepthBuffer value (inverse computation of the one done in gather depth min max to linearize)
+			// we can avoid the 0 testing if we can guarantee no 0 viewspace value (ie z_near greater than 0)
+			//return ( -$projectionMatrix[2][3] - _linearZFromDepthBuffer * $projectionMatrix[2][2] ) / _linearZFromDepthBuffer;
+			return _linearZFromDepthBuffer != 0.f ? ( -$projectionMatrix[2][3] - _linearZFromDepthBuffer * $projectionMatrix[2][2] ) / _linearZFromDepthBuffer : 1.f;
+		}
+
+		float3 RangeExpandColorFromR11G11B10( in float3 inColor ) {
+			if( $useCompressedHdrBuffers == 0 ) {
+				return inColor;
+			} else {
+				float maxLuminanceScalar = ( $view_max_luminance.x * $view_white_level.x ) / 139.26;
+				//if ( $view_luminancemode.x > 0.0 )
+				//{
+					$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+					maxLuminanceScalar = Adaptation.EngineLuminanceFactor * $view_white_level.x;
+				//}
+				return inColor.xyz * maxLuminanceScalar;
+			}
+		}
+
+		float RangeExpandColorFromR11G11B10( in float inColor ) {
+			if( $useCompressedHdrBuffers == 0 ) {
+				return inColor;
+			} else {
+				float maxLuminanceScalar = ( $view_max_luminance.x * $view_white_level.x ) / 139.26;
+				//if ( $view_luminancemode.x > 0.0 )
+				//{
+					$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+					maxLuminanceScalar = Adaptation.EngineLuminanceFactor * $view_white_level.x;
+				//}
+				return inColor * maxLuminanceScalar;
+			}
+		}
+
+		float3 RangeCompressColorToR11G11B10( in float3 inColor ) {
+			if( $useCompressedHdrBuffers == 0 ) {
+				return inColor;
+			} else {
+				float maxLuminanceScalar = ( $view_max_luminance.x * $view_white_level.x ) / 139.26;
+				//if ( $view_luminancemode.x > 0.0 ) 
+				//{
+					$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+					maxLuminanceScalar = Adaptation.EngineLuminanceFactor * $view_white_level.x;
+				//}
+				return inColor.xyz / maxLuminanceScalar;
+			}
+		}
+
+		// bmayaux (2013-05-28) Created macros for deep function names
+		// These are the macros that are used when calling some functions deep into the lighting pipeline so you can
+		//	simply replace them to swap the original function with your own test function without having to recompile
+		//	all the shaders, only your test shader...
+		//
+		// Say for example you want to debug the ComputeAreaLightLighting() function, you just need
+		//	to assign a test shader to your material and redefine COMPUTE_AREA_LIGHT_LIGHTING to point
+		//	to MyTest_ComputeAreaLightLighting instead of the default ComputeAreaLightLighting and
+		//	copy that function to your shader so you can modify it easily...
+		//
+		#define COMPUTE_PARALLEL_SHADOW		ComputeParallelShadow
+		#define COMPUTE_AREA_LIGHT_SHADOW	ComputeAreaLightShadow
+		#define CREATE_AREA_LIGHT_CONTEXT	CreateAreaLightContext
+		#define COMPUTE_AREA_LIGHT_LIGHTING	ComputeAreaLightLighting
+		#define COMPUTE_AMBIENT_LIGHTING	ComputeAmbientLighting
+		#define COMPUTE_IBL					ComputeIBL
+		#define COMPUTE_LIGHT_SCATTERING	ComputeLightScattering
+		#define INTEGRATE_SCATTER			IntegrateScatter
+	}
+}

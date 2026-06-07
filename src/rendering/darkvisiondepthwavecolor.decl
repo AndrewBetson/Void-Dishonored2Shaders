@@ -1,0 +1,54 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		blend SRC_ALPHA ONE
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <colorimetry>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	hlsl_fp_main {
+
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+		float2 pixelSize = $positionToViewTexture.zw * $resolutionScale.xy;
+		
+		float depth = $(rendering/DepthBufferIn).Sample( $linearClamp, UV ).x;
+		float4 ndcPos = float4( screenPosToNdc( $sv_position.xy ), depth, 1.0 );
+
+		float4 wsPos = mul ( $inverseViewProjectionMatrix, ndcPos );
+		wsPos.xyz /= wsPos.w;
+
+		float distToWaveCenter = length($(rendering/darkVisionWaveCenter) - wsPos.xyz);
+
+		float worldNoise = frac(sin(dot(wsPos.xyz + frac($localTime.x), float3(12.9898, 78.233, 37.8956)))* 43758.5453);
+		
+		float depthNoise = lerp(1.0, worldNoise, $(rendering/darkVisionDepthWaveNoisePower).x );
+		
+		float innerRadius = $(rendering/darkVisionDepthWaveColorRadius).x - depthNoise;
+		float outerRadius = $(rendering/darkVisionDepthWaveColorRadius).y + depthNoise;
+	
+		float depthPower = smoothstep( 0, innerRadius, distToWaveCenter ) * (1.0-smoothstep( innerRadius, outerRadius, distToWaveCenter ));
+		
+		float edgePower = smoothstep( outerRadius-$(rendering/darkVisionDepthWaveEdgeThickness).x, outerRadius-$(rendering/darkVisionDepthWaveEdgeThickness).y, distToWaveCenter ) * (1.0-smoothstep( outerRadius-$(rendering/darkVisionDepthWaveEdgeThickness).y, outerRadius, distToWaveCenter ));
+		float power = max( depthPower, edgePower );
+		
+		power *= $(rendering/darkVisionDepthWavePower).x;
+		clip( power - 0.001 );
+	
+		$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();			
+
+		float3 outColor = lerp(1.0, worldNoise, $(rendering/darkVisionDepthWaveColorNoisePower).x) * $(rendering/darkVisionDepthWaveColorPower).x * lerp( $(rendering/darkVisionDepthWaveTint), $(rendering/darkVisionDepthWaveEdgeTint), edgePower );
+		@sv_target.xyz = RangeCompressColorToR11G11B10( outColor/Adaptation.EngineLuminanceFactor );
+		@sv_target.w = power;
+	}
+}

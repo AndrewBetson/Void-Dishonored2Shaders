@@ -1,0 +1,97 @@
+{
+	newstyle
+
+	options {
+		alphatest				1
+		forcePixelShader		1
+		hairPass	3
+		parallelLightHasShadow 0
+		shadowFilteringQuality 0
+	}
+
+	state {
+		blend	ONE ZERO
+		blendOp	ADD
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <pixel>
+		#include <materialEffects>
+
+		
+		static const int NB_SAMPLES = 12;
+		static const float2 Kernel[NB_SAMPLES] =
+		{
+			float2(-0.326212 , -0.405805	),
+			float2(-0.695914 ,  0.457137	),
+			float2( 0.96234  , -0.194983 	),
+			float2( 0.519456 ,  0.767022	),
+			float2( 0.507431 ,  0.064425	),
+			float2(-0.32194  , -0.932615 	),
+			float2(-0.840144 , -0.07358		),
+			float2(-0.203345 ,  0.620716	),
+			float2( 0.473434 , -0.480026	),
+			float2( 0.185461 , -0.893124	),
+			float2( 0.89642  ,  0.412458	),
+			float2(-0.791559 , -0.597705	)
+		};
+
+		float4 Poisson( float2 uv, float2 radius, int index ) {
+			float2 offset = radius * Kernel[index];
+			return $textureMap.Sample( $bilinearClamp, uv + offset );
+		}
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+		@SSS_linearDepth.x = -vout._viewPosition.z;
+		@texcoords = vout._texcoords;
+		@wsTangent = vout.m_wsTangent.xyz;
+		// no need to pack bitangent sign since bitangent is not used in ps
+		//@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		// =================================================================
+		// Fetch alpha
+		// =================================================================
+		float alpha = 1.0;
+		#if $useAlphaMap
+			alpha = $hairAlphaMap.Sample( $anisotropicSampler, pixelCtx.m_texCoords.xy ).r;
+		#else
+			alpha = $diffusemap.Sample( $anisotropicSampler, pixelCtx.m_texCoords.xy ).a;
+		#endif
+		clip( alpha - $hairAlphaTest );
+
+		// =================================================================
+		// Blur
+		// =================================================================
+		float2 uv = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale );
+		float linearDepth = $SSS_linearDepth.x;
+		float2 tanFov = $globalViewInfos.xy;
+		float3 csNormal = mul( (float3x3)$viewProjectionMatrix, pixelCtx.m_wsTangent );
+		float2 radius = $diffuseBlur.xx * csNormal.xy + 3.0 * $positionToViewTexture.zw;
+		radius /= linearDepth.xx * tanFov;
+		float4 sampleColor = 0.0;
+
+		for( int idx=0; idx < NB_SAMPLES; ++idx) {
+			sampleColor += Poisson( uv, radius, idx );
+		}
+		sampleColor /= (float)NB_SAMPLES;
+
+		@sv_target = sampleColor;
+	}
+}

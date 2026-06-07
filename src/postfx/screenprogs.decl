@@ -1,0 +1,61 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <particles>
+
+		float2 ComputeRatioAdaptedTexcoord( in float2 vertex_position ) {
+			float _16_9 = 16.0/9.0;
+			float _9_16 = 9.0/16.0;
+
+			float ratio = ($positionToViewTexture.w/$resolutionScale.x) / ($positionToViewTexture.z/$resolutionScale.y);
+			float invratio = ($positionToViewTexture.z/$resolutionScale.y) / ($positionToViewTexture.w/$resolutionScale.x);
+
+			float2 newTexcoord;
+
+			#if $(PostFX/ratioAdaptation) == 0			//no adaptation --> stretch
+				newTexcoord = float2(1.f,-1.f) * vertex_position;
+			#elif $(PostFX/ratioAdaptation) == 1		//fit vertically
+				newTexcoord.x = vertex_position.x * ratio * _9_16;
+				newTexcoord.y = -vertex_position.y;
+			#elif $(PostFX/ratioAdaptation) == 2		//fit horizontally
+				newTexcoord.x = vertex_position.x;
+				newTexcoord.y = -vertex_position.y * invratio * _16_9;
+			#elif $(PostFX/ratioAdaptation) == 3		//fit vertically over 16/9  and horizontally under 16/9 (texture always inside)
+				if( ratio > _16_9 ) {
+					newTexcoord.x = vertex_position.x * ratio * _9_16;
+					newTexcoord.y = -vertex_position.y;
+				} else {
+					newTexcoord.x = vertex_position.x;
+					newTexcoord.y = -vertex_position.y * invratio * _16_9;
+				}
+			#elif $(PostFX/ratioAdaptation) == 4		//fit horizontally over 16/9  and vertically under 16/9 (texture always outside)
+				if( ratio > _16_9 ) {
+					newTexcoord.x = vertex_position.x;
+					newTexcoord.y = -vertex_position.y * invratio * _16_9;
+				} else {
+					newTexcoord.x = vertex_position.x * ratio * _9_16;
+					newTexcoord.y = -vertex_position.y;
+				}
+			#elif $(PostFX/ratioAdaptation) == 5		//fit vertically and rotate the texture if needed
+				if( ratio < 1.0 ) {
+					newTexcoord.y = vertex_position.x;
+					newTexcoord.x = -vertex_position.y * invratio * _9_16;
+				} else {
+					newTexcoord.x = vertex_position.x * ratio * _9_16;
+					newTexcoord.y = -vertex_position.y;
+				}
+			#elif $(PostFX/ratioAdaptation) == 6		//fit horizontally and rotate the texture if needed
+				if( ratio < 1.0 ) {
+					newTexcoord.y = vertex_position.x * ratio * _16_9;
+					newTexcoord.x = -vertex_position.y;
+				} else {
+					newTexcoord.x = vertex_position.x;
+					newTexcoord.y = -vertex_position.y * invratio * _16_9;
+				}
+			#endif
+
+			return 0.5 * newTexcoord + 0.5 + $(subpixelOffset).xy;
+		}
+
+	}
+}

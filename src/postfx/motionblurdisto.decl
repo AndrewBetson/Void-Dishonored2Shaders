@@ -1,0 +1,52 @@
+{
+	newstyle
+	//parms {}
+	state {
+		blend			ONE ONE_MINUS_SRC_ALPHA
+		alphaBlend		ONE ONE_MINUS_SRC_ALPHA
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		@texcoords.xy = 0.5f.xx * float2(1.f,-1.f) * $vertex_position.xy + 0.5f.xx;
+		@texcoords.zw = float2(0, 0);
+	}
+	hlsl_fp_main {
+		float2	UV = $texcoords.xy;
+		float4 iVectorRaw = $motionVectors.SampleLevel( $bilinearClamp, ( UV + $subpixelOffset.xy ) * $resolutionScale.xy, 0 );
+
+		float4 iVector = float4( iVectorRaw.xy * $vectorFieldScales.xx, iVectorRaw.zw );
+		
+		float2 uv0 = UV + iVector.zw;
+
+		float4 uv00 = uv0.xyxy;
+		float4 uv12 = uv00;
+		uv12.zw += iVector.xy;
+		float4 uv34 = uv00 + iVector.xyxy * float4( 2.f.xx, 3.f.xx);
+		
+		float2 fetch[4] = { uv12.xy, uv12.zw, uv34.xy, uv34.zw };
+		
+		float4 sum = float4(0, 0, 0, 0);
+
+		float2 screenLimit = $resolutionScale.xy - $positionToViewTexture.zw * 0.5;
+		
+		[unroll]
+		for ( int i = 0; i < 4; ++i ) {
+			float2 fetchUV = fetch[i] * $resolutionScale.xy;
+
+			// Mirror fetchUV
+			fetchUV *= sign( fetchUV );
+			fetchUV = 2 * min(fetchUV, screenLimit) - fetchUV;
+			sum += $viewColorMap.Sample( $bilinearMirror, fetchUV );
+		}
+		
+		sum *= 0.25;
+		sum.a = saturate( sum.a );
+		@sv_target = sum;
+	}
+}

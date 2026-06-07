@@ -1,0 +1,29 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 32
+		NUMTHREADY 32
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <colorimetry>
+
+//#define SHOW_COMPILER_BUG	// Define this to show evidence of compiler error when reading from SRVs using the [] operator
+
+	}
+	hlsl_cp_main
+	{
+		uint3	TexelIndex = uint3( $sv_groupThreadID.xy, $sv_groupID.z );
+
+#ifdef SHOW_COMPILER_BUG
+		float4	V0 = $(toneMapping/blendColorCube/sourceColorCube)[TexelIndex];	// Reading from SRVs returns completely crazy results
+		float4	V1 = $(toneMapping/blendColorCube/targetColorCube)[TexelIndex];
+#else
+		float3	UVW = (0.5 + TexelIndex) * INV_COLOR_CUBE_SIZE;
+		float4	V0 = $(toneMapping/blendColorCube/sourceColorCube).SampleLevel( $pointClamp, UVW, 0.0 );
+		float4	V1 = $(toneMapping/blendColorCube/targetColorCube).SampleLevel( $pointClamp, UVW, 0.0 );
+#endif
+
+		@(toneMapping/finalColorCube)[TexelIndex] = lerp( V0, V1, $(toneMapping/blendColorCube/blendWeights).x );
+	}
+}

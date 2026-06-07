@@ -1,0 +1,36 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 16
+		NUMTHREADY 16
+		NUMTHREADZ 4
+	}
+	hlsl_prefix {
+	}
+	hlsl_cp_main
+	{
+		uint	FOG_LUT_WIDTH = 4096;			// Fog Luts are 4096x1 (don't forget to also change FOG_LUT_WIDTH in RenderView.h!)
+		float	INV_FOG_LUT_WIDTH = (1.0 / FOG_LUT_WIDTH);
+
+		uint2	TexelIndex = uint2( $sv_groupThreadID.x * 256 + $sv_groupThreadID.y * 16 + $sv_groupThreadID.z * 4 + $sv_groupID.x, 0 );
+		float2	UV = float2( (0.5 + TexelIndex.x) * INV_FOG_LUT_WIDTH, 0.5 );
+
+		// Sample current cube
+		float	V0 = $(atm/worldDistanceFog/blendFogLut/sourceFogLut).SampleLevel( $pointClamp, UV, 0.0 ).x;
+
+		// Sample overrides
+		float	V1 = $(atm/worldDistanceFog/blendFogLut/blendWeights).x * $(atm/worldDistanceFog/overrideFogLut/fogLut0).SampleLevel( $pointClamp, UV, 0.0 ).x;
+		if ( $(atm/worldDistanceFog/blendFogLut/blendWeights).y > 1e-6 )
+			V1 += $(atm/worldDistanceFog/blendFogLut/blendWeights).y * $(atm/worldDistanceFog/overrideFogLut/fogLut1).SampleLevel( $pointClamp, UV, 0.0 ).x;
+		if ( $(atm/worldDistanceFog/blendFogLut/blendWeights).z > 1e-6 )
+			V1 += $(atm/worldDistanceFog/blendFogLut/blendWeights).z * $(atm/worldDistanceFog/overrideFogLut/fogLut2).SampleLevel( $pointClamp, UV, 0.0 ).x;
+		if ( $(atm/worldDistanceFog/blendFogLut/blendWeights).w > 1e-6 )
+			V1 += $(atm/worldDistanceFog/blendFogLut/blendWeights).w * $(atm/worldDistanceFog/overrideFogLut/fogLut3).SampleLevel( $pointClamp, UV, 0.0 ).x;
+
+		// Lerp
+		float	t = dot( $(atm/worldDistanceFog/blendFogLut/blendWeights), 1.0f.xxxx );
+
+		@(atm/worldDistanceFog/colorLUT)[TexelIndex] = lerp( V0, V1, t );
+
+	}
+}

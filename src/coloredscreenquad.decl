@@ -1,0 +1,17 @@
+{ newstyle
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		#if !$isShadow && !$isZPrePass
+			#if $outputToR11G11B10
+				// TODO: perform color compression on cpu
+				@sv_target.xyz = RangeCompressColorToR11G11B10( $color.xyz );
+				@sv_target.w = $color.w;
+			#else
+				@sv_target = $color;
+			#endif
+		#endif
+	}
+}

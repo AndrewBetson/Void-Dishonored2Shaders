@@ -1,0 +1,50 @@
+{
+	newstyle
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		blend ONE ONE
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <colorimetry>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	hlsl_fp_main {
+
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+		float2 pixelSize = $positionToViewTexture.zw * $resolutionScale.xy;
+
+		float depth = $(rendering/DepthBufferIn).Sample( $linearClamp, UV ).x;
+		
+		float4 ndcPos = float4( screenPosToNdc( $sv_position.xy ), depth, 1.0 );
+
+		float4 wsPos = mul ( $inverseViewProjectionMatrix, ndcPos );
+		wsPos.xyz /= wsPos.w;
+
+		float distToWaveCenter = length($(rendering/darkVisionWaveCenter) - wsPos.xyz);
+
+		float worldNoise = frac(sin(dot(wsPos.xyz + frac($localTime.x), float3(12.9898, 78.233, 37.8956)))* 43758.5453);
+		
+		float innerRadius = $(rendering/darkVisionDepthWaveColorRadius).x - worldNoise;
+		float outerRadius = $(rendering/darkVisionDepthWaveColorRadius).y + worldNoise;
+
+		
+		float depthPower = smoothstep( 0, innerRadius, distToWaveCenter ) * (1.0-smoothstep( innerRadius, outerRadius, distToWaveCenter ));
+		depthPower *= $(rendering/darkVisionDepthWavePower).x;
+
+		clip( depthPower - 0.001 );
+		
+		float noise = depthPower* frac(sin(dot(UV + frac($localTime.x), float2(12.9898, 78.233)))* 43758.5453);
+		@sv_target.y = noise * $positionToViewTexture.w * $resolutionScale.y * 0.2;
+		@sv_target.xzw = 0.0;
+		
+	}
+}

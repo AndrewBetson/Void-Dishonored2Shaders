@@ -1,0 +1,110 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <PostFX/Luminance/common>
+		#include <PostFX/Debug/DrawText>
+		
+		#define ES_TYPE_COMPILATION				(1 << 5)	// Compilation error
+		#define ES_TYPE_SHADER_STAGES_MISMATCH	(1 << 6)	// Semantics mismatch between stages
+		#define ES_TYPE_SHADER_BINDING			(1 << 7)	// Runtime program binding failed
+		#define ES_TYPE_INPUT_LAYOUT_MISMATCH	(1 << 8)	// Vertex Buffer format not compatible with Vertex Shader input layout
+	}
+	
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+	}
+		
+	hlsl_vp_main {
+		@sv_position.x = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixX );
+		@sv_position.y = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixY );
+		@sv_position.z = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixZ );
+		@sv_position.w = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixW );
+	}
+		
+	hlsl_fp_main {
+		//Exposure
+		$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+		float amount = 1.0/Adaptation.EngineLuminanceFactor;
+
+		bool Odd;
+		float col = 0.0;
+		float2 pixelCoords = $sv_position.xy;
+		float2 vTextLength = 0.0;
+		float2 printPos = 0.0;
+		uint2 Pixel = uint2( $sv_position.xy );
+
+		switch( (int)$(error_color).w ) {
+		case ES_TYPE_COMPILATION: //(8 char)
+			Odd = ((Pixel.x + (uint)STRWIDTH(15) ) ^ (Pixel.y + (uint)STRHEIGHT(1) )) & 1;
+			vTextLength = float2(STRWIDTH(15.0), STRHEIGHT(1.0) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y - 2;
+			col += get_char(ch_C,printPos,pixelCoords);
+			col += get_char(ch_o,printPos,pixelCoords);
+			col += get_char(ch_m,printPos,pixelCoords);
+			col += get_char(ch_p,printPos,pixelCoords);
+			col += get_char(ch_i,printPos,pixelCoords);
+			col += get_char(ch_l,printPos,pixelCoords);
+			col += get_char(ch_e,printPos,pixelCoords);
+			col += get_char(ch_r,printPos,pixelCoords);
+			break;
+		case ES_TYPE_SHADER_STAGES_MISMATCH:
+			Odd = ((Pixel.x + (uint)STRWIDTH(12) ) ^ (Pixel.y + (uint)STRHEIGHT(1) )) & 1;
+			vTextLength = float2(STRWIDTH(12.0), STRHEIGHT(1) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y - 2;
+			col += get_char(ch_S,printPos,pixelCoords);
+			col += get_char(ch_t,printPos,pixelCoords);
+			col += get_char(ch_a,printPos,pixelCoords);
+			col += get_char(ch_g,printPos,pixelCoords);
+			col += get_char(ch_e,printPos,pixelCoords);
+			break;
+		case ES_TYPE_SHADER_BINDING:
+			Odd = ((Pixel.x + (uint)STRWIDTH(11) ) ^ (Pixel.y + (uint)STRHEIGHT(1) )) & 1;
+			vTextLength = float2(STRWIDTH(11.0), STRHEIGHT(1.0) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y - 2;
+			col += get_char(ch_B,printPos,pixelCoords);
+			col += get_char(ch_i,printPos,pixelCoords);
+			col += get_char(ch_n,printPos,pixelCoords);
+			col += get_char(ch_d,printPos,pixelCoords);
+			break;
+		case ES_TYPE_INPUT_LAYOUT_MISMATCH:
+			Odd = ((Pixel.x + (uint)STRWIDTH(13) ) ^ (Pixel.y + (uint)STRHEIGHT(1) )) & 1;
+			vTextLength = float2(STRWIDTH(13.0), STRHEIGHT(1.0) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y - 2;
+			col += get_char(ch_L,printPos,pixelCoords);
+			col += get_char(ch_a,printPos,pixelCoords);
+			col += get_char(ch_y,printPos,pixelCoords);
+			col += get_char(ch_o,printPos,pixelCoords);
+			col += get_char(ch_u,printPos,pixelCoords);
+			col += get_char(ch_t,printPos,pixelCoords);
+			break;
+		default:
+			Odd = ((Pixel.x + (uint)STRWIDTH(7) ) ^ (Pixel.y + (uint)STRHEIGHT(1) )) & 1;
+			vTextLength = float2(STRWIDTH(7.0), STRHEIGHT(1.0) );
+			printPos = floor(pixelCoords/vTextLength) * vTextLength;
+			printPos.y += vTextLength.y;
+			break;
+		}
+
+		//Draw Text Error (7 char)
+		col += get_char(ch_spc,printPos,pixelCoords);
+		col += get_char(ch_E,printPos,pixelCoords);
+		col += get_char(ch_r,printPos,pixelCoords);
+		col += get_char(ch_r,printPos,pixelCoords);
+		col += get_char(ch_o,printPos,pixelCoords);
+		col += get_char(ch_r,printPos,pixelCoords);
+		col += get_char(ch_spc,printPos,pixelCoords);
+
+		//Color
+		float4 debugColor = lerp( $(error_color), $(error_color2), Odd );
+		//Out
+		float3 color = debugColor.rgb * col * amount;
+		float alpha = debugColor.a;
+		@sv_target = float4( color, alpha );
+	}
+}

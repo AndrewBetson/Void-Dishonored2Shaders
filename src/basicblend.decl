@@ -1,0 +1,30 @@
+{ newstyle
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		blend	SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthWrite 0
+		//depthfunc ALWAYS
+	}
+	hlsl_vp_main {
+		//#inlinefile "skinning.inc"
+		float4 position = float4( $vertex_position.xyz, 1 );
+
+		@sv_position.x = dot( position, $mvpMatrixX );
+		@sv_position.y = dot( position, $mvpMatrixY );
+		@sv_position.z = dot( position, $mvpMatrixZ );
+		@sv_position.w = dot( position, $mvpMatrixW );
+
+		// Convert back from 16 bit vertex elements.
+		float2 texcoord0 = $vertex_texcoord * $vertexStScaleBias.xy + $vertexStScaleBias.zw;
+
+		@legacy_texcoord.x = dot( float3( texcoord0, 1 ), $sMatrix.xyz );
+		@legacy_texcoord.y = dot( float3( texcoord0, 1 ), $tMatrix.xyz );
+		@legacy_texcoord.zw = 0;
+		@legacy_color = $color * $vertex_color;
+	}
+	hlsl_fp_main {
+		@sv_target = $transMap.Sample( $anisotropicSampler, $legacy_texcoord.xy ) * $legacy_color;
+	}
+}

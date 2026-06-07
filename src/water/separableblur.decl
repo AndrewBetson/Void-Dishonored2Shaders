@@ -1,0 +1,45 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0f );
+		@psPosition = float4( $vertex_position.xyz, 1.0f );
+	}
+
+	hlsl_fp_main {
+		const int blurRadius = $(water/GodRaysBlurRadius);
+
+		float2 screenUV = $psPosition.xy;
+		screenUV.y = -screenUV.y;
+		screenUV = screenUV * 0.5f + 0.5f;
+
+		float3 godrays = 0.0f;
+		float totalWeight = 0.0f;
+
+		for( int i=-blurRadius ; i <= blurRadius ; ++i )
+		{
+			//float weight = exp( - i * i * falloff );
+			float weight = 1.0f; //For this kind of input signal, box blur is good enough and offers more bang for the buck than gaussian
+			float3 tap = $(water/HDRBuffer).SampleLevel( $pointClamp, screenUV + $(water/BlurDirection) * i, 0.0f ).rgb;
+
+			godrays += tap * weight;
+			totalWeight += weight;
+		}
+
+		@sv_target.rgb = godrays / totalWeight;
+		@sv_target.a = 1.0f;
+	}
+}

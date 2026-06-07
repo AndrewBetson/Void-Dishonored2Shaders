@@ -1,0 +1,44 @@
+{
+	newstyle
+
+	state {
+		cull none
+		depthEnable 0
+		depthWrite 0
+		depthFunc always
+		colorWrite 0
+		alphaWrite 0
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+		#include <arkOceanHelpers>
+	}
+
+	hlsl_vp_main {
+
+		float waveAmplitudeMask = 1.0f; //g_WaveAmplitudeMask.SampleLevel( g_BilinearSampler, globalMapsUV, 0 ).x;
+		float foam; //unused
+		const float foamTex = 0.0f; //unused
+		float camDist = 0.0f;
+		float perlinBlendFactor = 0.0f;
+
+		float3 displacement = ComputeOceanSurfaceDisplacement( $wsCamPos.xy, camDist, perlinBlendFactor, waveAmplitudeMask, true, foamTex, foam );
+
+		float margin = 0.01f;
+
+		if( $wsCamPos.z < $(ocean/WaterLevel) + displacement.z + margin )
+		{
+			@sv_position = float4( $sv_vertexID * 0.1f, 0, 0, 1 );
+		}
+		else
+		{
+			@sv_position = float4( 0, 0, -1, 1 );
+		}
+	}
+
+	hlsl_fp_main {
+	}
+}

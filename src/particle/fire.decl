@@ -1,0 +1,139 @@
+{
+	newstyle
+	options {
+		noshadow	1
+		isParticle	1
+		forcePixelShader 1
+	}
+
+	parms {
+		stageSort sortTrans
+	}
+
+	state {
+		blend SRC_ALPHA ONE
+	}
+
+	hlsl_prefix {
+		#include <particles>
+		#include <particles_instancing>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+
+		// Convert back from 16 bit vertex elements.
+		@texcoords.xyzw = GetParticleTextureCoordinates( victx, $vertex_texcoord4 );
+		@legacy_color = GetParticleColor( victx, $vertex_color );
+
+		#if $isAlpha && !$isShadow && !$isZPrePass && !$(tool/unlit) && !$isMasking && !$isMainPassAlpha
+			@particleFogColor = ComputeFogPerVertex( vout._projPosition, vout._worldPosition );
+		#endif
+
+		// Soft contact
+		#if ($(fx/opt/use_softcontact) >= SOFT_CONTACT_CUBIC) && (!$isShadow && !$isZPrePass)
+			#if $useDirectInstancing
+				@particleCenterSize = float4( GetTranslation( vout ), GetParticleRadius( victx ) );
+			#else
+				@particleCenterSize = $vertex_texcoord5;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+
+		float4 color = 0.0;
+		float4 color_fireball = 0.0;
+		float4 color_light;
+		float4 color_smoke = 0.0;
+		float4 uv = 0;
+
+		float4 normals = 0.0;
+
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+		
+		
+		// COLOR X CONTROLS THE FIRE BALL
+		normals.xy = ($(fx/normals).Sample( $trilinearSampler, $texcoords.xy ).xy ) * $fire_distortion.xx  * ( $legacy_color.xx );
+		uv.xy = saturate ( $texcoords.xy + normals.xy );
+
+		// TO DO REMOVE POW FROM COMOR.X
+		color.x = pow ( $(fx/fire_ball).Sample( $trilinearSampler, uv.xy ).x, 1/2.2 );	//	becomes uv.x to read in the color lookup and apply uv offset for heat effect, also needs to be shard
+		color.y = $(fx/fire_light).Sample( $trilinearSampler, uv.xy ).x;				//	becomes uv.x to read in the color lookup and apply uv offset for heat effect
+		color.z = $(fx/fire_smoke).Sample( $trilinearSampler, $texcoords.xy ).x;		//	becomes uv.x to read in the color lookup
+
+
+		// get the fire ball color using color.x
+		float power = saturate (  color.x -1 + $legacy_color.x );
+		uv.x = power * power * power * power;
+		uv.y = 0.5;
+		color_fireball.xyz = pow ( $(fx/lookup_fire).Sample( $trilinearSampler, uv.xy ).xyz, $lookup_adjust ) * uv.xxx * $fire_intensity.xxx;
+		color_fireball.w = saturate ( uv.x );
+
+
+		// get the light color using color.y
+		#if $(fx/opt/use_lookup_light)
+			uv.x = saturate( color.y * $legacy_color.y );
+			color_light.xyz = $(fx/lookup_light).Sample( $trilinearSampler, uv.xy ).xyz * $legacy_color.yyy * uv.xxx * $fire_light_intensity.xxx;
+		#else
+			uv.x =	$fire_light_color;
+			color_light.xyz = $(fx/lookup_fire).Sample( $trilinearSampler, uv.xy ).xyz * $legacy_color.yyy * color.yyy * $fire_light_intensity.xxx;
+		#endif
+
+
+		// get the smoke color using color.z
+		color_smoke.xyz = $fire_smoke_color.xyz * color.zzz * $legacy_color.zzz;
+		color_smoke.w = color.z * $legacy_color.z;
+
+
+		// build the final color
+		color.xyz = lerp( color_fireball.xyz, color_smoke.xyz, color.yyy ) + color_light.xyz;
+		color.w = saturate ( ( color_fireball.w + color_smoke.w ) * $legacy_color.w );	// no need of the light alpha
+
+		float4 overbright = $legacy_color;
+		color.xyz = AdjustColor( overbright.xxxx, color.xyzz ).xyz;
+
+		// Soft particles.
+		#if $(fx/opt/use_softcontact) != SOFT_CONTACT_NONE
+			color.w *= SoftContact(pixelCtx, $particleCenterSize);
+		#endif
+
+		// View dependent fade out
+		#if $(fx/opt/view_dependent_fade)
+			color.w *= ViewDependentFade( $sv_position.w );
+		#endif
+		
+		float clipPlaneDot = dot( $(fx/ClipPlane).xyz, $wsPosition.xyz ) + $(fx/ClipPlane).w;
+		clip( sign( clipPlaneDot ) );
+		color.w *= smoothstep( 0.0, $(fx/ClipPlaneFadeDistance).x, clipPlaneDot );
+
+		#if $isShadow || $isZPrePass
+			ClipColor( color );
+			return;
+		#else
+			#if $isMasking
+				ClipAlpha(color.a);
+				@sv_target = color.w * $(rendering/masking/bendTimeFactor).x;
+			#else
+				float3 colorScattering = 0.0;
+				float3 result  = color.rgb * ComputeAutoExposure();
+
+				//result = ComputeFogWithLightScattering(result, colorScattering, pixelCtx );;			//fog per pixel
+				result = ComputeFogFromVertex(result, colorScattering, $particleFogColor, pixelCtx );	//fog per vertex
+
+				#if $isAlpha && !$isMainPassAlpha
+					writePixel( result.rgb, color.rgb, color.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target = float4(result.rgb, color.a);
+				#endif
+			#endif
+		#endif
+	}
+}

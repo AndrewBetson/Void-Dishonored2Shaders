@@ -1,0 +1,13 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 256
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+	}
+	hlsl_cp_main {
+		@(arkCullGeometry/indirectArgs )[ $sv_dispatchThreadID.x * 5 + 0 ] = 0;
+	}
+}

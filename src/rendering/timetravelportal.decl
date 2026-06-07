@@ -1,0 +1,224 @@
+{
+	newstyle
+
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <BRDF_ward>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <fogHelpers>
+		#if $useParallaxMapping
+			#include <parallaxSelfShadow>
+		#endif
+		#include <particles_instancing>
+
+		#if DURANGO
+			#if $alphaTest
+				#define __XBOX_FORCE_PS_ZORDER_RE_Z 1
+			#endif
+		#endif
+		
+		
+		
+		static const int NB_SAMPLES = 12;
+		static const float2 Kernel[NB_SAMPLES] =
+		{
+			float2(-0.326212f , -0.405805f	), 
+			float2(-0.695914f ,  0.457137f  ),
+			float2( 0.96234f  , -0.194983f 	),
+			float2( 0.519456f ,  0.767022f  ),
+			float2( 0.507431f ,  0.064425f  ),
+			float2(-0.32194f  , -0.932615f 	),
+			float2(-0.840144f , -0.07358f	),
+			float2(-0.203345f ,  0.620716f	), 
+			float2( 0.473434f , -0.480026f	),
+			float2( 0.185461f , -0.893124f	),
+			float2( 0.89642f  ,  0.412458f	), 
+			float2(-0.791559f , -0.597705f	)
+		};
+
+		float2 Rotate2d( float2 p, float angle ) {
+			float sinAngle, cosAngle;
+			sincos(angle,sinAngle,cosAngle);
+			float2x2 rotMat = { cosAngle, -sinAngle, sinAngle, cosAngle };
+			return mul(rotMat, p);
+		}
+		
+		float4 Poisson( float2 uv, float3 normal, float2 radius, int index ) {
+			float2 offset = radius * Kernel[index];
+			offset = Rotate2d( offset, normal.x ) * $resolutionScale.xy;
+			
+			return $(rendering/portal).SampleLevel( $linearClamp, uv + offset, 0.0 );
+		}
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+			
+		#if ( $alphaTest || ( !$isShadow && !$isZPrePass && !$isOutline ) ) 
+			@texcoords = vout._texcoords;
+		#endif
+
+		#if (!$(tool/unlit)) && ( !$isShadow && !$isZPrePass && !$isMasking && !$isOutline )
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		#if !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit)
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#elif $isAlpha && $isZPrePass && $(Alpha/EnableRefraction)
+			@wsNormal = vout.m_wsNormal;
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+
+		#if !$isShadow && !$isZPrePass && !$isCloth
+			#if $useParticleColorInstancing
+				@legacy_color = GetParticleColor( victx, $vertex_color );
+			#elif $isMasking
+				#if $VtxColorMultiply || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) )
+					@legacy_color = $vertex_color;
+				#endif
+			#elif ( $VtxColorMultiply || (!$(tool/unlit) && $(translucency/enable) && $translucencyUseVertexColor) || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) ) )
+				@legacy_color = $vertex_color;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+
+		#if $isShadow
+			ClipZorShadowPass( pixelCtx );
+			#if !$isZPrePassAlpha && $isAlpha && $isZPrePass && $(Alpha/EnableRefraction)
+				@sv_target = float4( 0.0, ComputeGlassDistortion( pixelCtx.m_wsView, pixelCtx.m_wsNormal, 0.5 * (1.0 + pixelCtx.m_frontFaceFactor) ) ), 0.0, 0.0 );
+			#endif
+			return;
+		#elif $isZPrePass
+			ClipZorShadowPass( pixelCtx );
+			#if !$isZPrePassAlpha && $isAlpha && $isZPrePass && $(Alpha/EnableRefraction)
+				@sv_target = float4( 0.0, ComputeGlassDistortion( pixelCtx.m_wsView, pixelCtx.m_wsNormal, 0.5 * (1.0 + pixelCtx.m_frontFaceFactor) ) ), 0.0, 0.0 );
+			#else
+				@sv_target = float4( 0.0, 0.0, 0.0, 0.0 );
+			#endif
+		#elif $isOutline
+			#if $outlineable
+				@sv_target = pixelCtx.OutlineSeed();
+			#endif
+		// =======================================================================
+		// Standard Pass
+		#else
+			#if $isMasking
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+				@sv_target = pixelCtx.m_diffuseAlbedo.w * $(rendering/masking/bendTimeFactor).x;
+
+			#elif $(tool/unlit)
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+
+				#if $isAlpha && !$isMainPassAlpha
+					writePixel( pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target = pixelCtx.m_diffuseAlbedo;
+				#endif
+
+
+			#else
+
+				SurfaceContext	surf;
+				surf.Clear();
+				ComputeLightingResult	result;
+				result.Clear();
+
+				// High quality
+				HQ_DoParallaxMapping( pixelCtx );
+				HQ_FetchMasks( pixelCtx );
+				HQ_FetchDiffuseAlbedo( pixelCtx );
+				HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+				HQ_ComputeLightingParams( pixelCtx, surf );
+				HQ_FetchMetallicSpecularFresnelAndIOR( pixelCtx, surf );
+
+				result = IntegrateLighting( surf, HIGH_QUALITY );
+				
+				// Compute Glass transmittance
+				ComputeGlassTransmittance( surf, pixelCtx, result );
+				
+				// Compute fog
+				result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+				float3 wsRefracted = refract( -pixelCtx.m_wsView, pixelCtx.m_wsNormal, $(tsd/RefractionIOR).x );	// Refracted ray through cornea
+				float3 vsRefracted = mul( (float3x3)$viewMatrix, wsRefracted );
+				float angle = safeAcos( dot( vsRefracted, float3( 0.0, 0.0, -1.0 ) ) );
+				float sina, cosa;
+				sincos( fmod(angle, TWOPI), sina, cosa );
+				float2 refractionOffset = float2( cosa, sina ) * $(tsd/RefractionStrength).xy;
+
+				float4 failureValue = $(tsd/FailureNoiseMap).Sample( $trilinearSampler, pixelCtx.m_texCoords.xy );
+				failureValue.xy = (2.0*failureValue.xy) -1.0;
+				
+				float2 failureRefraction = $(tsd/FailFactor).xx * $(tsd/FailureRefractionStrength).xy * failureValue.xy;
+				float failurePortalMask = failureValue.z;
+				float failureBlur = $(tsd/FailureBlurStrength).x * failureValue.w * $(tsd/FailFactor).x;
+			
+				float2 uv = screenPosToTexcoord( $sv_position.xy + (refractionOffset + failureRefraction)*$resolutionScale.xy, $positionToViewTexture, $resolutionScale.xy );
+
+				float2 masks = $(tsd/GlassMaskMap).Sample( $trilinearSampler, pixelCtx.m_texCoords.xy ).xy;
+				
+				float maskBlur = max( masks.y, failureBlur );
+				
+				float2 radius = maskBlur.xx * $(tsd/BlurStrength).xx * $positionToViewTexture.zw * $resolutionScale.xy;
+				float4 portalView = 0.0;
+				for( int idx=0; idx < NB_SAMPLES; ++idx) {
+					portalView += Poisson( uv, pixelCtx.m_wsNormal, radius, idx );
+				}
+				portalView /= NB_SAMPLES;
+				
+				float portalFactor = max(failurePortalMask, 1.0-$(tsd/FailFactor).x );
+				
+				result.finalizedColor *= lerp( masks.x, max( masks.x, 1.0-failurePortalMask.x), $(tsd/FailFactor).x);
+				result.finalizedColor += portalView.xyz * portalFactor.xxx * (1.0-masks.x);
+				
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+				
+				#if $isAlpha && !$isMainPassAlpha
+					writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target = float4(result.finalizedColor, pixelCtx.m_diffuseAlbedo.a);
+				#endif
+
+
+				// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+				#if defined( PC ) && !defined( RETAIL )
+					// Debug draw
+					DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+					// Write MRT info for probe rendering
+					#inlinefile <includes/resultOverrideIL.inc>
+					WRITE_IL_MRT( pixelCtx, surf, result )
+
+				#endif //defined( PC )
+			#endif
+		#endif
+	}
+}

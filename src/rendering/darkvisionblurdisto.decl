@@ -1,0 +1,64 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortDarkVision
+	}
+	state {
+		blend ONE ZERO
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <darkVisionGlobals>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float2 flowUV = $texcoord.xy + $(subpixelOffset).xy;
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture, $resolutionScale.xy);
+		float2 pixelSize = $positionToViewTexture.zw * $resolutionScale.xy;
+
+		float4 currentPixel = $(rendering/BufferIn).Sample( $linearClamp, UV );
+		
+		float4 pixelInput = currentPixel * 2.0;
+		pixelInput += $(rendering/BufferIn).Sample( $linearClamp, UV + pixelSize * float2( $(darkVision/BlurSize).x,  $(darkVision/BlurSize).x) );
+		pixelInput += $(rendering/BufferIn).Sample( $linearClamp, UV + pixelSize * float2(-$(darkVision/BlurSize).x, -$(darkVision/BlurSize).x) );
+		pixelInput += $(rendering/BufferIn).Sample( $linearClamp, UV + pixelSize * float2( $(darkVision/BlurSize).x, -$(darkVision/BlurSize).x) );
+		pixelInput += $(rendering/BufferIn).Sample( $linearClamp, UV + pixelSize * float2(-$(darkVision/BlurSize).x,  $(darkVision/BlurSize).x) );
+		pixelInput *= $(darkVision/EnergyFactor).x / 6.0f;
+
+		const float FlowSpeed		= $(rendering/FlowmapOffset).x;
+		const float HalfCycle		= $(rendering/FlowmapOffset).y;
+		const float FlowMapOffset0	= $(rendering/FlowmapOffset).z;
+		const float FlowMapOffset1	= $(rendering/FlowmapOffset).w;
+
+		//Compute UV
+		float2 flowmapUV = $(darkVision/Tilling).x * flowUV + $(darkVision/FlowMapPanning).xy * $time.xx;
+		float2 flowmap = $(rendering/Flowmap).Sample( $bilinearSampler, flowmapUV ).xy;
+
+		const float3 RGB_TO_GREYSCALE = float3(0.2989, 0.5870, 0.1140);
+		float cycleOffset = 1.0 - dot( currentPixel.xyz, RGB_TO_GREYSCALE );
+
+		// Get the flow vector
+		float phase0 = cycleOffset * $(darkVision/DistanceCoef).x + FlowMapOffset0;
+		float phase1 = cycleOffset * $(darkVision/DistanceCoef).x + FlowMapOffset1;
+	
+		// Sample normal map.
+		float4 flowPixelInput0 = $(rendering/BufferIn).SampleLevel( $linearMirror, UV + (flowmap * phase0+$(darkVision/BleedDirection).xy) * pixelSize, 0.0 );
+		float4 flowPixelInput1 = $(rendering/BufferIn).SampleLevel( $linearMirror, UV + (flowmap * phase1+$(darkVision/BleedDirection).xy) * pixelSize, 0.0 );
+
+
+		float f = ( abs( HalfCycle - FlowMapOffset0 ) / HalfCycle );
+
+		float4 cAccumulation = lerp( flowPixelInput0, flowPixelInput1, f ) * $(darkVision/EnergyFactor).x;
+
+		//Accumulate
+		@sv_target = min(max( pixelInput, cAccumulation ), MAX_INTENSITY * $(rendering/darkVisionLivingOpacity).x);
+	}
+}

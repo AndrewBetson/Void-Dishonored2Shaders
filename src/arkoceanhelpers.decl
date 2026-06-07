@@ -1,0 +1,286 @@
+{
+	newstyle
+
+	hlsl_prefix {
+		#include <helper>
+		#include <noise>
+		#include <arkFiltering>
+
+		float2 ComputeShoreWaveVoronoi( float2 _wsPos )
+		{
+			float3 v = F1F2Voronoi2D( _wsPos, 0.7f );
+
+			//v.xy = sqrt( v.xy );
+
+			float dist = v.y - v.x;
+			float border = smoothstep( 0.05f, 0.5f, dist );
+			float id = frac( sin( v.z ) * 54651.74916f ); // make it more random
+
+			return float2( id, border );
+		}
+
+		float ChoppyNoise( float n, float _choppiness )
+		{
+			n = n * 0.5 + 0.5f;
+			n = pow( n, _choppiness );
+			return n * 2.0f - 1.0f;
+		}
+
+		float ComputePerlinWaves( float2 _wsPos, float _camDist, in float _foamTex, in out float _foam )
+		{
+			_foam = 0.0f;
+
+			#define PERLIN_WAVE_METHOD 0
+
+			if( $(ocean/PerlinBlendStart).x > _camDist ) {
+				return 0.0f;
+			}
+
+			float rawOctaves = 4.0 * (1.0 - LinearStep( $globalViewInfos.z+$(ocean/PerlinBlendStart).x, $globalViewInfos.w, _camDist));
+
+			//Perform kind of a trilinear texture filtering
+			int octaves = 1 + (int)floor( rawOctaves );
+			float lastOctaveBlend = fmod( rawOctaves, 1.0f );
+
+			float time = $localTime.x * $(ocean/TimeScale);
+
+		#if PERLIN_WAVE_METHOD == 0
+
+			const int hashMethod = NOISE_HASH_GPU_GEMS;
+			const int interpQuality = HIGH_QUALITY_NOISE_INTERP;
+
+			const float2 windSpeed = float2( 0.8, 0.6 ) * 0.0f;
+			float2 movement = windSpeed * time;
+
+			float perlinNoise = FractalNoise3DBlendLastOctave( 	float3( (_wsPos + movement) * $(ocean/PerlinFrequency).x, time * $(ocean/PerlinSpeed).x ),
+																octaves, lastOctaveBlend,
+																float3( 2.054f, 2.042f, 1.3f ),
+																$(ocean/PerlinPersistence).x,
+																hashMethod, interpQuality );
+
+			perlinNoise *= $(ocean/PerlinAmplitude).x;
+
+			float foamMask = smoothstep( $(ocean/PerlinFoamThreshold).x, $(ocean/PerlinFoamThreshold).x + $(ocean/PerlinFoamTransition).x, perlinNoise );
+
+			_foam += _foamTex * foamMask * $(ocean/FoamLuminance).x;
+
+			return perlinNoise;
+
+		#elif PERLIN_WAVE_METHOD == 1
+
+			const int hashMethod = NOISE_HASH_INIGO_QUILEZ;
+			const int interpQuality = HIGH_QUALITY_NOISE_INTERP;
+
+			const float2x2 m = float2x2( 1.6f, 1.2f, -1.2f, 1.6f );
+			const float2 windSpeed = float2( 0.8, 0.6 ) * 5;
+
+			float2 movement = windSpeed * time;
+
+			float amplitude = $(ocean/PerlinAmplitude).x;
+			float frequency = $(ocean/PerlinFrequency).x;
+			float choppiness = $(ocean/PerlinChoppiness).x;
+
+			float perlinNoise = 0.0f;
+
+			for( int i=0 ; i < octaves ; ++i )
+			{
+				float n;
+			#if 1
+				n  = RidgedNoise2D( (_wsPos + movement) * frequency, 1, 0, 0, choppiness, hashMethod, interpQuality );
+				n += RidgedNoise2D( (_wsPos - movement) * frequency, 1, 0, 0, choppiness, hashMethod, interpQuality );
+			#else
+				n  = ChoppyNoise( Noise2D( (_wsPos + movement) * frequency, hashMethod, interpQuality ), choppiness );
+				n += ChoppyNoise( Noise2D( (_wsPos - movement) * frequency, hashMethod, interpQuality ), choppiness );
+			#endif
+
+				perlinNoise += n * amplitude;
+
+				_wsPos = mul( _wsPos, m );
+				frequency *= 1.9f;
+				amplitude *= $(ocean/PerlinPersistence).x;
+				choppiness = lerp( choppiness, 1.0f, 0.2f );
+			}
+
+			float foamMask = smoothstep( $(ocean/PerlinFoamThreshold).x, $(ocean/PerlinFoamThreshold).x + $(ocean/PerlinFoamTransition).x, perlinNoise );
+			_foam += _foamTex * foamMask * $(ocean/FoamLuminance).x;
+
+			return perlinNoise;
+		#endif
+		}
+
+		float3 ComputeShoreWaves( float2 _wsPos, float _waveAmplitudeMask, float _shoreDist, out float _foam )
+		{
+			_foam = 0.0f;
+
+			float shoreWaveDistMask = 1.0f - min( abs( _shoreDist - 0.125f ) * 8.0f, 1.0f );
+			shoreWaveDistMask = SCurve3( shoreWaveDistMask );
+
+		#if 0
+			float2 shoreWaveRandom = m_ShoreWaveRandomTex.SampleLevel( $anisotropicSampler, _wsPos * 0.01f, 0 );
+		#else
+			float2 shoreWaveRandom = ComputeShoreWaveVoronoi( _wsPos * 0.01f );
+		#endif
+
+			float shoreWaveMask = shoreWaveDistMask * shoreWaveRandom.g * _waveAmplitudeMask;
+
+			float x = _shoreDist * $(ocean/ShoreWavesFrequency).x + shoreWaveRandom.r * 80.0f + $localTime.x * $(ocean/ShoreWavesSpeed).x;
+			float cosx, sinx;
+			sincos( x, sinx, cosx );
+
+			float shoreWaves = cosx * 0.5f + 0.5f;
+			shoreWaves = pow( shoreWaves, step( sinx, 0 ) * 20 + 3 );
+
+			float2 planeDir = $wsCamPos.xy - _wsPos;
+			float twoDsqrDist = dot( planeDir, planeDir );
+			float farThreshold = $(ocean/ShoreWavesFoamFadeDistance).x+$(ocean/ShoreWavesFoamFadeLength).x;
+			farThreshold *= farThreshold;
+			float nearThreshold = $(ocean/ShoreWavesFoamFadeDistance).x*$(ocean/ShoreWavesFoamFadeDistance).x;
+			float fadeFactor = smoothstep( farThreshold, nearThreshold, twoDsqrDist );
+			
+			_foam = smoothstep( 0.5f, 0.8f, shoreWaves * shoreWaveMask ) * $(ocean/ShoreWavesFoamLuminance).x * fadeFactor * _waveAmplitudeMask;
+
+			shoreWaves *= $(ocean/ShoreWavesAmplitude).x;
+			shoreWaves *= shoreWaveMask;
+
+			return float3( 0.0f, 0.0f, shoreWaves );
+		}
+
+		float3 ComputeOceanSurfaceDisplacement( float2 _wsPos, float _camDist, float _perlinBlendFactor, float _waveAmplitudeMask, bool _usePreWarpedFFTDisplacement, float _foamTex, out float _foam )
+		{
+			_foam = 0.0f;
+
+			float2 globalMapsUV = _wsPos / $(ocean/MasksExtent).x;
+			globalMapsUV += 0.5f;
+			globalMapsUV.x = 1.0f - globalMapsUV.x;
+
+			_wsPos.x *= $(ocean/ScaleX);
+			_wsPos.y *= $(ocean/ScaleY);
+
+			//Shore waves
+		#if 1
+			float shoreDist = $(ocean/ShoreDistanceFieldTex).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+		#else
+			float shoreDist = BiCubicInterpolation( $(ocean/ShoreDistanceFieldTex), globalMapsUV );
+		#endif
+
+			float shoreWavesFoam;
+			float3 shoreWaves = ComputeShoreWaves( _wsPos, _waveAmplitudeMask, shoreDist, shoreWavesFoam );
+			_foam += shoreWavesFoam * _foamTex;
+
+			float globalWaveAmplitude = _waveAmplitudeMask;
+			//globalWaveAmplitude *= lerp( 0.05f, 1.0f, smoothstep( 0.0f, 0.1f, shoreDist ) );
+
+			//Perlin & fft waves
+
+			float3 fftWave = float3( 0.0f, 0.0f, 0.0f );
+			float3 perlinWave = float3( 0.0f, 0.0f, 0.0f );
+
+			if( _perlinBlendFactor < 1.0f )
+			{
+				float2 fftUV = _wsPos * 0.02f; //TODO don't hardcode
+
+				if( _usePreWarpedFFTDisplacement )
+				{
+					//Code path for "collision detection" (no lateral displacement, only vertical)
+					fftWave.z = $(ocean/FFTCollisionHeightMap).SampleLevel( $bilinearSampler, fftUV, 0.0f ).x;
+				}
+				else
+				{
+					fftWave = $(FFTWaves/FFTDisplacement).SampleLevel( $bilinearSampler, fftUV, 0.0f ).xyz;
+					fftWave.xy *= _waveAmplitudeMask; //(choppiness)
+				}
+
+				float foamMask = $(FFTWaves/FoamMask).SampleLevel( $bilinearSampler, fftUV, 0.0f ).x;
+
+				float fftFoam = foamMask * $(ocean/FoamBubblesLuminance).x;
+				fftFoam += _foamTex * foamMask * $(ocean/FoamLuminance).x;
+
+				fftFoam *= _waveAmplitudeMask * _waveAmplitudeMask * _waveAmplitudeMask;
+				_foam += fftFoam * (1.0f - _perlinBlendFactor);
+			}
+
+			if( _perlinBlendFactor > 0.0f )
+			{
+				float perlinFoam;
+				perlinWave.z = ComputePerlinWaves( _wsPos, _camDist, _foamTex, perlinFoam );
+				_foam += perlinFoam * _perlinBlendFactor;
+			}
+
+			#ifdef ORBIS
+				float3 waves = __invariant( lerp( fftWave, perlinWave, _perlinBlendFactor ) ); // ps4: we must keep this unafected by local compil optims or we have a lot of z-fighting between z-prepass and main pass !
+				waves.z = __invariant( waves.z * globalWaveAmplitude * $(ocean/ScaleZ) );
+			#else
+				float3	waves = lerp( fftWave, perlinWave, _perlinBlendFactor );
+				waves.z	*= globalWaveAmplitude * $(ocean/ScaleZ);
+			#endif
+			
+			waves += shoreWaves;
+			
+			return waves;
+		}
+
+		// bmayaux (2016-05-08) Used for motion vectors computation for TAA
+		float3 ComputeOceanPreviousSurfaceDisplacement( float2 _wsPos, float _camDist, float _perlinBlendFactor, float _waveAmplitudeMask ) {
+			float2	globalMapsUV = _wsPos / $(ocean/MasksExtent).x;
+					globalMapsUV += 0.5;
+					globalMapsUV.x = 1.0 - globalMapsUV.x;
+		
+			_wsPos.x *= $(ocean/ScaleX);
+			_wsPos.y *= $(ocean/ScaleY);
+		
+			// Shore waves
+			#if 1
+				float shoreDist = $(ocean/ShoreDistanceFieldTex).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+			#else
+				float shoreDist = BiCubicInterpolation( $(ocean/ShoreDistanceFieldTex), globalMapsUV );
+			#endif
+
+			float	shoreWavesFoam;
+			float3	shoreWaves = ComputeShoreWaves( _wsPos, _waveAmplitudeMask, shoreDist, shoreWavesFoam );
+
+			float	globalWaveAmplitude = _waveAmplitudeMask;
+//					globalWaveAmplitude *= lerp( 0.05f, 1.0, smoothstep( 0.0, 0.1f, shoreDist ) );
+
+			// Perlin & FFT waves
+			float3 fftWave = 0.0;
+			float3 perlinWave = 0.0;
+			if ( _perlinBlendFactor < 1.0 ) {
+				float2	fftUV = _wsPos * 0.02; //TODO don't hardcode
+				fftWave = $(FFTWaves/PreviousFFTDisplacement).SampleLevel( $bilinearSampler, fftUV, 0.0 ).xyz;
+				fftWave.xy *= _waveAmplitudeMask; //(choppiness)
+			}
+
+			if( _perlinBlendFactor > 0.0 ) {
+				float perlinFoam, foamTex = 0.0;
+				perlinWave.z = ComputePerlinWaves( _wsPos, _camDist, foamTex, perlinFoam );
+			}
+
+			#ifdef ORBIS
+				float3 waves = __invariant( lerp( fftWave, perlinWave, _perlinBlendFactor ) ); // ps4: we must keep this unafected by local compil optims or we have a lot of z-fighting between z-prepass and main pass !
+				waves.z = __invariant( waves.z * globalWaveAmplitude * $(ocean/ScaleZ) );
+			#else
+				float3	waves = lerp( fftWave, perlinWave, _perlinBlendFactor );
+				waves.z	*= globalWaveAmplitude * $(ocean/ScaleZ);
+			#endif
+			
+			waves += shoreWaves;
+			
+
+			return waves;
+		}
+
+		float3 ComputeOceanSurfaceNormal( float2 _wsPos, float _camDist, float _perlinBlendFactor, float _waveAmplitudeMask, float _foamTex, out float _foam ) {
+			const float delta = 0.098;	// fft_size / fft_res (TODO don't hardcode it)
+
+			float foamUnused;
+
+			float h = ComputeOceanSurfaceDisplacement( _wsPos, _camDist, _perlinBlendFactor, _waveAmplitudeMask, false, _foamTex, _foam ).z;
+			float hdx = ComputeOceanSurfaceDisplacement( _wsPos + float2( delta, 0 ), _camDist, _perlinBlendFactor, _waveAmplitudeMask, false, 0.0, foamUnused ).z;
+			float hdy = ComputeOceanSurfaceDisplacement( _wsPos + float2( 0, delta ), _camDist, _perlinBlendFactor, _waveAmplitudeMask, false, 0.0, foamUnused ).z;
+
+			float normalFadeout = max( _camDist - $(ocean/NormalFadeOutStart).x, 0.0 ) * $(ocean/NormalFadeOut).x + 1.0;
+
+			return normalize( float3( h - hdx, h - hdy, delta * normalFadeout ) );
+		}
+	}
+}

@@ -1,0 +1,140 @@
+{
+	newstyle
+
+	options {
+		skyType	2
+	}
+	
+	parms {
+		stageSort	sortCoverage
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <pixel>
+		#include <helper>
+		#include <fogHelpers>
+
+		float ComputeFogMask(float4 inputData) {
+			float2 texcoords = inputData.xy * $skyDepthUvScale.xy + $skyDepthUvScale.zw;
+			float4 sv_position = inputData;
+			float depthSrc = $skyDepth.Sample( $trilinearSampler, texcoords ).x;
+			float depth = pow(1.f - depthSrc , $skyDepthOffset);
+			return saturate(1.0 - depth);
+		}
+
+		float3 ComputeStars(float3 sv_position, float size) {
+			//float size = $skyStarSize.x;
+			float prob = 0.9 + $skyStarDensity;
+			
+			float3 color = 0.0;
+			float2 coord = sv_position.xy;
+			float2 pos = floor(1.0 / size * coord);
+			float starValue = rand(pos + size);
+			
+			if (starValue > prob)
+			{
+				//Star shape
+				float2 center = size * pos + size * 0.5;
+				float dist = distance(coord, center);
+				float shape = 1.0 - dist / (0.5 * size);
+				shape = pow( abs(shape), dist );
+
+				//Blink
+				float blink = sin( sin( $skyStarBlink * $localTime.x ) + abs(starValue - prob) / (1.0 - prob) * 45.0);
+				shape *= blink * blink;
+
+				//Star color
+				float3 starColor = 1.0;
+				float fShift = frac(starValue * 10000.0) - 0.5;
+				float fShift2 = frac(starValue * 100000.0) - 0.5;
+				starColor.r -= fShift;
+				starColor.g += (fShift + fShift2) / 2.0;
+				starColor.b += fShift;
+				starColor = lerp(normalize(starColor), 1.0, 0.5 + fShift2 / 2.0);
+
+				//Star mask
+				float mask = LinearStep( 0.25, 1.0, dot( normalize(sv_position), float3(0,0,1)) );
+
+				//Star intensity
+				float intensity = pow( $skyStarIntensity, size/30.0 );
+
+				//Mixed
+				color = shape * mask * intensity * starColor;
+			}
+
+			return color;
+		}
+
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		#if $(tool/unlit)
+			@sv_position = vout._projPosition;
+		#else
+			//@sv_position = vout._projPosition.xyww;	//project on far plane
+			@sv_position = float4( vout._projPosition.xy, 0.f, vout._projPosition.w );	//project on far plane  //ARKANE (2015-06-12) - depth inversion
+		#endif
+
+		#if !$isShadow || $isZPrePass
+			@wsPosition = vout._worldPosition;
+		#endif
+		
+		#if $isZPrePass
+			@psPosition = vout._projPosition; //For motion vectors
+		#endif
+		
+		#if (!$isShadow && !$isZPrePass)
+			@texcoords = vout._texcoords;
+			@texcoords.zw = vout._projPosition.zw;
+		#endif
+	}
+	
+	hlsl_fp_main {
+		#if $isZPrePass
+			//Motion vectors
+			float4 psPreviousPos = mul( $previousViewProjectionMatrix, float4( $wsPosition, 1 ) );
+			psPreviousPos.xy /= psPreviousPos.w;
+			
+			float2 psCurPos = $psPosition.xy / $psPosition.w;
+			
+			float2 motion = psCurPos - psPreviousPos.xy;
+			motion -= $jitterRelativeToPreviousFrame;
+			motion *= 0.5f;
+			
+			@sv_target = float4( motion.x, -motion.y, 1.0f, 0.0f );
+			
+		#elif ( !$isShadow && !$isZPrePass )
+			float4 m_diffuseAlbedo = $diffusemap.Sample( $anisotropicSampler, $texcoords.xy );
+			#if $(tool/unlit)
+				float3 color = lerp($wireFrameColor.rgb, m_diffuseAlbedo.rgb, $wireFrameBlend);
+				@sv_target.rgb = color;
+				@sv_target.a = 1.0;
+			#else
+				float3 color = lerp( m_diffuseAlbedo.rgb, (m_diffuseAlbedo.rgb * $skyCoef), m_diffuseAlbedo.a);
+
+				// compute starColor
+				float3 stars = ComputeStars($wsPosition, $skyStarSize.x) + ComputeStars($wsPosition, $skyStarSize.y);
+
+				@sv_target.xyz = RangeCompressColorToR11G11B10( color + stars );
+				@sv_target.a = 1.0;
+
+				// compute clouds density
+				@sv_target1.yzw = 0.0;
+				@sv_target1.x = ComputeFogMask($texcoords) * $(env/atm/sky/MaskingFactor).x;
+			#endif
+			
+		#endif
+	}	
+}

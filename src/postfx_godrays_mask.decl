@@ -1,0 +1,77 @@
+{
+	newstyle
+
+	state {
+		blend		ONE	ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <pixel>
+		#include <helper>
+		#include <fogHelpers>
+//		#include <downsampling/common>
+	}
+
+	hlsl_vp_main {
+		@sv_position.xy = $vertex_position.xx * $(godRaysMask/Transform1).xy + $vertex_position.yy * $(godRaysMask/Transform1).zw + $(godRaysMask/Transform2).xy;
+		@sv_position.z  = 0.0;
+		@sv_position.w  = 1.0;
+		#if $(godRaysMask/useFogScattering)
+			float3 csView = float3( $globalViewInfos.xy * ($vertex_position.xy * float2(1.0,$(godRaysMask/Transform2).w)  + $(godRaysMask/Transform2).xy), -1.0 );	// Remember we look at -Z!
+			@vsPosition = mul( $inverseViewMatrix, float4( csView, 0.0 ) ).xyz;	// Now in WORLD space
+		#endif
+		@texcoords = float4( $vertex_texcoord.xy, 0.0, 0.0 );
+	}
+
+	hlsl_fp_main {
+		//Fetch color
+		float2 screenTexCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float3 color = $(atm/distanceFog/TexSourceImage).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).rgb; 
+		color = RangeExpandColorFromR11G11B10( color );
+
+		#if $(godRaysMask/useFogScattering)
+			#if $(godRaysMask/useShadow)
+				//Fetch shadow
+				float shadow = $(atm/distanceFog/TexShadow).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).x;
+			#else
+				float shadow = 1.0;
+			#endif
+
+			//Compute scattering
+			float	ZtoDistance = length( $vsPosition.xyz );
+			float3	View = $vsPosition.xyz / ZtoDistance;
+			float	PhaseAngle = dot( $(atm/worldFog/ScatteringDirection), View );
+			float	Phase = PhaseFunctionMie( PhaseAngle, $(atm/worldFog/ScatteringPhase) );
+			float3	scattering = ComputeScatteringIntensity( Phase, $(atm/worldFog/ScatteringColor) );
+			float	scatteringAlpha = min( 1.0, max( scattering.r, max( scattering.g, scattering.b ) ) );
+			color += scattering * shadow * scatteringAlpha;
+		#endif
+
+		//Scale color
+		float3 colorScaled  = max(0.0, color.rgb - $(godRaysMask/ThresholdBias) ) * $(godRaysMask/ThresholdScale);
+
+		//Fetch depth
+		const float zfar = $globalViewInfos.w;
+		float depth = $(water/DownsampledDepthBuffer2).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).x;
+//		float depth = SampleLevelDownsampledDepthBufferLinear( texCoords, 0.0 ).y;	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+		float depthMask = LinearStep( $(godRaysMask/DepthDist), zfar, depth );
+
+		//Circle Mask
+		float2 center_coords = $(texcoords).xy * 2.0 - 1.0;
+		float circleMask = LinearStep(1.0, 0.5, dot( center_coords, center_coords ));
+
+		//Colorize Mask
+		const float3 RGB_TO_GREYSCALE = float3(0.2989, 0.5870, 0.1140);
+		float luminance = dot( colorScaled, RGB_TO_GREYSCALE );
+		colorScaled = lerp( colorScaled , luminance, $(atm/worldFog/GodRayColor).a ) * $(atm/worldFog/GodRayColor).rgb;
+
+		//Compute Mask
+		float3 final = colorScaled * depthMask * circleMask;
+		@sv_target = float4( final, 0.0 );
+	}
+}

@@ -1,0 +1,661 @@
+{
+	newstyle
+	//=============================================================================
+	// HELPERS
+	//=============================================================================
+	hlsl_prefix {
+	#ifndef PARTICLE_COMMON
+		#define PARTICLE_COMMON
+		#include <vertex>
+		#include <BRDF_particles>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <PostFX/Luminance/common>
+		#include <helper>
+		#include <fogHelpers>
+
+		// Soft contact techniques
+		#define SOFT_CONTACT_NONE 0
+		#define SOFT_CONTACT_LINEAR 1
+		#define SOFT_CONTACT_CUBIC 2
+		#define SOFT_CONTACT_SPHERIC 3
+
+		float Fade( float eyeDist, float alphascale ) {
+			// fade particle based on distance to near clip and thickness
+			float fade = saturate( abs( eyeDist ) / ( ( 1.0 - alphascale ) * 127.0 ) );
+			return fade;
+		}
+
+		float Thickness( float eyeDist, float alphascale ) {
+			// create thickness based on alpha scale
+			float thickness = ( ( 1.0 - alphascale ) * 127.0 ) / eyeDist;
+			return thickness;
+		}
+
+		float Fog( float eyeDist ) {
+			float fogTerm = -( clamp( eyeDist - $fogStart.x, 0.0, $fogEnd.x ) * $fogScale.x );
+			float fogVal = saturate( exp2( fogTerm ) );
+			return fogVal;
+		}
+
+		float2 PanAndReadDistUV ( float4 texcoords, Texture2D Texture_Disto, float RotationSpeed, float2 PanningSpeed, float2 Tilling) {
+			float local_time = texcoords.w * $material_seed.x + $localTime.x;
+			float2 bias = { 0.5, 0.5 };
+			float2 localuvrot =  texcoords.xy;
+
+			// apply rotation
+			float cosinus, sinus;
+			sincos ( local_time * RotationSpeed, sinus, cosinus );
+
+			localuvrot.x =  ( texcoords.x -0.5 ) * cosinus + ( texcoords.y -0.5 ) * sinus   + 0.5;
+			localuvrot.y = -( texcoords.x - 0.5 ) *  sinus + ( texcoords.y -0.5 ) * cosinus + 0.5;
+/*
+			// pgrison: matrice transpose to remove rendering articfact while normal maps are rendering
+			float2x2 rot;
+			rot._m00 = cosinus;
+			rot._m01 = sinus;
+			rot._m10 = -sinus;
+			rot._m11 = cosinus;
+			float2 rotatedUV =  mul( rot, texcoords.xy - bias ) + bias;
+				 cosinus + ( texcoords.y -0.5 ) * sinus   + 0.5;
+			//localuvrot.y = -( texcoords.x - 0.5 ) *  sinus + ( texcoords.y -0.5 ) * cosinus + 0.5;
+
+//			float2 newUV = mul( rot, resultDeltaUV.xy );
+*/
+			// apply scale and speed
+			float2 panningUV =  local_time * PanningSpeed.xy;
+			float2 resultDeltaUV = Texture_Disto.Sample( $trilinearSampler, localuvrot.xy * Tilling.xy + panningUV.xy ).xy;
+
+			return resultDeltaUV;
+		}
+
+		float3 Distortion(float4 texcoords, out float4 distoDelta1result, out float4 distoDelta2result ) {
+			distoDelta1result = distoDelta2result = 0.0;
+			float3 disto_result = 0;
+			float cosinus = 1.0, sinus = 0.0;
+			float alpha_1 = 0.0;
+			float2 localuvrot = texcoords.xy;
+
+			#if $(fx/opt/uv_disto1)
+				distoDelta1result.xy =  PanAndReadDistUV( texcoords, $(fx/disto1), $disto1_RotationSpeed.x, $disto1_PanningSpeed, $disto1_Tilling.xy);
+				disto_result.z =  distoDelta1result.x;
+				#if  $(fx/opt/uv_disto1_uniform) // if the disto 1 texture is a BC4 we put in .y the .x
+					distoDelta1result.y = distoDelta1result.x;
+				#endif
+
+				disto_result.xy += distoDelta1result.xy * $disto1_Strength.xy;
+
+
+				// apply uv disto 2
+				#if $(fx/opt/uv_disto2)
+					distoDelta2result.xy =  PanAndReadDistUV( texcoords, $(fx/disto2), $disto2_RotationSpeed.x, $disto2_PanningSpeed, $disto2_Tilling.xy);
+					alpha_1 = distoDelta2result.x;
+					#if  $(fx/opt/uv_disto2_uniform) // if the disto 1 texture is a BC4 we put in .y the .x
+						distoDelta2result.y = distoDelta2result.x;
+					#endif
+
+					// choose weather to add or multiply the 2 UV distortion textures
+					#if $(fx/opt/uv_Disto2xDisto1)
+						disto_result.xy *= distoDelta2result.xy * $disto2_Strength.xy;
+						disto_result.z *= alpha_1;
+					#else
+						disto_result.xy += distoDelta2result.xy * $disto2_Strength.xy;
+						disto_result.z += alpha_1;
+					#endif
+
+				#endif
+			#endif
+			disto_result.z = saturate( disto_result.z );
+			disto_result.xy += texcoords.xy;
+			return disto_result;
+		}
+
+		float4 RadialRamp(float2 texcoords, float2 uv) {
+			texcoords -= 0.5;
+			uv -= 0.5;
+
+			float a = ( texcoords.x + uv.x );
+			float b = ( texcoords.y + uv.y );
+			float c = a * a + b * b;
+
+			float4 color = saturate( 1.0 - c );
+			color = pow ( color, $radial_RampPow.x );
+			return color;
+		}
+
+		float4 AdjustColor(float4 legacy_color, float4 color) {
+			return float4 ( color.xyz * legacy_color.xyz * $color_Adjust.xyz * $color_Adjust.www, color.w * legacy_color.w);
+		}
+
+		float4 TextureColor(float4 texcoords, float3 uv, float lookupModulate) {
+			float2 opacity_uv = uv.xy;
+			float4 color = 0.0;
+
+			float cosinus = cos ( $localTime.x * $opacity_RotationSpeed.x);
+			float sinus = sin ( $localTime.x * $opacity_RotationSpeed.x);
+			opacity_uv.x =  ( uv.x -0.5 ) * cosinus + ( uv.y -0.5 ) * sinus   + 0.5;
+			opacity_uv.y = -( uv.x - 0.5 ) *  sinus + ( uv.y -0.5 ) * cosinus + 0.5;
+			#if $(fx/opt/use_mirror_sampler)
+				SamplerState customsampler = $linearMirror;
+			#elif $(fx/opt/use_clamp_sampler)
+				SamplerState customsampler = $linearClamp;
+			#elif $(fx/opt/use_bilinear_sampler)
+				SamplerState customsampler = $bilinearSampler;
+			#else
+				SamplerState customsampler = $trilinearSampler;
+			#endif
+
+			float2 uv_offset = $opacity_PanningSpeed.xy * $localTime.xx;
+			#if $(fx/opt/use_disto_has_mask)
+				#if $(fx/opt/use_flipbook)
+					float3 offsets = float3(uv.xy * $opacity_Tilling.xy + uv_offset.xy, texcoords.z);
+					#if $(fx/opt/flipbook_is_mask)
+						color.xyz = 1.0;
+						color.w = $(fx/flipbook).Sample( customsampler, offsets ).x;
+					#else
+						color = $(fx/flipbook).Sample( customsampler, offsets );
+					#endif
+				#else
+					color.rgb = 1.0;
+					color.a = $(fx/opacity).Sample( customsampler, opacity_uv.xy * $opacity_Tilling.xy + uv_offset.xy ).x;
+				#endif
+				color.a *= uv.z;
+			#else
+				float3 offsets = float3(uv.xy * $opacity_Tilling.xy + uv_offset.xy, texcoords.z);
+				#if $(fx/opt/use_flipbook)
+					#if $(fx/opt/flipbook_is_mask)
+						color.xyz = 1.0;
+						color.w = $(fx/flipbook).Sample( customsampler, offsets ).x;
+					#else
+						color = $(fx/flipbook).Sample( customsampler, offsets );
+					#endif
+				#else
+					color.rgb = 1.0;
+					color.a = $(fx/opacity).Sample( customsampler, opacity_uv.xy * $opacity_Tilling.xy + uv_offset.xy ).x;
+				#endif
+			#endif
+
+			#if $(fx/opt/use_diffuse)
+				color.xyz = $(fx/diffuse).Sample( customsampler, opacity_uv.xy * $opacity_Tilling.xy + uv_offset.xy  ).xyz;
+			#endif
+
+			#if $(fx/opt/use_lookup)
+				// set the lookup uv coordinates
+				float2 lookup_uv = float2( pow( color.w, $lookup_adjust) * lookupModulate, 1);
+				// read the pixel color in the texture lookup
+				color.xyz *= $(fx/lookup).Sample( $linearClamp, lookup_uv ).xyz;
+			#endif
+
+			//discard low alpha value
+			clip( color.a - 0.5/255.0 );
+			return color;
+		}
+
+		// identical to TextureColor(), but uses only SampleLevel on 0 mip to be callable from Vertex Shader
+		float4 TextureColorMip0(float4 texcoords, float3 uv, float lookupModulate) {
+			float2 opacity_uv = uv.xy;
+			float4 color = 0.0;
+
+			float cosinus = cos ( $localTime.x * $opacity_RotationSpeed.x);
+			float sinus = sin ( $localTime.x * $opacity_RotationSpeed.x);
+			opacity_uv.x =  ( uv.x -0.5 ) * cosinus + ( uv.y -0.5 ) * sinus   + 0.5;
+			opacity_uv.y = -( uv.x - 0.5 ) *  sinus + ( uv.y -0.5 ) * cosinus + 0.5;
+			#if $(fx/opt/use_mirror_sampler)
+				SamplerState customsampler = $linearMirror;
+			#elif $(fx/opt/use_clamp_sampler)
+				SamplerState customsampler = $linearClamp;
+			#elif $(fx/opt/use_bilinear_sampler)
+				SamplerState customsampler = $bilinearSampler;
+			#else
+				SamplerState customsampler = $trilinearSampler;
+			#endif
+
+			float2 uv_offset = $opacity_PanningSpeed.xy * $localTime.xx;
+			#if $(fx/opt/use_disto_has_mask)
+				#if $(fx/opt/use_flipbook)
+					color = $(fx/flipbook).SampleLevel( customsampler, float3(uv.xy * $opacity_Tilling.xy, texcoords.z), 0 );
+					#if $(fx/opt/flipbook_is_mask)
+						color.xyzw = color.x;
+					#endif
+					color.w *= uv.z;
+				#else
+					color = $(fx/opacity).SampleLevel( customsampler, opacity_uv.xy * $opacity_Tilling.xy, 0 ).x;
+					color.w = color.w * uv.z;		// mask the alpha with the uv value
+				#endif
+			#else
+				#if $(fx/opt/use_flipbook)
+					color = $(fx/flipbook).SampleLevel( customsampler, float3(uv.xy * $opacity_Tilling.xy + uv_offset.xy, texcoords.z), 0 );
+					#if $(fx/opt/flipbook_is_mask)
+						color.xyzw = color.x;
+					#endif
+				#else
+					color = $(fx/opacity).SampleLevel( customsampler, opacity_uv.xy * $opacity_Tilling.xy + uv_offset.xy, 0 ).x;
+				#endif
+			#endif
+
+			#if $(fx/opt/use_diffuse)
+				color.xyz = $(fx/diffuse).SampleLevel( customsampler, opacity_uv.xy * $opacity_Tilling.xy + uv_offset.xy, 0  ).xyz;
+			#endif
+
+			#if $(fx/opt/use_lookup)
+				// set the lookup uv coordinates
+				float2 lookup_uv = float2( pow( color.w, $lookup_adjust) * lookupModulate, 1);
+				// read the pixel color in the texture lookup
+				color.xyz *= $(fx/lookup).SampleLevel( $linearClamp, lookup_uv, 0 ).xyz;
+			#endif
+			return color;
+		}
+
+		float4 FadeColor(float4 legacy_color, float4 texcoords, float current_threshold, float4 temp1, float4 temp2) {
+			float4 color = 0.0;
+
+			#if $(fx/opt/fade_threshold)
+				current_threshold += ( 1 - clamp ( legacy_color.w, 0, 1) );
+			#endif
+
+			#if	$(fx/opt/no_opacity_map)
+				color.w = ( clamp (   ( pow ( temp1.x, 1 ) + pow ( temp2.x, 1) - current_threshold ) * 2 , 0, 1 ) );
+			#else
+				float2 uv_offset = $opacity_PanningSpeed.xy * $localTime.xx;
+				float opa = $(fx/opacity).Sample( $trilinearSampler, texcoords.xy * $opacity_Tilling.xy + uv_offset.xy ).x;
+				color.w = opa.x * ( clamp (   ( pow ( temp1.x, 1 ) + pow ( temp2.x, 1) - current_threshold ) * 2 , 0, 1 ) );
+			#endif
+
+			// color adjustment
+			#if $(fx/opt/fade_threshold)
+				color = float4 ( color.xyz * legacy_color.xyz * $color_Adjust.xyz * $color_Adjust.www, color.w);
+			#else
+				color = float4 ( color.xyz * legacy_color.xyz * $color_Adjust.xyz * $color_Adjust.www, color.w * legacy_color.w);
+			#endif
+
+			return color;
+		}
+
+		void ClipAlpha(float alpha) {
+			#if $isShadow
+				clip( alpha - 0.7 );
+			#else
+				clip( alpha - max($particleAlphaTest, 0.0001) );
+			#endif
+		}
+
+		void ClipColor(float4 color) {
+			#if $isShadow
+				clip( color.a - 0.7 );
+			#else
+				const float3 RGB_TO_LUMINANCE = float3(0.2126f, 0.7152f, 0.0722f);	//perceptual luminance
+				float alpha = dot( color.rgb, RGB_TO_LUMINANCE ) * color.a;
+				#if $(fx/opt/use_lighting) == 1
+					clip( alpha - (1.0/255.0) );
+				#else
+					clip( alpha - max($particleAlphaTest, 0.0001) );
+				#endif
+			#endif
+		}
+
+		float Opacity_Linear( in arkPixelContext_t _pixelCtx ) {
+			float svPosW = _pixelCtx.m_ssPosition.w;
+			#if $isAlpha
+				float alpha = LinearStep(0.0, $depth_Threshold, max(0,_pixelCtx.m_opaqueZscene-svPosW));
+			#else
+				float Zproj = $(fx/depthFull).SampleLevel( $linearClamp, svPosW*$positionToViewTexture.zw, 0.0 ).x;
+				float Zscene = ComputeLinearZ( Zproj );
+				float alpha = LinearStep(0.0, $depth_Threshold, max(0,Zscene-svPosW));
+			#endif
+			return alpha;
+		}
+
+		float Opacity_Spherical( in arkPixelContext_t _pixelCtx, float3 _particleCenter, float _particleRadius) {
+			float svPosW = _pixelCtx.m_ssPosition.w;
+			_particleRadius *= 0.5;
+			float tau = $depth_Threshold.x; //density
+			float alpha = 0.0;
+			float dist = length(_particleCenter - _pixelCtx.m_wsPosition);
+			float ratio = dist/_particleRadius;
+
+			float w = sqrt(_particleRadius*_particleRadius - dist*dist);
+			float F = svPosW;
+			float B = svPosW + w;
+
+			#if $isAlpha
+				float Zs = _pixelCtx.m_opaqueZscene;
+			#else
+				float2 texCoords = screenPosToTexcoord( _pixelCtx.m_ssPosition.xy, $positionToViewTexture );
+				float Zproj = $(fx/depth).SampleLevel( $bilinearClamp, texCoords, 0.0 ).y ;
+				float Zs = ComputeLinearZ( Zproj );
+			#endif
+
+			float ds = min(Zs, B) - F;
+			alpha = 1.0 - exp(- tau * (1.0 - ratio) * ds);
+
+			return saturate( alpha );
+		}
+
+		float Opacity_Cube( in arkPixelContext_t _pixelCtx, float _particleSize ) {
+			float svPosW = _pixelCtx.m_ssPosition.w;
+			#if $isAlpha
+				float alpha = LinearStep(0.0, $depth_Threshold, (_pixelCtx.m_opaqueZscene-svPosW) / _particleSize);
+			#else
+				float Zproj = $(fx/depthFull).SampleLevel( $linearClamp, svPosW*$positionToViewTexture.zw, 0.0 ).x;
+				float Zscene = ComputeLinearZ( Zproj );
+				float alpha = LinearStep(0.0, $depth_Threshold, (Zscene-svPosW) / _particleSize);
+			#endif
+			return alpha;
+		}
+
+		float ComputeSoftParticleScale( Texture2D<float> _depthBuffer, uint2 _screenPos, float _interpolatedZOverW, float _softness ) {
+			// This instruction handles the 1.0 - depth calc automatically when using an inverted depth buffer
+			float depth = _depthBuffer[ _screenPos ];
+			// Approximate a linear depth difference
+			float r1 = 1.0 / ( 1.0 - depth );
+			float r2 = 1.0 / ( 1.0 - _interpolatedZOverW );
+			return saturate( ( r1 - r2 ) * _softness );
+		}
+
+		float SoftContact( in arkPixelContext_t _pixelCtx, float4 _particleCenterSize ) {
+			float alpha = 1.0;
+			#if (!$isShadow && !$isZPrePass)
+				#if $(fx/opt/use_softcontact) == SOFT_CONTACT_LINEAR
+					alpha = Opacity_Linear(_pixelCtx);
+				#elif $(fx/opt/use_softcontact) == SOFT_CONTACT_CUBIC
+					alpha = Opacity_Cube(_pixelCtx, _particleCenterSize.w);
+				#elif $(fx/opt/use_softcontact) == SOFT_CONTACT_SPHERIC
+					alpha = Opacity_Spherical(_pixelCtx, _particleCenterSize.xyz, _particleCenterSize.w);
+				#endif
+			#endif
+			return alpha;
+		}
+
+		float InvertSoftContact( in arkPixelContext_t _pixelCtx, float4 _particleCenterSize ) {
+			return 1.0 - SoftContact(_pixelCtx, _particleCenterSize);
+		}
+
+		float4 ComputeAnimCrossFadeColor( Texture2D<float4> _texture, SamplerState _sampler, float2 _tc0, float2 _tc1, float _frameFrac ) {
+			// For strip animations, we need to cross-fade
+			float4 result0 = _texture.Sample( _sampler, _tc0 ) * ( 1.0 - _frameFrac );
+			float4 result1 = _texture.Sample( _sampler, _tc1 ) * ( _frameFrac );	// when frameFrac is 0, no contribution
+			return ( result0 + result1 );
+		}
+
+		float4 ComputeDistortionMV( float2 distortVec, float blur ) {
+			float4 final;
+			final.xy = distortVec.xy*blur.xx;
+			final.zw = distortVec.xy;
+			return final;
+		}
+
+		float FresnelOpacity( const arkPixelContext_t pixelCtx ) {
+			float fresnel = 1.0;
+
+			#if $(fx/opt/fresnel)
+				// The opacity of the particle is controlled by this Fresnel effect. The computation is based on the direction
+				// of the normal and the view direction. The computation of the Fresnel contribution is directly impacted by
+				// the cosinus between those two vectors.
+				float cosTheta = 0.0;
+				float3 wsNormal = 0.0;
+				// Compute the normal either by using a specific normal map or with the already.
+				#if $(fx/opt/fresnel/useNormalMap)
+					float2 rawTsNormal = $particleFresnelNormalMap.Sample( $trilinearSampler, pixelCtx.m_layerTexCoords[0] ).xy;
+					float3 tsNormal = UnpackBC5NormalMap( rawTsNormal );
+					wsNormal = normalize( tsNormal.x * pixelCtx.m_wsVertexTangent + tsNormal.y * pixelCtx.m_wsVertexBiTangent + tsNormal.z * pixelCtx.m_wsVertexNormal );
+				#else
+					wsNormal = pixelCtx.m_wsNormal;
+				#endif
+
+				// The fresnel contribution
+				cosTheta = saturate( dot( pixelCtx.m_wsView, wsNormal ) );
+				// Compute the frenel spreading either with a LUT or with a threshold.
+				#if $(fx/opt/fresnel/useLUT)
+					fresnel = $particleFresnelLUT.Sample( $linearClamp, cosTheta );
+				#else
+					fresnel = min( cosTheta / $particleFresnelThreshold.x, 1.0 );
+				#endif
+				// The strength of the Fresnel effect.
+				fresnel = pow( fresnel, $particleFresnelStrength.x );
+			#endif
+
+			return fresnel;
+		}
+
+		float ViewDependentFade( const float distance ) {
+			float fadeFactor = 1.0;
+			#if $(fx/opt/view_dependent_fade)
+				fadeFactor = smoothstep( $particleDistanceFadeIn, $particleDistanceFadeOut, distance );
+			#endif
+			return fadeFactor;
+		}
+
+		float3 ComputeMacroUV(float3 uv, float3 wsPosition, float3 wsNormal) {
+			#if $(fx/opt/use_macroUV)
+
+				const float amount = $macroUvAmount.x;
+				const float tiling = $macroUvAmount.y;
+
+				//Tri-planar mapping
+				float2 coord1 = wsPosition.yz * tiling;
+				float2 coord2 = wsPosition.zx * tiling;
+				float2 coord3 = wsPosition.xy * tiling;
+				float2 swirl0 = $(fx/macroUvMap).Sample( $bilinearSampler, coord1 ).xy * 2.0 - 1.0;
+				float2 swirl1 = $(fx/macroUvMap).Sample( $bilinearSampler, coord2 ).xy * 2.0 - 1.0;
+				float2 swirl2 = $(fx/macroUvMap).Sample( $bilinearSampler, coord3 ).xy * 2.0 - 1.0;
+
+				float2 swirlCoords = swirl0 * wsNormal.xx + swirl1 * wsNormal.yy + swirl2 * wsNormal.zz;
+
+				float2 distOffsets = swirlCoords * amount;
+				float2 dist = uv.xy + distOffsets;
+
+				return float3( dist.xy, uv.z );
+			#else
+				return uv;
+			#endif
+		}
+
+		float	ComputeParticleParallelShadow( const float4 _wsPosition ) {
+			#if $parallelLightHasShadow
+				// select slice
+				float	viewZ = -dot( _wsPosition, $viewMatrix[2] );
+				float4	slicesFar = $parallelLightSliceFars;
+				float4	slicesMask = step( slicesFar, viewZ );
+				uint	sliceIndex = uint( slicesMask.x + slicesMask.y + slicesMask.z + slicesMask.w );
+				float3 shadowCoords = mul( (float3x4)$shadowProjections[sliceIndex], _wsPosition );
+
+				return $(lightDepthCompareMap).SampleCmpLevelZero( $(shadowHardwarePCFSampler), float3( shadowCoords.xy, sliceIndex ), shadowCoords.z );
+			#else
+				return 1.0;
+			#endif
+		}
+		
+		float ComputeAutoExposure() {
+			$(PostFX/Luminance/autoExposure_t) Adaptation = ReadAutoExposureParameters();
+			float amount = $(fx/auto_exposure_amount);
+			return lerp( 1.0, 1.0/Adaptation.EngineLuminanceFactor, amount );
+		}
+
+		void ComputeHL2Basis(out float3 wsHL2BasisX, out float3 wsHL2BasisY, out float3 wsHL2BasisZ,
+							 float3 wsVertexTangent, float3 wsVertexBiTangent, float3 wsVertexNormal ) {
+			// Build HL2 basis for backface lighting
+			const float3 tsHL2Basis_R = float3(  sqrt(2.0/3.0),            0.0, sqrt(1.0/3.0) );
+			const float3 tsHL2Basis_G = float3( -sqrt(1.0/6.0),  sqrt(1.0/2.0), sqrt(1.0/3.0) );
+			const float3 tsHL2Basis_B = float3( -sqrt(1.0/6.0), -sqrt(1.0/2.0), sqrt(1.0/3.0) );
+
+			// Transformation to world space must use the original geometric TBN since HL2 basis is expressed in that original tangent space
+			wsHL2BasisX = tsHL2Basis_R.x * wsVertexTangent + tsHL2Basis_R.y * wsVertexBiTangent + tsHL2Basis_R.z * wsVertexNormal;
+			wsHL2BasisY = tsHL2Basis_G.x * wsVertexTangent + tsHL2Basis_G.y * wsVertexBiTangent + tsHL2Basis_G.z * wsVertexNormal;
+			wsHL2BasisZ = tsHL2Basis_B.x * wsVertexTangent + tsHL2Basis_B.y * wsVertexBiTangent + tsHL2Basis_B.z * wsVertexNormal;
+		}
+
+		float3x3 AccumulateLighting( float3 wsHL2BasisX, float3 wsHL2BasisY, float3 wsHL2BasisZ,
+									 float3 wsLightDir, float3 lightColor) {
+			//Compute weights from light direction
+			float3 weights = saturate( float3( dot(wsLightDir, wsHL2BasisX), dot(wsLightDir, wsHL2BasisY), dot(wsLightDir, wsHL2BasisZ)) );
+
+			//Accumulate color in HL2 basis
+			float3x3 basisColor;
+			basisColor[0] = lightColor * weights.x;
+			basisColor[1] = lightColor * weights.y;
+			basisColor[2] = lightColor * weights.z;
+			return basisColor;
+		}
+
+		float3 EvaluateLighting(float3 wsNormal,
+								float3 wsHL2BasisX, float3 wsHL2BasisY, float3 wsHL2BasisZ,
+								float3 basisColorX, float3 basisColorY, float3 basisColorZ ) {
+			// Evalutate final diffuse lighting
+			float3 w = saturate( float3(dot(wsNormal, wsHL2BasisX), dot(wsNormal, wsHL2BasisY), dot(wsNormal, wsHL2BasisZ)) );
+			float3 diffuseLight = basisColorX * w.x + basisColorY * w.y + basisColorZ * w.z;
+			return diffuseLight;
+		}
+
+		float3x3 ComputeLighting(VertexOutContext vout, float3 direction, float3 normal, float3 wsTangent, float3 wsBitangent, float3 wsNormal ) {
+			//Compute HL2 basis
+			float3 wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ;
+			ComputeHL2Basis( wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, wsTangent, wsBitangent, wsNormal );
+
+			//Compute direct lighting
+			float3x3 basisColor = 0.0;
+			LightContext light;
+
+			uint maxLights = 8; // LOW_QUALITY
+			float2 coords = vout._projPosition.xy / vout._projPosition.w;
+			coords = coords * 0.5 + 0.5;
+			coords.y = 1.0 - coords.y;
+			coords /= $positionToViewTexture.zw;
+			uint2 pixelAddr = uint2( trunc(coords) );
+
+			SurfaceContext	_Surface;
+			_Surface.pixelIndex			= pixelAddr;
+			_Surface.wsPosition			= vout._worldPosition;
+			_Surface.wsPositionHacked	= vout._worldPosition;
+			_Surface.wsView				= direction;
+			_Surface.wsNormal			= normal;
+
+			//Diffuse Directional
+			float vtxShadow = ComputeParticleParallelShadow( float4( vout._worldPosition, 1.0) );
+			basisColor += AccumulateLighting(wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, $parallelLightDir.xyz, $parallelLightColor.xyz * vtxShadow );
+
+			//Diffuse Half Point
+			light = CreateLightContext( vout._worldPosition, pixelAddr, LIGHT_TYPE_HALF_POINT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_HALF_POINT );
+					light.ComputeShadow( _Surface, LOW_QUALITY, LIGHT_TYPE_HALF_POINT );
+					basisColor += AccumulateLighting(wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, light.m_wsToLight, light.m_color * light.m_shadow * light.m_attenuation );
+				}
+			}
+			//Diffuse Point
+			light = CreateLightContext( vout._worldPosition, pixelAddr, LIGHT_TYPE_POINT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_POINT );
+					light.ComputeShadow( _Surface, LOW_QUALITY, LIGHT_TYPE_POINT );
+					basisColor += AccumulateLighting(wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, light.m_wsToLight, light.m_color * light.m_shadow * light.m_attenuation );
+				}
+			}
+			//Diffuse Spot
+			light = CreateLightContext( vout._worldPosition, pixelAddr, LIGHT_TYPE_SPOT );
+			while( light.NextLightData( maxLights ) ) {
+				int lightIndex;
+				if (light.LightIndex(lightIndex)) {
+					light.FetchLightData(lightIndex);
+					light.ComputeAttenuation( LIGHT_TYPE_SPOT );
+					light.ComputeShadow( _Surface, LOW_QUALITY, LIGHT_TYPE_SPOT );
+					basisColor += AccumulateLighting(wsHL2BasisX, wsHL2BasisY, wsHL2BasisZ, light.m_wsToLight, light.m_color * light.m_shadow * light.m_attenuation );
+				}
+			}
+
+			return basisColor;
+		}
+
+		void Lighting( inout arkPixelContext_t _pixelCtx, out float3 finalColor, out float3 accumScattering ) {
+			SurfaceContext surf;
+			surf.Clear();
+			surf.pixelIndex			= uint2( _pixelCtx.m_ssPosition.xy );
+			surf.wsPosition			= _pixelCtx.m_wsPosition;
+			float2 ndcPos			= screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, _pixelCtx.m_ssPosition.z, 1.0 ) );
+			surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+
+			surf.wsView				= _pixelCtx.m_wsView;
+			surf.distance			= _pixelCtx.m_distance;
+			surf.wsTangent			= _pixelCtx.m_wsTangent;
+			surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			surf.wsNormal			= _pixelCtx.m_wsNormal;
+			surf.wsVertexTangent 	= _pixelCtx.m_wsVertexTangent;
+			surf.wsVertexBiTangent 	= _pixelCtx.m_wsVertexBiTangent;
+			surf.wsVertexNormal		= _pixelCtx.m_wsVertexNormal;
+			surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.rgb;
+			surf.roughness			= 0.0;
+			surf.anisotropy			= $wardRoughness.z;
+			surf.anisotropyAngle	= PI * $wardRoughness.w;
+			surf.sheen				= $sheen.x;
+			surf.sheenImportance	= $sheenImportance.x;
+			surf.IOR				= float3(1.0,1.0,1.0);
+			surf.fresnelStrength	= 0.0;
+			surf.translucency		= $particleTranslucency;
+			surf.emissive			= float3(0.0,0.0,0.0);
+			surf.AO					= 0.0;
+			surf.IBLLuminanceFactor	= _pixelCtx.m_IBLLuminanceFactor;
+			surf.IBLCubeMapIndex 	= _pixelCtx.m_IBLCubeMapIndex;
+
+			finalColor = _pixelCtx.m_diffuseAlbedo.rgb;
+			accumScattering = 0.0;
+			#if !$(tool/unlit)
+				#if $(fx/opt/use_lighting)
+					HQ_ComputeLightingParams( _pixelCtx, surf );
+					HQ_FetchMetallicSpecularFresnelAndIOR( _pixelCtx, surf );
+					ComputeLightingResult result = IntegrateLighting( surf, HIGH_QUALITY );
+					const float BC7epsilon = 0.01569; //BC7 compression is not accurate and can add some noise on alpha low value
+					result.accumSpecular *= _pixelCtx.m_diffuseAlbedo.a > BC7epsilon ? 1.0 / _pixelCtx.m_diffuseAlbedo.a : 1.0;
+					result.accumSpecular = min( 250.0, result.accumSpecular ); //avoid infinite in OIT - avoid too bright value
+					result.Finalize();
+					finalColor = result.finalizedColor.rgb;
+					accumScattering = result.accumScattering.rgb;
+				#else
+					finalColor *= ComputeAutoExposure();
+				#endif
+			#endif
+		}
+
+		float3 ComputeIBL( inout arkPixelContext_t _pixelCtx ) {
+			SurfaceContext surf;
+			surf.Clear();
+			surf.pixelIndex			= uint2( _pixelCtx.m_ssPosition.xy );
+			surf.wsPosition			= _pixelCtx.m_wsPosition;
+			surf.wsPositionHacked	= _pixelCtx.m_wsPosition;
+			surf.wsView				= _pixelCtx.m_wsView;
+			surf.distance			= _pixelCtx.m_distance;
+			surf.wsTangent			= _pixelCtx.m_wsTangent;
+			surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			surf.wsNormal			= _pixelCtx.m_wsNormal;
+			surf.wsVertexTangent 	= _pixelCtx.m_wsVertexTangent;
+			surf.wsVertexBiTangent 	= _pixelCtx.m_wsVertexBiTangent;
+			surf.wsVertexNormal		= _pixelCtx.m_wsVertexNormal;
+			surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.rgb;
+			surf.roughness			= 0.0;
+			surf.anisotropy			= $wardRoughness.z;
+			surf.anisotropyAngle	= PI * $wardRoughness.w;
+			surf.sheen				= $sheen.x;
+			surf.sheenImportance	= $sheenImportance.x;
+			surf.IOR				= float3(1.0,1.0,1.0);
+			surf.fresnelStrength	= 0.0;
+			surf.translucency		= $particleTranslucency;
+			surf.emissive			= float3(0.0,0.0,0.0);
+			surf.AO					= 0.0;			
+			surf.IBLCubeMapIndex	= _pixelCtx.m_IBLCubeMapIndex;
+			surf.IBLLuminanceFactor	= _pixelCtx.m_IBLLuminanceFactor;
+
+			HQ_ComputeLightingParams( _pixelCtx, surf );
+			HQ_FetchMetallicSpecularFresnelAndIOR( _pixelCtx, surf );
+			float3 accumSpecular = LQ_ComputeIBL( surf, surf.roughness * surf.roughness );
+			accumSpecular = min( 250.0, accumSpecular ); //avoid infinite in OIT - avoid too bright value
+			return accumSpecular;
+		}
+
+	//=============================================================================
+	#endif //PARTICLE_COMMON
+	}//hlsl_prefix
+}

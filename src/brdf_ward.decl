@@ -1,0 +1,249 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef BRDF_WARD_INCLUDED
+		#define BRDF_WARD_INCLUDED
+		#define BRDF_OK	1			// Every BRDF include file must define this so we can easily spot the shaders that forgot to include a BRDF model!
+
+		#include <surfaceContext>	// Contains information about the surface
+		#include <lightContext>		// Contains information about the light
+		#include <areaLight>
+		#include <ward>				// Ward specular model
+		#include <fresnel>
+		#include <colorimetry>
+		#include <translucency>
+		#include <orenNayar>
+
+		// Analytical estimate of the pre-integrated BRDF after curve fitting with Mathematica
+		float2	AnalyticalBRDFIntegral_Order3( in float _VdotN, in float _SurfaceRoughness ) {
+			float	x = saturate( _VdotN );
+			float	y = saturate( _SurfaceRoughness );
+
+			const float2	a = float2(  4.48312009476652700, -4.2683733765575550  );
+			const float2	b = float2( -6.60741816270206900,  5.9893822170455895 );
+			const float2	c = float2(  3.13691461267413140, -2.7458769822052020 );
+			const float2	d = float2(  0.31965568814498413, -1.1169779635363377 );
+			const float2	e = float2( -4.17156096973304100,  6.2485832361009965 );
+			const float2	f = float2(  10.5792564139974970, -10.359824418695426 );
+			const float2	g = float2( -6.40718197313275800,  5.2965925776235290 );
+			const float2	h = float2(  1.48122387524109470,  0.08005589283505338 );
+			const float2	i = float2( -5.67918029305783100, -4.0578784784654650 );
+			const float2	j = float2( -0.17354724317745246,  10.024587584890986 );
+			const float2	k = float2(  2.90600797354352560, -6.1837797619503120 );
+			const float2	l = float2( -1.14830951945513980,  0.3075771997708405 );
+			const float2	m = float2(  5.28977465305014900,  0.8965992421669212 );
+			const float2	n = float2( -4.03337882134342000, -3.9327120832393003 );
+			const float2	o = float2(  0.49631367829983400,  2.8109277250321485 );
+
+			// 14 adds / 26 muls
+// 			float	x2 = x*x;
+// 			float	x3 = x2*x;
+// 			float	y2 = y*y;
+// 			float	y3 = y2*y;
+// 			float2	result =           a * x    + b * x2    + c * x3
+// 							+ d * y  + e * x*y  + f * x2*y  + g * x3*y
+// 							+ h * y2 + i * x*y2 + j * x2*y2 + k * x3*y2
+// 							+ l * y3 + m * x*y3 + n * x2*y3 + o * x3*y3;
+
+			// 14 adds / 15 muls
+			float2	result = x * (a + y * (e + y * (i + y * m)) + x * (b + y * (f + y * (j + y * n)) + x * (c + y * (g + y * (k + y * o))))) + y * (d + y * (h + y * l));
+
+			result.y += 1.0;
+			return saturate( result );
+		}
+
+// bmayaux (2016-09-30) After testing, this version is too poor to fit the initial texture
+// 		float2	AnalyticalBRDFIntegral_Order2( in float _VdotN, in float _SurfaceRoughness ) {
+// 			float	x = _VdotN;
+// 			float	y = _SurfaceRoughness;
+// 
+// 			const float2	a = float2(  3.23413167494725770, -3.1064482408957500 );
+// 			const float2	b = float2( -2.37327245090627200,  2.2442720252458033 );
+// 			const float2	c = float2(  1.06431921062117780, -1.5631045930597178 );
+// 			const float2	d = float2( -4.84008496658310300,  5.2866827417999930 );
+// 			const float2	e = float2(  4.17441196003678700, -4.0130727950136680 );
+// 			const float2	f = float2( -0.38184478124695787,  0.8078765587702772 );
+// 			const float2	g = float2(  1.33047313499217810, -2.9710821881549427 );
+// 			const float2	h = float2( -1.77977429364710300,  2.3561138954372183 );
+// 
+// 			// 7 adds / 16 muls
+// // 			float	x2 = x*x;
+// // 			float	x3 = x2*x;
+// // 			float	y2 = y*y;
+// // 			float	y3 = y2*y;
+// // 			float2	result = a * x + b * x2 + c * y + d * x*y + e * x2*y + f * y2 + g * x*y2 + h * x2*y2;
+// 
+// 			// 7 adds / 8 muls
+// 			float2	result = x * (a + y * (d + y * g) + x * (b + y * (e + y * h))) + y * (c + y * f);
+// 
+// 			result.y += 1.0;
+// 			return saturate( result );
+// 		}
+
+		//////////////////////////////////////////////////////////////
+		// Retrieves the values of the pre-integrated BRDF (cf. http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)
+		//	_VdotN, dot( View, Normal )
+		//	_SurfaceRoughness, the surface roughness in [0,1]
+		//
+		// Returns a scale (X) and bias (Y) value to use in the following manner:
+		//
+		//	float3	PreFilteredIrradiance = SampleIBL( Direction, Roughness );	// Or any other source of irradiance
+		//	float3	CorrectedPreFilteredIrradiance = PreFilteredIrradiance * (F0 * PreIntegratedBRDF.x + PreIntegratedBRDF.y);
+		//
+		float2	FetchPreIntegratedBRDF( in float _VdotN, in float _SurfaceRoughness ) {
+//			return $texPreIntegratedBRDF_Ward.SampleLevel( $bilinearClamp, float2( _VdotN, _SurfaceRoughness ), 0.0 ).xy;
+			return AnalyticalBRDFIntegral_Order3( _VdotN, _SurfaceRoughness );	// bmayaux (2016-09-30) We're now using the analytical version
+		}
+			
+		//////////////////////////////////////////////////////////////
+		// If you need to provide additional surface info for your BRDF you simply need to create a structure and a define like this:
+// 		#define	BRDF_SURFACE_INFO_OK	1
+// 		struct BRDFSurfaceInfo {
+// 			Some additional info
+//			void	Clear() { the clear function }
+// 		};
+
+		//////////////////////////////////////////////////////////////
+		// Any BRDF structure must provide the following methods so it's compatible with the IntergrateLighting() function found in lighting.mrpr:
+		//		void	Init( in SurfaceContext _surface );
+		//		void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light );
+		//		void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight );	// bmayaux (2015-07-30) Special for area lights
+		//		void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality );
+		//
+		struct BRDF {
+
+			WardContext			m_ward;				//	Contains all the information to compute the Ward specular model
+			float3				m_sheenColor;
+
+			//////////////////////////////////////////////////////////////
+			// BRDF Initialization
+			void	Init( in SurfaceContext _Surface ) {
+
+				// Create the ward context for our BRDF
+				CreateWardContext( m_ward, _Surface.roughness );
+
+				// Compute sheen color
+				m_sheenColor = ComputeSheenColor( _Surface.diffuseAlbedo, _Surface.sheen );	// A sheen of -1 will show desaturated color, a sheen of +1 will show fully saturated color
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Diffuse Part
+			#if $hasDiffuseLookup
+				float3	ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+					float ndotl = saturate( dot( _Light.m_wsToLight, _Surface.wsNormal ) );
+					return INVPI * $diffuseLookup.SampleLevel( $bilinearClamp, float2( ndotl, 0 ), 0 ).rgb;
+				}
+			#else
+				// =================================================================
+				// Standard case Oren-Nayar				
+				float3 ComputeDiffuseTerm( in SurfaceContext _Surface, in LightContext _Light ) {
+					return INVPI * ComputeOrenNayar( _Surface.wsNormal, _Light.m_wsToLight, _Surface.wsView, _Surface.roughness );
+				}					
+			#endif
+
+
+			//////////////////////////////////////////////////////////////
+			// Main lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the light
+			//
+			void	ComputeLighting( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in LightContext _Light ) {
+				#if $(translucency/enable) || (BRDF_SKIN && $(translucency_hq/enable)) || $isAlpha
+					bool isTranslucent = true;
+				#else
+					bool isTranslucent = false;
+				#endif
+
+				if ( _Light.m_attenuation > 0.0 && (isTranslucent || _Light.m_shadow > 0.0) ) {
+					float3	View = _Surface.wsView;
+					float3	Light = _Light.m_wsToLight;
+					float3	Normal = _Surface.wsNormal;	// Specular normal
+					float3	Half_unorm = View + Light;
+					float3	Half = normalize( Half_unorm );
+
+					float	LdotN = saturate( dot( Light, Normal ) );
+					float	VdotN = saturate( dot( View, Normal ) );
+					float	HdotN = saturate( dot( Half, Normal ) );
+
+					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+					float3	Irradiance_shadowed = _Light.m_shadow * Irradiance;
+
+					// =================================================================
+					// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
+					float3	FresnelSpecular = FresnelAccurate( _Surface.IOR, HdotN, _Surface.fresnelStrength );
+					FresnelSpecular *= _Light.m_SpecularAttn; // Apply attenuation factor from artist settings. (cf. dlaurent for more infos)
+					float3	FresnelDiffuse = 1.0 - FresnelSpecular;	// Diffuse Fresnel is always left with what has not been specularly reflected...
+
+					// ====== Diffuse lighting ======
+					float3	DiffuseColor = lerp( _Surface.diffuseAlbedo, m_sheenColor, _Surface.roughness * pow( FresnelSchlick( HdotN ), _Surface.sheenImportance ) );
+					float3	DiffuseTerm = DiffuseColor * ComputeDiffuseTerm( _Surface, _Light );	// BRDF * (L.N)
+					_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * DiffuseTerm;
+
+					// ====== Specular lighting ======
+					float	SpecularTerm = m_ward.ComputeWardTerm( Normal, Light, View ) * LdotN;	// BRDF * (L.N)
+					_Result.accumSpecular += FresnelSpecular * Irradiance_shadowed * SpecularTerm;
+
+					#if $(fuzz/enable)
+						float fuzz = pow( 1.0f - VdotN, $(fuzz/fresnel) ) * $(fuzz/intensity);
+						#if $(fuzz/hasMask)
+							fuzz *= _Surface.fuzzMask;
+						#endif
+						_Result.accumSpecular += Irradiance_shadowed * fuzz * LdotN;
+					#endif
+
+					// =================================================================
+					// Translucency using bent normal (Dice method)
+					#if $(translucency/enable)
+						float	LdotN_translucency = -dot( Light, _Surface.wsVertexNormal );
+						float	TranslucencyFactor = smoothstep( -0.2, 0.1, LdotN_translucency ) * _Surface.translucency;
+
+						float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+						float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * DiffuseColor;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+
+						_Result.accumDiffuse += INVPI * Rho_t * ComputeTranslucency( TranslucencyFactor, Irradiance_shadowed, _Surface.wsVertexNormal, Light, View );
+					#endif
+				}
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Area light lighting computation
+			//	_Result, the result structure where we accumulate lighting
+			//	_Surface, information about the surface
+			//	_Light, information about the area light
+			//	_BaseLight, standard information about the original light
+			//
+			void	ComputeLightingArea( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in AreaLightContext _Light, in LightContext _BaseLight ) {
+
+				// Standard lighting
+				COMPUTE_AREA_LIGHT_LIGHTING( _Result, _Surface, _Light );
+
+				// =================================================================
+				// Translucency using bent normal (Dice method)
+				#if $(translucency/enable)
+					float	LdotN_translucency = -dot( _Light.m_wsLight, _Surface.wsVertexNormal );
+					float	TranslucencyFactor = smoothstep( -0.2, 0.1, LdotN_translucency ) * _Surface.translucency;
+
+					float3	FresnelSpecular_translucency = FresnelAccurate( _Surface.IOR, saturate( LdotN_translucency ), _Surface.fresnelStrength );
+					float3	Rho_t = 1.0 - (1.0 - FresnelSpecular_translucency) * _Surface.diffuseAlbedo;	// This is the transmitted reflectance, the complement of the diffuse reflectance that is not specularly reflected
+
+					float3	Irradiance_shadowed = _Light.m_attenuation * _Light.m_shadow * _Light.m_color * _Light.m_irradianceDiffuse;
+					_Result.accumDiffuse += INVPI * Rho_t * ComputeTranslucency( TranslucencyFactor, Irradiance_shadowed, _Surface.wsVertexNormal, _Light.m_wsLight, _Surface.wsView );
+				#endif
+			}
+
+			//////////////////////////////////////////////////////////////
+			// Indirect/Ambient lighting computation
+			void	ComputeIndirect( inout ComputeLightingResult _Result, in SurfaceContext _Surface, in float _ssao, const uint _quality ) {
+				float AO = ComputeAmbientOcclusion( _Surface, _Surface.AO.x, _ssao );
+				_Result.accumAmbient += COMPUTE_AMBIENT_LIGHTING( _Surface, AO, _quality );
+				
+				#if !$buildingEnvironmentProbe
+					_Result.accumSpecular += AO * COMPUTE_IBL( _Surface, _quality );
+				#endif
+			}			
+		};
+		
+		#endif	// #ifndef BRDF_WARD_INCLUDED
+	}
+}

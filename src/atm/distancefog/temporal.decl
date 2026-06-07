@@ -1,0 +1,69 @@
+{
+	newstyle
+	state {
+		depthWrite	0
+ 		depthfunc	ALWAYS
+ 		cull none
+		depthEnable	0
+		blend		ONE	ZERO
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <helper>
+//		#include <downsampling/common>
+
+		float3 ReconstructWorldSpacePositionFromLinearZ( float2 _ndcPixelPos, float _linearDepth )
+		{
+			float4 wsZFarPos = mul( $inverseViewProjectionMatrix, float4( _ndcPixelPos, 0.0, 1.0 ) );  //ARKANE (2015-06-12) - depth inversion
+			wsZFarPos /=  wsZFarPos.w;
+			float3 wsRayDir = wsZFarPos.xyz - $wsCamPos;
+			float zfar = $globalViewInfos.w;
+			return $wsCamPos + wsRayDir * ( _linearDepth / zfar );
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+
+		const float weight = 0.8750; //accumulate 8 frames
+		const float2 currentTexCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float scale = 3.0;
+		float delta = 1.5;
+
+		#if $(atm/worldFog/useMotionVectors)
+			//Rebuild previous texCoords
+			float2 motionVectors = $motionVectors.SampleLevel( $pointClamp, currentTexCoords, 0.0f ).xy;
+			float2 previousTexCoords = currentTexCoords - motionVectors.xy;
+			float2 speed = smoothstep(0.0, 4.0 * $positionToViewTexture.zw, abs(motionVectors));
+			delta = dot(speed,speed);
+		#else
+			//Rebuild position
+			float depth = $(atm/distanceFog/TexDepthHalf)[(uint2)$sv_position.xy].x;
+			depth *= $globalViewInfos.w; //zFar
+//			float depth = $(downsampling/downsampledDepthBuffer)[(uint2)$sv_position.xy].x;	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+
+			float2 cpPos =  float2(currentTexCoords.x * 2.0 - 1.0, 1.0 - currentTexCoords.y * 2.0);
+			float3 wsPosition = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, depth );
+
+			//Rebuild previous position
+			float4 csPosLast = mul ( $previousViewProjectionMatrix, float4(wsPosition,1.0) );
+			float4 wsPreviousPosition = mul ( $inverseViewProjectionMatrix, csPosLast );
+			csPosLast.xyz /= csPosLast.w;
+			float2 previousTexCoords = float2( csPosLast.x * 0.5 + 0.5, 1.0 - (csPosLast.y * 0.5 + 0.5) );
+			delta = distance(wsPosition, wsPreviousPosition.xyz);
+		#endif
+
+		//Compute Weight
+		float dist = saturate( exp( -delta * scale ) ) * weight;
+		
+		//Blend result
+		float4 currentFog = $(atm/distanceFog/TexSourceImage).SampleLevel( $bilinearClamp, currentTexCoords, 0.0);
+		float4 previousFog = $(atm/distanceFog/TexDestImage).SampleLevel( $bilinearClamp, previousTexCoords, 0.0);
+		@sv_target = lerp( currentFog, previousFog, dist );
+		//@sv_target = lerp( float4(10,0,0,1), float4(0,10,0,1), step(0.5, dist) );
+	}
+}

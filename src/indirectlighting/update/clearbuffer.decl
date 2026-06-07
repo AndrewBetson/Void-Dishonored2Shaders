@@ -1,0 +1,18 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 128
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+	}
+
+	hlsl_cp_main {
+		uint	ProbeIndex = $sv_dispatchThreadID.x;
+		if ( ProbeIndex >= $(indirectLighting/update/parmsUint).x )
+			return;
+
+		@(indirectLighting/bufferProbesSH)[ProbeIndex] = ($(indirectLighting/SH3)) 0;
+	}
+}

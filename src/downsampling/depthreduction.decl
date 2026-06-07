@@ -1,0 +1,145 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		groupshared float4	gs_Samples[NUMTHREADX * NUMTHREADY];
+	}
+	hlsl_cp_main {
+		uint2	maxPos = $(downsampling/depthBufferSize) - 1U;
+		uint2	position00 = $sv_dispatchThreadID.xy << 1U;			// Pixel position
+				position00 = min( position00, maxPos );				// Clamp to avoid fetching crap
+		uint2	position11 = min( position00+1U, maxPos );			// Clamp to avoid fetching crap
+		uint2	position01 = uint2( position11.x, position00.y );
+		uint2	position10 = uint2( position00.x, position11.y );
+
+		// ======================================================================
+		// Full-res sampling of 4 linear Z values
+		
+			// Single gather
+// Can't use because we can't simply divide by buffer's size in case we have scissoring => UV's need to be rescaled
+//		linearZ = $(downsampling/depthBuffer).Gather( $pointClamp, float2( position00 ) / $(downsampling/depthBufferSize) );
+
+			// 4 individual loads
+			// Main advantage is we're using pixel positions, not UVs, so no need to scale or care about viewport/scissor size
+		float4 rawZ;
+		rawZ.x = $(downsampling/depthBuffer).Load( int3( position00, 0 ) );
+		rawZ.y = $(downsampling/depthBuffer).Load( int3( position01, 0 ) );
+		rawZ.z = $(downsampling/depthBuffer).Load( int3( position11, 0 ) );
+		rawZ.w = $(downsampling/depthBuffer).Load( int3( position10, 0 ) );
+
+		float4 linearZ;
+		linearZ.x = ComputeLinearZ( rawZ.x );
+		linearZ.y = ComputeLinearZ( rawZ.y );
+		linearZ.z = ComputeLinearZ( rawZ.z );
+		linearZ.w = ComputeLinearZ( rawZ.w );
+
+		// ======================================================================
+		// Build thread indices so each thread addresses groups of 2x2 pixels in shared memory
+		uint2	threadPos = $sv_groupThreadID.xy;			// Thread position within group
+		uint	threadIndex = NUMTHREADY * threadPos.y + threadPos.x;
+
+		uint	threadIndex00 = threadIndex << 1;
+		uint	threadIndex01 = threadIndex00 + 1;			// Right pixel
+		uint	threadIndex11 = threadIndex01 + NUMTHREADX;	// Bottom-Right pixel
+		uint	threadIndex10 = threadIndex11 - 1;			// Bottom pixel
+
+		// ======================================================================
+		// Compute mip 0 (half res of original buffer)
+		// This is the first mip for which we can build average, min and max Z values...
+		{
+			// Threads in range [{0,0},{8,8}[ will each span 4 samples in range [{0,0},{16,16}[
+			float	ZAvgMinMax00 = linearZ.x;
+			float	ZAvgMinMax01 = linearZ.y;
+			float	ZAvgMinMax11 = linearZ.z;
+			float	ZAvgMinMax10 = linearZ.w;
+
+			float4	ZAvgMinMax;
+			ZAvgMinMax.x = 0.25 * (ZAvgMinMax00 + ZAvgMinMax01 + ZAvgMinMax10 + ZAvgMinMax11);
+			ZAvgMinMax.y = min( min( min( ZAvgMinMax00, ZAvgMinMax01 ), ZAvgMinMax10 ), ZAvgMinMax11 );
+			ZAvgMinMax.z = max( max( max( ZAvgMinMax00, ZAvgMinMax01 ), ZAvgMinMax10 ), ZAvgMinMax11 );
+			ZAvgMinMax.w = 0.0;
+
+			// Store into first mip
+			uint2	targetPos = 8U * $SV_GroupID.xy + threadPos;
+			@(downsampling/downsampledDepthBufferMip0)[targetPos] = ZAvgMinMax;
+
+			// Also store in shared memory for further downsampling
+			gs_Samples[threadIndex] = ZAvgMinMax;
+		}
+
+		GroupMemoryBarrierWithGroupSync();	// We wait until all samples from the group are available
+
+		// ======================================================================
+		// Compute mip 1 (quarter res of original buffer)
+		if ( all( threadPos < 4U ) ) {
+			// Threads in range [{0,0},{4,4}[ will each span 4 samples in range [{0,0},{8,8}[
+			float4	ZAvgMinMax00 = gs_Samples[threadIndex00];
+			float4	ZAvgMinMax01 = gs_Samples[threadIndex01];
+			float4	ZAvgMinMax11 = gs_Samples[threadIndex11];
+			float4	ZAvgMinMax10 = gs_Samples[threadIndex10];
+
+			float4	ZAvgMinMax;
+			ZAvgMinMax.x = 0.25 * (ZAvgMinMax00.x + ZAvgMinMax01.x + ZAvgMinMax10.x + ZAvgMinMax11.x);
+			ZAvgMinMax.y = min( min( min( ZAvgMinMax00.y, ZAvgMinMax01.y ), ZAvgMinMax10.y ), ZAvgMinMax11.y );
+			ZAvgMinMax.z = max( max( max( ZAvgMinMax00.z, ZAvgMinMax01.z ), ZAvgMinMax10.z ), ZAvgMinMax11.z );
+			ZAvgMinMax.w = 0.0;
+
+			// Store into second mip
+			uint2	targetPos = 4U * $SV_GroupID.xy + threadPos;
+			@(downsampling/downsampledDepthBufferMip1)[targetPos] = ZAvgMinMax;
+
+			// Also store in shared memory for further downsampling
+			gs_Samples[threadIndex] = ZAvgMinMax;
+		}
+
+		GroupMemoryBarrierWithGroupSync();	// We wait until all samples from the group are available
+
+		// ======================================================================
+		// Compute mip 2 (1/8th res of original buffer)
+		if ( all( threadPos < 2U ) ) {
+			// Threads in range [{0,0},{2,2}[ will each span 4 samples in range [{0,0},{4,4}[
+			float4	ZAvgMinMax00 = gs_Samples[threadIndex00];
+			float4	ZAvgMinMax01 = gs_Samples[threadIndex01];
+			float4	ZAvgMinMax11 = gs_Samples[threadIndex11];
+			float4	ZAvgMinMax10 = gs_Samples[threadIndex10];
+
+			float4	ZAvgMinMax;
+			ZAvgMinMax.x = 0.25 * (ZAvgMinMax00.x + ZAvgMinMax01.x + ZAvgMinMax10.x + ZAvgMinMax11.x);
+			ZAvgMinMax.y = min( min( min( ZAvgMinMax00.y, ZAvgMinMax01.y ), ZAvgMinMax10.y ), ZAvgMinMax11.y );
+			ZAvgMinMax.z = max( max( max( ZAvgMinMax00.z, ZAvgMinMax01.z ), ZAvgMinMax10.z ), ZAvgMinMax11.z );
+			ZAvgMinMax.w = 0.0;
+
+			// Store into third mip
+			uint2	targetPos = 2U * $SV_GroupID.xy + threadPos;
+			@(downsampling/downsampledDepthBufferMip2)[targetPos] = ZAvgMinMax;
+
+			// Also store in shared memory for further downsampling
+			gs_Samples[threadIndex] = ZAvgMinMax;
+		}
+
+		GroupMemoryBarrierWithGroupSync();	// We wait until all samples from the group are available
+
+		// ======================================================================
+		// Compute mip 3 (1/16th res of original buffer)
+		if ( threadIndex == 0 ) {
+			// Thread 0 will each span 4 samples in range [{0,0},{2,2}[
+			float4	ZAvgMinMax00 = gs_Samples[threadIndex00];
+			float4	ZAvgMinMax01 = gs_Samples[threadIndex01];
+			float4	ZAvgMinMax11 = gs_Samples[threadIndex11];
+			float4	ZAvgMinMax10 = gs_Samples[threadIndex10];
+
+			float4	ZAvgMinMax;
+			ZAvgMinMax.x = 0.25 * (ZAvgMinMax00.x + ZAvgMinMax01.x + ZAvgMinMax10.x + ZAvgMinMax11.x);
+			ZAvgMinMax.y = min( min( min( ZAvgMinMax00.y, ZAvgMinMax01.y ), ZAvgMinMax10.y ), ZAvgMinMax11.y );
+			ZAvgMinMax.z = max( max( max( ZAvgMinMax00.z, ZAvgMinMax01.z ), ZAvgMinMax10.z ), ZAvgMinMax11.z );
+			ZAvgMinMax.w = 0.0;
+
+			// Store into fourth mip
+			@(downsampling/downsampledDepthBufferMip3)[$SV_GroupID.xy] = ZAvgMinMax;
+		}
+	}
+}

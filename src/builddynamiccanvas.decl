@@ -1,0 +1,179 @@
+{
+	newstyle
+	state {
+		blendOp		ADD
+		blend		ONE	ZERO
+		depthfunc	ALWAYS
+		alphaWrite	0
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+
+	hlsl_prefix {
+		float bilinearNoisyValue( in float2 p ) {
+			return $noiseMap.SampleLevel( $bilinearSampler, p, 0.0 ).x;
+			//return $noiseMap.SampleLevel( $pointSampler, p, 0.0 ).x;
+			//return $noiseMap.SampleLevel( $pointWrap, p, 0.0 ).x;
+		}
+/*
+		float2 warpedTextureCoordinate( float2 texcoord, float sphereRadius, float alpha, float blendFactor )	//assuming center texcoord in the center of the screen (-1 to 1)
+		{
+			const float ratio = (1.0/$positionToViewTexture.z) * $positionToViewTexture.w;
+
+			// Let's call M the point on the screen.
+			// Compensate for the screen aspect ratio.
+			const float3 M = float3(ratio*texcoord.x, texcoord.y, 0.0);
+
+			// Center of the sphere relatively to the texture plane
+			// on which the ball is rolling.
+			const float3 sphereCenter = float3(0, 0, sphereRadius);
+
+			// Compute the vector from the sphere center to M.
+			// Remember: I is the short name of 'sphereCenter'.
+			const float3 IM = M - sphereCenter;
+
+			// Let's call M' the projection of M on the sphere. M' is noted Mp.
+			// IM' = (IM * sphereRadius) / ||IM||
+			const float3 IMp = (IM*sphereRadius)/length(IM);
+
+
+			// Vector pointing toward the north pole of the sphere.
+			const float3 upVector = float3(0,cos(alpha),-sin(alpha));
+
+			// Let's call "M bar" the projection of M' on the up vector.
+			// IMbar = (IM'.upVector) * upVector
+			const float3 IMbar = (IMp*upVector) * upVector;
+
+			// Compute the vector from the sphere center to the screen center (0,0,0).
+			// Remember: O is the short name of 'screenCenter'.
+			const float3 IO = float3(0.0,0.0,0.0) - sphereCenter;
+
+			// Let's call "O bar" the projection of O on the up vector.
+			// IMbar = (IO.upVector) * upVector
+			const float3 IObar = (IO*upVector) * upVector;
+
+			// Compute (phi - alpha). See Appendix B in the paper.
+			// sin(phi) = IMbar.upVector / sphereRadius
+			const float phiMinusAlpha = asin( ( dot(IMbar, upVector) ) / sphereRadius ) - alpha;
+
+			// Compute o. See Appendix B in the paper.
+			const float o = phiMinusAlpha * sphereRadius;
+
+			// Compute the vector from Mbar to M'.
+			float3 MbarMp = IMp-IMbar;
+
+			// Normalize MbarM'. Avoid division by 0.
+			MbarMp = SafeNormalize( MbarMp );
+
+
+			// Compute the vector from Obar to O.
+			// Remember: O is the short name of 'screenCenter'.
+			float3 ObarO = IO-IObar;
+
+			// Normalize ObarO. Avoid division by 0.
+			ObarO = SafeNormalize( ObarO );
+
+			// Compute theta (Appendix B) through sin and cos.
+			// cos(theta) = MbarM'.ObarO
+			const float cosTheta = dot(MbarMp, ObarO);
+
+			// sin(theta) = (MbarM' x ObarO) . upVector
+			const float sinTheta = dot( cross(MbarMp, ObarO), upVector);
+
+			// Classical atan2 from sin and cos.
+			const float theta = atan2(sinTheta,cosTheta);
+
+
+			// Compute the point C (Appendix B).
+			// C.x = C.z = 0
+			// tan(alpha) = sphereRadius / C.y
+			const float3 C = float3(0,(sphereRadius/tan(alpha)),0);
+
+			// Compute d - o (Appendix B).
+			const float dMinusO =  C.y - o;
+
+			// Compute sigma (Appendix B).
+			// Considering the screen center:
+			// C.y * sigma = sphereRadius * cos(alpha)* theta
+			const float sigma = theta * sphereRadius * cos(alpha)/C.y;
+
+			// Compute u and v (Appendix B).
+			// Because of the blending near the poles, we name them "warped".
+			const float warpedU = dMinusO * sin(sigma);
+			const float warpedV = o + dMinusO * (1 - cos(sigma));
+
+			// Send texture coordinates to OpenGL (linear blending).
+			return float2(blendFactor*M.x + (1.0-blendFactor)*warpedU,   blendFactor*M.y + (1.0-blendFactor)*warpedV);
+		}
+
+*/
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoords = ($vertex_position.xy + $(subpixelOffset).xy ).xyxy  ;
+	}
+	
+	hlsl_fp_main {
+		#if ( !$isShadow && !$isZPrePass )
+
+			const float sphereRadius = $(dyn_can/uvWarpParms).x;
+			const float alpha = $(dyn_can/uvWarpParms).y;
+			const float blendFactor = $(dyn_can/uvWarpParms).z;
+
+			const float2 ratio = float2( (1.0/ ( $positionToViewTexture.z * $resolutionScale.x ) ) * ( $positionToViewTexture.w * $resolutionScale.y ), 1.0 );
+
+			float2 uv = $texcoords.xy * ratio;
+		
+			float2 transformedUV;
+	        transformedUV.x = dot( float4(uv.xy,0,1), $sMatrix );
+	        transformedUV.y = dot( float4(uv.xy,0,1), $tMatrix );
+			uv = transformedUV;
+
+			float value = 0.0;
+			float2 octUV = 0.0;
+
+			octUV = uv + $(dyn_can/octave0).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave0).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave1).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave1).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave2).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave2).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave3).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave3).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave4).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave4).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave5).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave5).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave6).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave6).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave7).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave7).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave8).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave8).z;
+
+			uv*=2.0;
+			octUV = uv + $(dyn_can/octave9).xy;
+			value +=  bilinearNoisyValue( octUV ) * $(dyn_can/octave9).z;
+
+			@sv_target = value;
+		#endif
+	}	
+}

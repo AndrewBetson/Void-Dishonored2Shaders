@@ -1,0 +1,104 @@
+{
+	newstyle
+
+	parms {
+
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <dof>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@legacy_texcoord.xy = $vertex_texcoord; //texCoords for 1/4 resolution
+		@legacy_texcoord.zw = $vertex_texcoord; //texCoords for 1/8 resolution
+	}
+
+	hlsl_fp_main {
+		float4	result = 0.0;
+		float2 coords_high = $legacy_texcoord.xy;
+		float2 coords_low  = $legacy_texcoord.zw;
+
+		#if $(PostFX/DOF/DOF_TYPE) == 0 //ALPHA
+		{
+
+			const float compressedValues = $(PostFX/DOF/refractionMap).SampleLevel( $bilinearClamp, coords_high, 0.0 ).y;
+			float2 rawBlurSize = DecompressGlassDistortion(compressedValues);
+			float blurSize = rawBlurSize.y;
+			float useBlur = (blurSize > 1.0) ? 1.0 : 0.0;
+
+			if( useBlur ) {
+				float sina, cosa;
+				float angle = rawBlurSize.x;
+				sincos( angle, sina, cosa );
+				float2 offsets = float2( cosa, sina ) * GetRefractionOffset( ) * $positionToViewTexture.zw;
+				coords_low += offsets;
+			}
+
+			const float3 centerColor = 0.0;
+			float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
+			
+			float2 cocRadius = GetCOCRadius(centerDepth.g);
+			if( cocRadius.x >  (1.0/255.0) ) 
+			{
+				result = Dof_Alpha( coords_low, $(PostFX/DOF/targetSize).zw, centerColor, centerDepth, useBlur, blurSize );
+			}
+			else
+			{
+				result = 0.0;
+			}
+		}
+		#elif $(PostFX/DOF/DOF_TYPE) == 1 //NEAR
+		{
+			const float3 centerColor = 0.0;
+			const float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
+
+			float2 cocRadius = GetCOCRadius(centerDepth.r);
+			if( cocRadius.x >  (1.0/255.0) ) 
+			{
+				result = Dof_Near( coords_low, $(PostFX/DOF/targetSize).xy, centerColor, centerDepth.r );
+			}
+			else
+			{
+				result = 0.0;
+			}
+		}
+		#elif $(PostFX/DOF/DOF_TYPE) == 2 //FAR
+		{
+			float3 centerColor = $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, coords_high, 0.0).rgb;
+			centerColor.xyz = centerColor.xyz;
+			const float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
+			
+			float2 cocRadius = GetCOCRadius(centerDepth.g);
+			if( cocRadius.x >  (1.0/255.0) ) 
+			{
+				result = Dof_Far( coords_high, coords_low, $(PostFX/DOF/targetSize), centerColor, centerDepth.g );
+			}
+			else
+			{
+				result = float4( centerColor, 0.0 );
+			}
+		}
+		#else
+		{
+			result = $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, coords_high, 0.0);
+			result.xyz = result.xyz;
+		}
+		#endif
+
+		@sv_target = result;
+		
+		#if $(PostFX/DOF/DOF_TYPE) == 0 || $(PostFX/DOF/DOF_TYPE) == 1 //ALPHA || NEAR
+			@sv_target1 = result.wwww;
+		#endif
+	}
+}

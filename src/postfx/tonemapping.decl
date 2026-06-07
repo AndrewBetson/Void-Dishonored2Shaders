@@ -1,0 +1,309 @@
+{
+	newstyle
+	state {
+		blend		ONE ZERO
+		depthfunc	ALWAYS
+		depthEnable	0
+		depthWrite	0
+		cull none
+	}
+	
+	hlsl_prefix {
+		#include <helper>
+		#include <colorimetry>
+		#include <PostFX/Luminance/common>
+		#include <PostFX/ToneMapping/common>
+
+		#if $(PostFX/ToneMapping/debug)
+			#include <indirectLighting/common>
+			#include <PostFX/Debug/LuminanceHistogram>
+			#include <PostFX/Debug/ToneMappingCurve>
+			#include <PostFX/Debug/SkyTables>
+			#include <PostFX/Debug/EmbedColorCube>
+			#include <PostFX/Debug/WardBRDFAlbedo>
+			#include <PostFX/Debug/EnvParm>
+			#include <PostFX/Debug/DrawDynamicIBLCubeMaps>
+			#include <PostFX/Debug/DrawSHProbes>
+			#include <PostFX/Debug/DisplayImage>
+			#include <PostFX/Debug/DrawAreaLights>
+		#endif
+
+		#if $(PostFX/ToneMapping/debug)
+			static const bool	EMBED_COLOR_CUBE = ($(PostFX/ToneMapping/debugFlags) & (16|32)) != 0;	// In debug mode, this will be evaluated at runtime and code will be slower
+		#else
+			static const bool	EMBED_COLOR_CUBE = false;												// In normal mode, the compiler will easily strip the test
+		#endif
+
+		// ===========================================================
+		float2 Rotate2dScaled( float2 p, float angle ) {
+			float sinAngle, cosAngle;
+			sincos(angle,sinAngle,cosAngle);
+			float2x2 rotMat = { cosAngle, -sinAngle  * 0.5, sinAngle  * 0.5, cosAngle };
+			return mul(rotMat, p);
+		}		
+		
+		float LensStreak( float2 UV ) {
+			float2 uv = UV - 0.5;			
+			float camAxis = ( dot( $viewMatrix[0].xyz, float3(0,0,1) ) + dot( $viewMatrix[2].xyz, float3(0,1,0) ) );
+			uv = Rotate2dScaled(uv, camAxis);
+			
+			float squaredRadius = dot( uv, uv );
+			float angle = PI + atan2(uv.x, uv.y);	
+	   
+			const float	SLICES = 4096.0;
+			float sliceIndex = SLICES * angle / TWOPI;
+			float sliceRounded = floor( sliceIndex );
+			
+			//Interpolate to reduce aliasing
+			float rnd0 = rand( sliceRounded );
+			float rnd1 = rand( sliceRounded + 1.0);
+			float t = sliceIndex - sliceRounded;
+			float rnd = lerp( rnd0, rnd1, t );
+			
+			float r0 = $(PostFX/LensFlares/StreakRadius) + rnd * $(PostFX/LensFlares/StreakOffset);
+			float dr = abs( squaredRadius - r0*r0 );
+			float b = smoothstep( $(PostFX/LensFlares/StreakWidth), 0.0, dr );			
+			
+			return b * $(PostFX/LensFlares/StreakOpacity);
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+#if !$isShadow && !$isZPrePass && !$isOutline && !$isMasking && !$(tool/unlit)
+		@texcoord = $vertex_texcoord;
+		
+		#if $(PostFX/AutoExposure/enable)
+			// Histogram Auto-exposure
+			$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();
+			@(PostFX/ToneMapping/exposure) = Adaptation.EngineLuminanceFactor * exp2( -$(PostFX/Luminance/customEVBias).x );
+		#else
+			@(PostFX/ToneMapping/exposure) = ComputeExposureFactor();	// Only use the EV settings provided by the env (default is 1)
+		#endif
+#endif // !$isShadow && !$isZPrePass && !$isOutline && !$isMasking && !$(tool/unlit)
+	}
+
+	hlsl_fp_main {
+
+#if !$isShadow && !$isZPrePass && !$isOutline && !$isMasking && !$(tool/unlit)
+
+		float2 UV = $texcoord.xy;
+		float2 scaledUV = UV * $resolutionScale.xy;
+
+		float4 OriginalColor = $viewColorMap[ uint2($sv_position.xy) ];
+
+		// range expand luminance from r11g11b10 to linear
+		float3 color = RangeExpandColorFromR11G11B10( OriginalColor.xyz );
+
+		// ===========================================================
+		// Add the bloom
+		if ( !EMBED_COLOR_CUBE ) {
+			if( $(PostFX/LensFlares/enabled) || $(PostFX/Bloom/enabled) ) {
+			
+				float3 lensDirt;
+				if ( $(PostFX/LensDirt/UseDefault).x > 0 ) {
+					lensDirt = $(PostFX/Bloom/lensDirt_From).SampleLevel( $linearClamp, UV+$(subpixelOffset).xy, 0.0 ).xyz;
+				} else {
+					float3 lensDirtFrom = $(PostFX/Bloom/lensDirt_From).SampleLevel( $linearClamp, UV+$(subpixelOffset).xy, 0.0 ).xyz;
+					float3 lensDirtTo = $(PostFX/Bloom/lensDirt_To).SampleLevel( $linearClamp, UV+$(subpixelOffset).xy, 0.0 ).xyz;
+					lensDirt = lerp( lensDirtFrom, lensDirtTo, $(PostFX/Bloom/lensDirt_BlendWeight).x );
+				}
+				
+				//Bloom
+				float3 bloom = 0.0;
+				if ( $(env/bloom/veil_strength) > 0.0 )	{ // This line to prevent adding it entirely, allows to remove the black square that occur when blurring NaNs & infinites!
+					bloom =	$(env/bloom/veil_strength) * RangeExpandColorFromR11G11B10( $(PostFX/Bloom/texBloom).SampleLevel( $linearClamp, scaledUV, 0.0 ).xyz );
+					color += $(PostFX/Bloom/lensDirt_strength) * lensDirt * bloom + bloom;
+				}
+				 
+				//Lens Flares
+				lensDirt += LensStreak( UV );
+				scaledUV = saturate( scaledUV - ($positionToViewTexture.zw*(1.0/$resolutionScale.xy)) );
+				float3 lensflares = RangeExpandColorFromR11G11B10( $(PostFX/LensFlares/texLensFlares).SampleLevel( $linearClamp, scaledUV, 0.0 ).xyz );
+				lensflares = lensflares * (0.2 + 0.8 * lensDirt);	
+				color += lensflares;				
+			}
+		}
+
+		// When debugging, it's often that we output a vector that can have negative components so we need to clamp these to avoid funky values!
+		color = max( 0.0, color );
+
+		OriginalColor.xyz = color;
+
+
+		// ===========================================================
+		// Apply exposure correction & tone mapping
+		color *=  $(PostFX/ToneMapping/exposure);
+
+		#if $(PostFX/ToneMapping/enable)
+			color = ToneMap( color );	// Apply tone mapping
+		#endif
+
+
+		// ===========================================================
+		// Color grading
+		#if $(PostFX/AutoExposure/enable)
+			// Apply the color cube
+			color = $(toneMapping/finalColorCube).SampleLevel( $linearClamp, ((color * (COLOR_CUBE_SIZE-1.0) + 0.5) * (1.0 / COLOR_CUBE_SIZE)), 0.0 ).xyz;
+		#endif
+
+
+		// ===========================================================
+		// Adrenaline
+		#if $(PostFX/ToneMapping/Adrenaline)
+			float resolutionFactor = max($positionToViewTexture.z, $positionToViewTexture.w);
+			float pixelFactor = 450.0f * resolutionFactor;	//used for value defined in pixels for an half vertical resolution of 450 (vertical resolution beeing the less)
+			float2 center = 0.5f / $positionToViewTexture.zw;
+
+			const float adrenalineNoise_DeadZone	= 0.0f / pixelFactor;	// means 150 pixels for a vertical resolution of 900
+			const float adrenalineNoise_FullZone	= 600.0f / pixelFactor;	// means 400 pixels for a vertical resolution of 900
+
+			float distToCenter = length($sv_position.xy - center);
+			float noiseIntensity = lerp( 0.25, 1.0, smoothstep( adrenalineNoise_DeadZone, adrenalineNoise_FullZone, distToCenter ) );
+			
+			float rawNoise = frac(sin(dot(UV + frac($localTime.x), float2(12.9898, 78.233)))* 43758.5453);
+			
+			float3 refColor = float3(0.549, 0.274, 0.047);
+			float3 noise = lerp( 0.5, saturate(refColor+rawNoise), noiseIntensity);
+			
+			color = ( dot( color, LUMINANCE ) <= 0.5f )?2.0*color*noise:1.0-2.0*(1.0-color)*(1.0-noise);
+		#endif
+
+		float gamma = $(env/tonemapping/gamma_brightness).x;
+		float brightness = $(env/tonemapping/gamma_brightness).y;
+		color = pow( saturate(color * brightness), gamma );
+		
+		// ===========================================================
+		// DEBUG
+		#if $(PostFX/ToneMapping/debug)
+
+			// Debug luminance histogram
+			if ( $(PostFX/ToneMapping/debugFlags) & 1 )
+				DEBUG_DisplayLuminanceHistogram( UV, color, OriginalColor.xyz, $(PostFX/ToneMapping/debugParms).x );
+
+			// Debug sky tables
+			if ( $(PostFX/ToneMapping/debugFlags) & 2 )
+				DEBUG_DisplaySkyTables( UV, color );
+
+			// Debug env parm
+			if ( $(PostFX/ToneMapping/debugFlags) & 4 )
+				DEBUG_EnvParm( UV, color );
+
+			// Debug IBL cube maps array
+			if ( $(PostFX/ToneMapping/debugFlags) & 8 )
+				DEBUG_DisplayDynamicIBLCubeMaps( UV, color, uint( $(PostFX/ToneMapping/debugParms).y ), $(PostFX/ToneMapping/exposure) );
+
+			// Debug SH Probes array
+			if ( $(PostFX/ToneMapping/debugFlags) & 16 )
+				DEBUG_DisplaySHProbes( UV, color, $(PostFX/ToneMapping/exposure) );
+
+			// Embed the color cube as 2 strips of 16 slices of size 32x32
+			if ( $(PostFX/ToneMapping/debugFlags) & (32|64) )
+				DEBUG_EmbedColorCube( $viewColorMap, uint2( floor( $sv_position.xy ) ), color, $(PostFX/ToneMapping/debugFlags) & 32 );
+
+			// Debug image
+			if ( $(PostFX/ToneMapping/debugFlags) & 128 )
+				DEBUG_DisplayDebugImage( UV, color );
+
+			// Debug area lights
+			if ( $(PostFX/ToneMapping/debugFlags) & 256 )
+				DEBUG_DisplayAreaLightTextures( UV, color );
+
+			// Debug tone mapping curve
+			if ( $(PostFX/ToneMapping/debugFlags) & 512 )
+				DEBUG_DisplayToneMappingCurve( UV, color, OriginalColor.xyz, $(PostFX/ToneMapping/exposure), $(PostFX/ToneMapping/debugParms).x );
+
+// This code is commented because it's too long to compile each time...
+//			// Ward BRDF albedo display
+// 			if ( $(PostFX/ToneMapping/debugFlags) & 1024 )
+// 	 			DEBUG_DisplayWardBRDFAlbedo( UV, color );
+
+		#endif
+
+
+// MANUAL DEBUG BORDEL
+// if ( $alwaysOne ) {
+// 	float	compressedValues = $(PostFX/DOF/refractionMap).SampleLevel( $pointClamp, UV, 0.0 ).y;
+// 
+// 	int		iExponent = floor( log2( compressedValues ) );
+// 	float	blurRadius = DOF_REFRACTION_MAX_BLUR_RADIUS * (16.0 + iExponent) / 31.0;
+// 
+// 	float	mantissa = (compressedValues * exp2( -iExponent ));
+// 	int		iAngleLength = 1024.0 * mantissa;
+// 	float	angle = TWOPI * (iAngleLength >> 4) - PI;
+// 	float	vectorLength = DOF_REFRACTION_MAX_DISTORTION * (iAngleLength & 0xF) / 15.0;
+// 
+// 	@sv_target = float4( 2.0 * INVPI * angle.xxx, 1.0 );
+// 	return;
+// }
+
+/*
+// DEBUG BLOOM & DOWNSAMPLING
+// if ( $alwaysOne )
+// {
+// #if $(PostFX/ToneMapping/type) != 0
+// 	color = $(PostFX/ToneMapping/exposure) * $(PostFX/Luminance/texDownsampledHDR).SampleLevel( $linearClamp, UV, 4.0 ).xyz;
+// //	color.xy = UV;
+// #else
+// 	color = $(PostFX/Luminance/texDownsampledHDR).SampleLevel( $linearClamp, UV, 0.0 ).xyz;
+// #endif
+// 	color = 1.01 * $(PostFX/Bloom/texBloom).SampleLevel( $linearClamp, UV, 0.0 ).xyz;
+// }
+
+if ( !$alwaysOne )
+{
+	float3	UVW = float3( UV, 0.0 + 0.5 * (1.0 + sin( $time.x ) ) );
+
+//color = $(atm/sky/precompute/texTransmittance).SampleLevel( $linearClamp, UV, 0.0 ).xyz; 
+// color = $(atm/sky/precompute/texIrradianceDelta).SampleLevel( $linearClamp, UV, 0.0 ).xyz; 
+//color = 10.0 * $(atm/sky/precompute/texScatteringDelta_Rayleigh).SampleLevel( $linearClamp, UVW, 0.0 ).xyz; 
+// color = 2.0 * $(atm/sky/precompute/texScatteringDelta_Mie).SampleLevel( $linearClamp, UVW, 0.0 ).xyz; 
+// color = $(atm/sky/precompute/texIrradiance).SampleLevel( $linearClamp, UV, 0.0 ).xyz; 
+//color = 1000.0 * $(atm/sky/precompute/texScatteringDelta).SampleLevel( $linearClamp, UVW, 0.0 );
+
+// Directional tables (only irradiance is available)
+//color = $(atm/sky/texTransmittance).SampleLevel( $linearClamp, UVW, 0.0 ).xyz;
+//color = 4.0 * $(atm/sky/texIrradiance).SampleLevel( $linearClamp, UVW, 0.0 ).xyz;
+//color = 1.0 * $(atm/sky/texScattering).SampleLevel( $linearClamp, UVW, 0.0 ).xyz;
+
+// Final useable tables
+color = $(atm/sky/precompute/texTransmittance).SampleLevel( $linearClamp, UV, 0.0 ).xyz; 
+color = 10.0 * $(atm/sky/texIrradiance).SampleLevel( $linearClamp, UVW, 0.0 ).xyz;
+//color = $(atm/sky/precompute/texScattering).SampleLevel( $linearClamp, UVW, 0.0 ).xyz; 
+
+// Env map
+//color = $(atm/sky/texEnvMap).SampleLevel( $linearClamp, UVW.xy, 0.0 ).xyz;
+
+
+// color += 0.1 * UVW;
+
+
+// // uint3	Texel = UVW * float3( 256, 128, 32 );
+// // 
+// // // Retrieve the 3 cosines for the current slice
+// // float	AltitudeKm, CosThetaView, CosThetaSun, CosGamma;
+// // GetSliceData( Texel, AltitudeKm, CosThetaView, CosThetaSun, CosGamma );
+// // 
+// // color = abs(CosThetaSun);
+// // color = CosThetaView * (CosThetaView > 0.0 ? float3( 1, 0, 0 ) : float3( 0, 0, -1 ));
+// // color = 0.5 + 0.5 * CosGamma;
+// // color = AltitudeKm / 60.0;
+// 
+// 
+// 
+// 
+// if ( UVW.x > 0.999 )
+// 	color = float3( UVW.z, 0, 0 );
+
+}
+
+*/
+
+		// ===========================================================		
+		@sv_target.xyz = color;
+		@sv_target.w = 1;
+
+#endif // !$isShadow && !$isZPrePass && !$isOutline && !$isMasking && !$(tool/unlit)
+	}
+}

@@ -1,0 +1,114 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		#include <ward>
+		
+		// Displays the BRDF albedo in 2 small screen insets showing how the albedo varies with roughness
+		// The albedo is computed by integrating the BRDF over an entire hemisphere of view directions for a 
+		//	single light direction that varies with U in [0,1] corresponding to Theta_Light in [0,PI/2].
+		//
+		// The goal here is to demonstrate the albedo is correctly bounded (i.e. never > 1).
+		// The especially important part is when the light is at grazing angles (i.e. U -> 1)
+		//
+		// Just call this function in the finalizer post-process, providing the screen UVs and the final color
+		//
+		void	DEBUG_DisplayWardBRDFAlbedo( float2 _UV, inout float3 _Color )
+		{
+			float	Roughness = lerp( 0.01, 1.0, 0.5 * (1.0 + sin( $time.x )) );	// Roughness is varying with time here...
+
+			if ( _UV.x < 0.2 && _UV.y > 0.8 )
+			{	// This version integrates the "true" BRDF
+				// The formula comes from eq. (15) from http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.169.9908&rep=rep1&type=pdf
+				//
+				_UV.x /= 0.2;
+				_UV.y = (_UV.y - 0.8) / 0.2;
+
+				float	Theta = 0.5 * _UV.x * PI;
+				float3	ToLight = float3( sin( Theta ), 0, cos( Theta ) );
+				float3	ToView = float3( -sin( Theta ), 0, cos( Theta ) );
+
+				float	Albedo = 0.0;
+				const int	THETA_COUNT = 64; // * $alwaysOne; /*warning X4008: floating point division by zero*/
+				const float	dTheta = HALFPI / THETA_COUNT;
+				const float	dPhi = PI / THETA_COUNT;
+				for ( int i=0; i < THETA_COUNT; i++ )
+				{
+					Theta = HALFPI * (0.5 + i) / THETA_COUNT;
+					for ( int j=0; j < THETA_COUNT; j++ )
+					{
+						float	Phi = PI * j / THETA_COUNT;
+
+						ToView = float3( sin( Theta ) * cos( Phi ), sin( Theta ) * sin( Phi ), cos( Theta ) );
+
+						float3	Half = normalize( ToLight + ToView );
+
+						// "True" and expensive evaluation of the Ward BRDF
+						float	alpha = Roughness;
+
+						float	CosDelta = Half.z;	// dot( Half, _wsNormal );
+						float	delta = safeAcos( CosDelta );
+						float	CosThetaL = ToLight.z;
+						float	SinThetaL = sqrt( 1.0 - CosThetaL*CosThetaL );
+						float	PhiL = atan2( ToLight.y, ToLight.x );
+						float	CosThetaV = ToView.z;
+						float	SinThetaV = sqrt( 1.0 - CosThetaV*CosThetaV );
+						float	PhiV = atan2( ToView.y, ToView.x );
+
+						float	BRDF = 1.0 / square(alpha) * exp( -square( tan( delta ) / alpha ) ) * 2.0 * (1.0 + CosThetaL*CosThetaV + SinThetaL*SinThetaV*cos( PhiV - PhiL )) / pow4( CosThetaL + CosThetaV );
+
+						Albedo += BRDF * cos( Theta ) * sin( Theta ) * dTheta * dPhi;
+					}
+				}
+
+				Albedo *= 2.0;		// Since we integrate on half a hemisphere...
+				Albedo *= INVPI;	// Since we forgot that in the main loop
+
+				_Color = 1.0 - _UV.y < 0.8 * Albedo ? 1 : 0;
+
+				if ( _UV.x < 0.01 )
+					_Color = Roughness;
+			}
+			else if ( _UV.x > 0.25 && _UV.x < 0.45 && _UV.y > 0.8 )
+			{	// And this version uses our implementation of the Ward BRDF
+				// The formula comes from eq. (23) of the same paper.
+				// Both renderings should be equal and albedo should NEVER be > 1!
+				//
+				_UV.x = (_UV.x - 0.25) / 0.2;
+				_UV.y = (_UV.y - 0.8) / 0.2;
+
+				WardContext	ctx;
+				CreateWardContext( ctx, Roughness );
+
+				float	Theta = 0.5 * _UV.x * PI;
+				float3	ToLight = float3( sin( Theta ), 0, cos( Theta ) );
+				float3	ToView = float3( -sin( Theta ), 0, cos( Theta ) );
+
+				float	Albedo = 0.0;
+				const int	THETA_COUNT = 64; // * $alwaysOne;	// Allows to prevent unrolling and lenghty shader compilation!
+				const float	dTheta = HALFPI / THETA_COUNT;
+				const float	dPhi = PI / THETA_COUNT;
+				for ( int i=0; i < THETA_COUNT; i++ )
+				{
+					Theta = HALFPI * (0.5 + i) / THETA_COUNT;
+					for ( int j=0; j < THETA_COUNT; j++ )
+					{
+						float	Phi = PI * j / THETA_COUNT;
+
+						ToView = float3( sin( Theta ) * cos( Phi ), sin( Theta ) * sin( Phi ), cos( Theta ) );
+ 						Albedo += ctx.ComputeWardTerm( float3( 0, 0, 1 ), ToLight, ToView ) * cos( Theta ) * sin( Theta ) * dTheta * dPhi;
+					}
+				}
+
+				Albedo *= 2.0;		// Since we integrate on half a hemisphere...
+				Albedo *= INVPI;	// Since we forgot that in the main loop
+
+				_Color = (1.0 - _UV.y < 0.8 * Albedo ? 1 : 0) * float3( 1, 0, 0 );
+
+				if ( _UV.x < 0.01 )
+					_Color = Roughness;
+			}
+		}
+	}
+}

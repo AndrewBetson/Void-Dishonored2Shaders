@@ -1,0 +1,41 @@
+{
+	newstyle
+	state {
+		depthWrite	0
+		depthfunc	ALWAYS
+		depthEnable	0
+		cull		NONE
+		blend		ONE		ZERO
+	}
+
+	hlsl_prefix {
+		float BB_Blur( float2 texCoords,
+						 float blurRadius,
+						 float2 direction,
+						 float4 aInvResolution ) {
+			float color = 0.0;
+			for (float radius = -blurRadius; radius <= blurRadius; ++radius) {
+				float2 uv = texCoords.xy + direction * (radius*aInvResolution.x);
+				color += $(atm/distanceFog/TexSourceImage).SampleLevel( $linearMirror, uv, 0.0 ).r;
+			}
+			return saturate(color);
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		float color;
+		float2	texCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+		float g_BlurRadius  = $(atm/distanceFog/ratio).x;
+		float4 g_InvResolution = $(atm/distanceFog/offset);
+		#if $(ATM/DISTANCEFOG/BILATERAL/HORIZONTAL) == 1
+			color = BB_Blur( texCoords, g_BlurRadius, float2(1.0, 0.0), g_InvResolution );
+		#else
+			color = BB_Blur( texCoords, g_BlurRadius, float2(0.0, 1.0), g_InvResolution );
+		#endif
+		@sv_target = color;
+	}
+}

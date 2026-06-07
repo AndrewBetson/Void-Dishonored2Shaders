@@ -1,0 +1,118 @@
+{
+	newstyle
+
+	parms {
+
+	}
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <dof>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+
+		float2 texCoords = $texcoord;
+
+		//gather renderParms
+		const float4 aDofRangeFar = float4(	$(PostFX/DOF/FarParams).x,		//far fuzzy
+											$(PostFX/DOF/FarParams).y,		//far sharp
+											$(PostFX/DOF/FarParams).z,		//fuzziness bias
+											$(POSTFX/DOF/CommonParams).x);	//far DOF
+
+		const float2 center = $(PostFX/DOF/center).xy;
+		bool dontFetch = false;
+		#if $(PostFX/DOF/USE_DISTORTION)
+		{
+			const float k     = $(PostFX/DOF/distortionParams).x;
+			const float kcube = $(PostFX/DOF/distortionParams).y;
+			texCoords = cubicLensDistortion(texCoords / $resolutionScale.xy, center, k, kcube);
+			dontFetch = any(texCoords<0.0) || any(texCoords>1.0);
+			texCoords = saturate(texCoords);
+			texCoords *= $resolutionScale.xy;
+		}
+		#endif
+
+		float3 texColor = dontFetch ? 0.0 : $(PostFX/DOF/frameBufferMap).SampleLevel($pointClamp, texCoords, 0.0).rgb;
+
+		// Compute Dof Mask and upscale
+		float depth = $(PostFX/DOF/depthMap).SampleLevel( $pointClamp, texCoords, 0.0 ).x;
+
+		float dofMaskSharp = ComputeFuzziness(depth, aDofRangeFar);
+
+		//add Sharpen
+		#if $(PostFX/DOF/USE_SHARPENING)
+		{
+			//Sharpen with extrapolation
+			const float sharpen = $(PostFX/DOF/distortionParams).z;
+		
+		#if 0 //ftournade version (unsharp masking)
+			float3 lowPass = dontFetch ? 0.0 : $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, texCoords, 0.0).rgb;
+			float3 highPass = texColor - lowPass;
+			texColor = texColor + highPass * sharpen;
+			texColor = max( texColor, 0.0f );
+		#else //ltartinville version
+			float3 texColorDiv2 = dontFetch ? 0.0 : $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, texCoords, 0.0).rgb;
+			float3 edge = step(texColorDiv2, texColor) - step($(atm/worldFog/ScatteringColor), texColor);
+			texColor = lerp( texColorDiv2, texColor, 1.0 + sharpen * edge );
+		#endif
+		
+			/*
+			// Funny Toon shading
+			const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance
+			float gEdge = dot(RGB_TO_GREYSCALE,edge);
+			float dist = distance(texColorDiv2,texColor);
+			texColor = lerp( gEdge*dist, texColorDiv2, saturate(gEdge));
+			*/
+		}
+		#endif
+
+		//blend DOF near
+		#if $(PostFX/DOF/USE_DOF_NEAR)
+		if( !dontFetch )
+		{
+			float3 dofNear = $(PostFX/DOF/dofNearMap).SampleLevel($bilinearClamp, texCoords, 0.0);
+			float dofNearAlpha = $(PostFX/DOF/dofNearAlphaMap).SampleLevel($bilinearClamp, texCoords, 0.0);
+			texColor = lerp( texColor, dofNear, pow( dofNearAlpha, 4.0 ) );
+		}
+		#endif
+
+		//blend DOF far
+		{
+			float3 dofColor = dontFetch ? 0.0 : $(PostFX/DOF/dofMap).SampleLevel( $bilinearClamp, texCoords, 0.0).rgb;
+			dofMaskSharp = LinearStep(0,0.5,dofMaskSharp);
+			texColor = lerp( texColor, dofColor.rgb, dofMaskSharp );
+		}
+
+		//add noise
+		#if $(PostFX/DOF/USE_NOISE)
+		{
+			const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance
+			float grey = saturate(dot( texColor, RGB_TO_GREYSCALE ));
+			texColor = noise_lum(texColor, texCoords / $resolutionScale, $(PostFX/DOF/noiseParams), grey);
+		}
+		#endif
+
+		//add vignetting
+		#if $(PostFX/DOF/USE_VIGNETTING)
+		{
+			texColor *= vignette($texcoord / $resolutionScale, center, $(PostFX/DOF/vignParams));
+		}
+		#endif
+
+		@sv_target.xyz = texColor;
+		@sv_target.w = 1.0;
+	}
+}

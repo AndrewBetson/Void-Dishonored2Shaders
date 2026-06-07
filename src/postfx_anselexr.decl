@@ -1,0 +1,22 @@
+{
+	newstyle
+
+	state {
+		blend		ONE ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+	
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	
+	hlsl_fp_main {
+		float2 screenTexCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float3 color = $(Identity/BufferIn).SampleLevel( $linearClamp, screenTexCoords.xy, 0.0 ).rgb; 
+		color = RangeExpandColorFromR11G11B10( color );		
+		@sv_target = float4( color, 1.0 );
+	}
+}

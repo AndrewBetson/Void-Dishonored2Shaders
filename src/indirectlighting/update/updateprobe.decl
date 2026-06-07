@@ -1,0 +1,465 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 128	// Each thread processes a sample. The amount of threads per probe must match the PROBE_SAMPLES_COUNT define declared in arkEnvProbe.h!
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+
+		#define	SHADOWS_PROVIDE_CASTER_DISTANCE 1	// New option to use shadows that perform manual PCF but also return the average caster distance!
+
+		#include <sphericalHarmonics>
+		#include <lightContext>
+		#include <surfaceContext>
+		#include <fresnel>
+		#include <areaLight>
+
+		#define PROBE_SAMPLES_COUNT			NUMTHREADX
+
+		#define	MAX_PROBE_EMISSIVE_SURFACES	16		// Must match the MAX_PROBE_EMISSIVE_SURFACES define declared in arkEnvProbe.h!
+		#define	MAX_PROBE_NEIGHBORS			4		// Must match the MAX_PROBE_NEIGHBORS define declared in arkEnvProbe.h!
+
+		// As defined in shadow.mrpr
+		// 	#define HIGH_QUALITY	(2)
+		// 	#define AVERAGE_QUALITY	(1)
+		// 	#define LOW_QUALITY		(0)	
+		#define SHADOW_QUALITY		2	// @TODO: Reduce if useless...
+
+
+		groupshared $(indirectLighting/SH3)	gs_SamplesCoeffs[PROBE_SAMPLES_COUNT];
+		#if $(indirectLighting/update/dynamicSunUpdate)
+			groupshared $(indirectLighting/SH3)	gs_SamplesCoeffsSun[PROBE_SAMPLES_COUNT];
+		#endif
+		groupshared $(indirectLighting/SH3)	gs_EmissiveSurfaceCoeffs[MAX_PROBE_EMISSIVE_SURFACES];
+//		groupshared $(indirectLighting/SH3)	gs_NeighborProbeCoeffs[MAX_PROBE_NEIGHBORS];
+
+		// =========================================================
+		// Light context and light browsing for samples relighting
+
+		// Fetches the next light data in the list of lights
+		bool FetchNextProbeLightData( inout LightContext _Context ) {
+			if ( _Context.m_lightsCount == 0 || _Context.m_lightsCount > 32 )
+				return false;
+
+			uint			LightIndex = $(indirectLighting/update/bufferProbeLightIndices)[_Context.m_currentLightIndex];
+ 			$(tlf/light_t)	light  = $(indirectLighting/update/bufferProbeLights)[LightIndex];
+
+			_Context.m_currentLightIndex++;	// Go to next light
+			_Context.m_lightsCount--;
+
+			// Fetch light data
+			_Context.m_wsLightPos = light.mWorldPosition;
+			_Context.m_RadiusFalloff = light.mRadiusFalloff;
+			_Context.m_RadiusCutoff = light.mRadiusCutoff;
+			_Context.m_color = light.mColor;
+			_Context.m_Decay = light.mDecay;
+			_Context.m_SpotDir = light.mSpotDir;
+			_Context.m_SpecularAttn = light.mSpecularAttn;
+			_Context.m_ScatterValue = light.mScatterValue;
+			_Context.m_ScatterScale = light.mScatterScale;
+			_Context.m_ScatterOffset = light.mScatterOffset;
+			_Context.m_ScatterTurbulence = light.mScatterTurbulence;
+			_Context.m_originOffset = light.mOriginOffset;
+			_Context.m_SpotParms = light.mSpotParms;
+			_Context.m_AreaLightX = light.mAreaLightX;
+			_Context.m_AreaLightSlice = AREA_LIGHT_SLICE( light.mFlags );
+
+			_Context.m_castsShadow = false;
+			_Context.m_ShadowSetup = light.mShadowSetup;
+
+			uint	LightType = LIGHT_TYPE( light.mFlags );
+			_Context.m_isDirectionalLight = false;
+
+			// initialize computed parameters
+			_Context.m_attenuation = 1.0;
+			_Context.m_shadow = 1.0;
+			_Context.m_scatter = 0.0;
+
+			// Compute world light vector (pointing TOWARD the light)
+			_Context.m_wsToLight = light.mWorldPosition - _Context.m_wsPosition;
+			_Context.m_distance2Light = length( _Context.m_wsToLight );
+			_Context.m_invDistance2Light = 1.0 / max( 1.0, _Context.m_distance2Light );	// Avoid too large intensities by clamping 1/r² to a minimum of 1! (false in case of continuous surfaces but good for discrete samples)
+			_Context.m_wsToLight *= _Context.m_invDistance2Light;
+
+			return true;
+		}
+
+		// =========================================================
+		// Samples relighting
+		float3	ComputeDiffuseRadiance( LightContext _Light, SurfaceContext _Surface ) {
+			#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+				float	Shadow = smoothstep( 0.05, 1.0, exp( 1.0 * (_Light.m_shadowCasterZ - _Light.m_shadowReceiverZ) ) );
+				float3	Irradiance_shadowed = Shadow * _Light.m_attenuation * _Light.m_color;
+			#else
+				float3	Irradiance_shadowed = _Light.m_shadow * _Light.m_attenuation * _Light.m_color;
+			#endif
+
+			float	LdotN = saturate( dot( _Surface.wsNormal, _Light.m_wsToLight ) );
+			float	FresnelSpecular = FresnelSchlick( _Surface.roughness, LdotN );	// Not a mistake here: we stored F0 into the surface's roughness...
+			float	FresnelDiffuse = 1.0 - FresnelSpecular;	// Crude...
+
+			return FresnelDiffuse * Irradiance_shadowed * LdotN;
+		}
+
+		float3	ComputeAreaLightDiffuse( AreaLightContext _Light, SurfaceContext _Surface ) {
+			float3	Irradiance_shadowed = _Light.m_shadow * _Light.m_attenuation * _Light.m_color * _Light.m_irradianceDiffuse;
+
+			float	LdotN = saturate( dot( _Surface.wsNormal, _Light.m_wsLight ) );
+			float	FresnelSpecular = FresnelSchlick( _Surface.roughness, LdotN );
+			float	FresnelDiffuse = 1.0 - FresnelSpecular;	// Crude...
+
+			return FresnelDiffuse * Irradiance_shadowed * _Light.m_solidAngle_diffuse;	// = Fresnel * Rho/PI * (N.L) * dw
+		}
+
+		// Computes sample lighting by all the lights influencing the probe
+		float3	ComputeSampleRadiance( $(indirectLighting/update/probeUpdateInfo) _UpdateInfo, SurfaceContext _Surface ) {
+
+			float3	AccumDiffuse = 0.0;
+
+			LightContext	Light = (LightContext) 0;
+			Light.m_wsPosition = _Surface.wsPosition;
+			Light.m_currentLightIndex = _UpdateInfo.LightsStart;	// Will be incremented by the FetchNextProbeLightData() function...
+
+			// ===== POINT LIGHTS =====
+			Light.m_lightsCount = _UpdateInfo.LightsCountPoint;
+			while ( FetchNextProbeLightData( Light ) ) {
+				Light.ComputeAttenuation( LIGHT_TYPE_POINT );
+				Light.ComputeShadow( _Surface, SHADOW_QUALITY, LIGHT_TYPE_POINT );
+
+// Light.m_shadow = 1.0;
+
+				AccumDiffuse += ComputeDiffuseRadiance( Light, _Surface );
+			}
+
+			// ===== HALF-POINT LIGHTS =====
+			Light.m_lightsCount = _UpdateInfo.LightsCountHalfPoint;
+			while ( FetchNextProbeLightData( Light ) ) {
+				Light.ComputeAttenuation( LIGHT_TYPE_HALF_POINT );
+				Light.ComputeShadow( _Surface, SHADOW_QUALITY, LIGHT_TYPE_HALF_POINT );
+
+// Light.m_shadow = 1.0;
+
+				AccumDiffuse += ComputeDiffuseRadiance( Light, _Surface );
+			}
+
+			// ===== SPOT LIGHTS =====
+			Light.m_lightsCount = _UpdateInfo.LightsCountSpot;
+			while ( FetchNextProbeLightData( Light ) ) {
+				Light.ComputeAttenuation( LIGHT_TYPE_SPOT );
+				Light.ComputeShadow( _Surface, SHADOW_QUALITY, LIGHT_TYPE_SPOT );
+
+// Light.m_shadow = 1.0;
+
+				AccumDiffuse += ComputeDiffuseRadiance( Light, _Surface );
+			}
+
+			// ===== AREA LIGHTS =====
+			Light.m_lightsCount = _UpdateInfo.LightsCountArea;
+			while ( FetchNextProbeLightData( Light ) ) {
+				ComputeAreaLightShadow( Light, _Surface, SHADOW_QUALITY );
+
+// Light.m_shadow = 1.0;
+
+				_Surface.wsView = Light.m_wsToLight;	// In this case, the view direction is the light direction
+
+				AreaLightContext	areaLight = CreateAreaLightContext( _Surface, Light, SHADOW_QUALITY );	// Transforms a standard light+surface context into an area light context
+
+				AccumDiffuse += ComputeAreaLightDiffuse( areaLight, _Surface );
+			}
+			
+			return _Surface.diffuseAlbedo * AccumDiffuse;
+		}
+
+		#if $(indirectLighting/update/dynamicSunUpdate)
+			// Computes sample lighting by the Sun
+			float3	ComputeSampleRadianceSun( SurfaceContext _Surface ) {
+
+				LightContext	Light = (LightContext) 0;
+
+				Light.m_color = 1.0;		// Sun color is injected in realtime SH accumulation pass later...
+				Light.m_attenuation = 1.0;
+				Light.m_distance2Light = 1.0;
+				Light.m_wsToLight = $(atm/sky/SunDirection).xyz;
+				#ifdef SHADOWS_PROVIDE_CASTER_DISTANCE
+					float3	Shadow = ComputeParallelShadow( _Surface.wsPosition, _Surface.wsNormal, Light.m_shadowInfo.mWorldToShadowMat, Light.m_shadowInfo.mShadowToWorldMat, Light.m_shadowInfo.mInfo, SHADOW_QUALITY );
+					Light.m_shadow = Shadow.x;
+					Light.m_shadowCasterZ = Shadow.y;
+					Light.m_shadowReceiverZ = Shadow.z;
+				#else
+					Light.m_shadow = ComputeParallelShadow( _Surface.wsPosition, _Surface.wsNormal, Light.m_shadowInfo.mWorldToShadowMat, Light.m_shadowInfo.mShadowToWorldMat, Light.m_shadowInfo.mInfo, SHADOW_QUALITY );
+				#endif
+
+				return _Surface.diffuseAlbedo * ComputeDiffuseRadiance( Light, _Surface );
+			}
+		#endif
+	}
+
+	hlsl_cp_main {
+		uint										UpdateIndex = $sv_groupID.x;
+		$(indirectLighting/update/probeUpdateInfo)	Probe = $(indirectLighting/update/bufferProbeUpdateInfo)[UpdateIndex];
+
+		uint	ProbesCount = $(indirectLighting/update/parmsUint).x;
+
+		//////////////////////////////////////////////////////////////////////////
+		// 1] Process the samples (1 sample per thread here)
+		uint									SampleIndex = $sv_groupThreadID.x;
+		$(indirectLighting/update/probeSample)	Sample = $(indirectLighting/update/bufferProbeSampleInfo)[UpdateIndex * PROBE_SAMPLES_COUNT + SampleIndex];
+
+		uint	relightProbeIndex = Sample.RelightProbeIndex_Opacity >> 16;
+		uint	intOpacity = Sample.RelightProbeIndex_Opacity & 0xFFFFU;
+		float	opacity = intOpacity / 65535.0;
+
+		float3	Radiance = 0.0;
+		float3	RadianceSun = 0.0;
+
+		if ( intOpacity > 0U ) {
+
+			// Build dummy surface context from sample
+			SurfaceContext	Surface;
+			Surface.Clear();
+			Surface.wsPosition = Sample.wsPosition;
+			Surface.wsPositionHacked = Sample.wsPosition;
+
+				// Unpack normal
+			float	wsNormal_Phi = TWOPI * (Sample.wsNormal_PhiTheta & 0xFFFFU) / 65535.0;
+			float	wsNormal_Theta = PI * ((Sample.wsNormal_PhiTheta >> 16) & 0xFFFFU) / 65535.0;
+			float2	sinCosPhi, sinCosTheta;
+			sincos( wsNormal_Phi, sinCosPhi.x, sinCosPhi.y );
+			sincos( wsNormal_Theta, sinCosTheta.x, sinCosTheta.y );
+
+			Surface.wsNormal = float3( sinCosTheta.x * sinCosPhi.y, sinCosTheta.x * sinCosPhi.x, sinCosTheta.y );
+
+				// Unpack albedo and F0
+			Surface.diffuseAlbedo.x = (Sample.Albedo_F0 >> 24) / 255.0;
+			Surface.diffuseAlbedo.y = ((Sample.Albedo_F0 >> 16) & 0xFFU) / 255.0;
+			Surface.diffuseAlbedo.z = ((Sample.Albedo_F0 >> 8) & 0xFFU) / 255.0;
+			Surface.diffuseAlbedo *= Surface.diffuseAlbedo;	// Was stored as sqrt( albedo ) to maximize dynamic range
+			Surface.diffuseAlbedo *= INVPI;					// So we don't need to apply it during lighting computation
+
+			float	F0 = (Sample.Albedo_F0 & 0xFFU) / 255.0;
+					F0 *= F0;								// Was stored as sqrt( F0 ) to maximize dynamic range
+
+			Surface.roughness = F0;							// ComputeDiffuseRadiance() will use roughness knowing it's F0
+			Surface.IOR = Fresnel_IORFromF0( F0 );			// Used by area lights
+			Surface.fresnelStrength = 1.0;					// Used by area lights
+
+			// Compute lighting by dynamic lights
+			Radiance = opacity * ComputeSampleRadiance( Probe, Surface );
+
+			#if $(indirectLighting/update/dynamicSunUpdate)
+				// Compute lighting by the Sun
+				RadianceSun = opacity * ComputeSampleRadianceSun( Surface );
+			#endif
+		}
+
+		// Encode into SH
+		$(indirectLighting/SH1)	SampleDirection = $(indirectLighting/update/bufferStaticSamples)[SampleIndex];
+		[unroll]
+		for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+			gs_SamplesCoeffs[SampleIndex].SH[i] = Radiance * SampleDirection.SH[i];
+			#if $(indirectLighting/update/dynamicSunUpdate)
+				gs_SamplesCoeffsSun[SampleIndex].SH[i] = RadianceSun * SampleDirection.SH[i];
+			#endif
+		}
+
+		// Ensure all threads have finished computing their sample radiance
+		GroupMemoryBarrierWithGroupSync();
+
+
+		//////////////////////////////////////////////////////////////////////////
+		// 2] Process the emissive surfaces with unused threads (i.e. above 64)
+		uint	ThreadStartIndex_Emissive = NUMTHREADX >> 1;
+		uint	EmissiveSurfaceIndex = $sv_groupThreadID.x - ThreadStartIndex_Emissive;
+		if ( EmissiveSurfaceIndex < MAX_PROBE_EMISSIVE_SURFACES ) {
+			if ( EmissiveSurfaceIndex < Probe.EmissiveSurfacesCount ) {
+				// Retrieve emissive surface infos for that thread
+				$(indirectLighting/update/probeEmissiveSurface)	EmissiveSurface = $(indirectLighting/update/bufferProbeEmissiveSurfaceInfo)[Probe.EmissiveSurfacesStart + EmissiveSurfaceIndex];
+
+				// Build radiance
+				[unroll]
+				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+					gs_EmissiveSurfaceCoeffs[EmissiveSurfaceIndex].SH[i] = EmissiveSurface.EmissiveColor * EmissiveSurface.SH[i];
+				}
+			} else {
+				// Clear radiance
+				[unroll]
+				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+					gs_EmissiveSurfaceCoeffs[EmissiveSurfaceIndex].SH[i] = 0.0;
+				}
+			}
+		}
+
+
+// bmayaux (2016-02-26) Former way of propagating indirect lighting used neighbor probes, now the samples are used for propagation instead
+// 		//////////////////////////////////////////////////////////////////////////
+// 		// 3] Use 4 unused threads to add contribution from neighbor probes (i.e. threads above 64 + 16)
+// 		uint	ThreadStartIndex_Neighbors = ThreadStartIndex_Emissive + MAX_PROBE_EMISSIVE_SURFACES;
+// 		uint	NeighborIndex = $sv_groupThreadID.x - ThreadStartIndex_Neighbors;
+// 		if ( NeighborIndex < MAX_PROBE_NEIGHBORS ) {
+// 			uint	NeighborProbeID = ~0U;
+// 			float4	Swizzle = 0.0;
+// 
+// 			// Neighbor probes IDs & SH are stored in the update structure
+// 			switch ( NeighborIndex ) {
+// 				case 0:	NeighborProbeID = Probe.NeighborProbeIDs.x;	Swizzle = float4( 1, 0, 0, 0 ); break;
+// 				case 1:	NeighborProbeID = Probe.NeighborProbeIDs.y;	Swizzle = float4( 0, 1, 0, 0 ); break;
+// 				case 2:	NeighborProbeID = Probe.NeighborProbeIDs.z;	Swizzle = float4( 0, 0, 1, 0 ); break;
+// 				case 3:	NeighborProbeID = Probe.NeighborProbeIDs.w;	Swizzle = float4( 0, 0, 0, 1 ); break;
+// 			}
+// 
+// 			if ( NeighborProbeID < ProbesCount ) {
+// 				// Read back last frame's final SH coefficients
+// 				$(indirectLighting/SH3)	NeighborProbeCoeffs = $(indirectLighting/bufferProbesSH_RGBE)[NeighborProbeID];
+// 
+// 				// Isolate neighbor visibility SH coefficients
+// 				$(indirectLighting/SH1)	NeighborVisibilityCoeffs;
+// 				[unroll]
+// 				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+// 					NeighborVisibilityCoeffs.SH[i] = dot( Probe.SHConvolution[i], Swizzle );					// Isolate the SH for this neighbor (4 neighbors SH are packed in a float4 here)
+// 				}
+// 
+// 				// Compute the perceived SH coefficients using a costly triple product
+// 				$(indirectLighting/SH3)	PerceivedNeighborCoeffs;
+// 				SHProduct( NeighborProbeCoeffs.SH, NeighborVisibilityCoeffs.SH, PerceivedNeighborCoeffs.SH );	// This is the SH this probe can see from its neighbor
+// 
+// 				[unroll]
+// 				for ( uint j=0; j < SH_COEFFS_COUNT; j++ ) {
+// 					gs_NeighborProbeCoeffs[NeighborIndex].SH[j] = PerceivedNeighborCoeffs.SH[j];
+// // 					gs_NeighborProbeCoeffs[NeighborIndex].SH[j] = NeighborConvolutionSH[j];								// Use this to show the exhanges
+// // 					gs_NeighborProbeCoeffs[NeighborIndex].SH[j] = NeighborIndex == 0 && j == 0 ? NeighborProbeID : 0.0;	// Use this to show the neighbor's ID
+// // 					gs_NeighborProbeCoeffs[NeighborIndex].SH[j] = NeighborIndex == 0 ? NeighborProbeSH[j] : 0.0;		// Use this to show the neighbor's SH
+// 				}
+// 			} else {
+// 				// Accumulate nothing
+// 				float3	Zero = NeighborProbeID == ~0U ? 0.0 : float3( 1, 0, 1 );	// Debug => Out of range probes will display in magenta!
+// 				for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+// 					gs_NeighborProbeCoeffs[NeighborIndex].SH[i] = Zero;
+// 				}
+// 			}
+// 		}
+
+
+		//////////////////////////////////////////////////////////////////////////
+		// 4] Perform a parallel reduction of the samples' SH & emissive SH
+		uint	BlockOffset = SampleIndex;
+		if ( SampleIndex < 64 ) {
+			uint	BlockOffset2 = BlockOffset + 64;	// Offset to the next block of 64 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					gs_SamplesCoeffsSun[BlockOffset].SH[i] += gs_SamplesCoeffsSun[BlockOffset2].SH[i];
+				#endif
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 32 ) {
+			uint	BlockOffset2 = BlockOffset + 32;	// Offset to the next block of 32 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					gs_SamplesCoeffsSun[BlockOffset].SH[i] += gs_SamplesCoeffsSun[BlockOffset2].SH[i];
+				#endif
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 16 ) {
+			uint	BlockOffset2 = BlockOffset + 16;	// Offset to the next block of 16 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					gs_SamplesCoeffsSun[BlockOffset].SH[i] += gs_SamplesCoeffsSun[BlockOffset2].SH[i];
+				#endif
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 8 ) {
+			uint	BlockOffset2 = BlockOffset + 8;	// Offset to the next block of 8 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					gs_SamplesCoeffsSun[BlockOffset].SH[i] += gs_SamplesCoeffsSun[BlockOffset2].SH[i];
+				#endif
+
+				// Reduce emissive as well
+				gs_EmissiveSurfaceCoeffs[BlockOffset].SH[i] += gs_EmissiveSurfaceCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 4 ) {
+			uint	BlockOffset2 = BlockOffset + 4;	// Offset to the next block of 4 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					gs_SamplesCoeffsSun[BlockOffset].SH[i] += gs_SamplesCoeffsSun[BlockOffset2].SH[i];
+				#endif
+
+				// Reduce emissive as well
+				gs_EmissiveSurfaceCoeffs[BlockOffset].SH[i] += gs_EmissiveSurfaceCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+
+		//////////////////////////////////////////////////////////////////////////
+		// 5] Use a single thread to finalize SH
+		// At this point, we have 4 sums of SH coefficients in gs_SamplesCoeffs[0], gs_SamplesCoeffs[1], gs_SamplesCoeffs[2] and gs_SamplesCoeffs[3]
+		// We won't force a barrier for summing 4 samples so we'll collapse them using a single thread that will also add other SH...
+		//
+		if ( $sv_groupThreadID.x == 0 ) {
+
+			float3	FactorEmissive = $(indirectLighting/update/contributionFactorEmissive);		// User parm to boost contribution
+//			float3	FactorNeighbors = $(indirectLighting/update/contributionFactorNeighbors);	// User parm to boost contribution
+
+			// Finalize dynamic
+			$(indirectLighting/SH3)	SHDynamic;
+			SHDynamic.__PADDING = 0.0;	// Don't care but the compiler whines about that :(
+			
+			$(indirectLighting/SH3)	SHDynamicSun;
+			SHDynamicSun.__PADDING = 0.0;	// Don't care but the compiler whines about that :(
+
+			[unroll]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				// Dynamic = Samples + Emissive + Neighbors
+				SHDynamic.SH[i] = gs_SamplesCoeffs[0].SH[i] + gs_SamplesCoeffs[1].SH[i] + gs_SamplesCoeffs[2].SH[i] + gs_SamplesCoeffs[3].SH[i]
+								+ FactorEmissive * (gs_EmissiveSurfaceCoeffs[0].SH[i] + gs_EmissiveSurfaceCoeffs[1].SH[i] + gs_EmissiveSurfaceCoeffs[2].SH[i] + gs_EmissiveSurfaceCoeffs[3].SH[i]);
+// 								+ FactorNeighbors * (gs_NeighborProbeCoeffs[0].SH[i] + gs_NeighborProbeCoeffs[1].SH[i] + gs_NeighborProbeCoeffs[2].SH[i] + gs_NeighborProbeCoeffs[3].SH[i]);
+
+				#if $(indirectLighting/update/dynamicSunUpdate)
+					// Dynamic Sun = Samples Sun
+					SHDynamicSun.SH[i] = gs_SamplesCoeffsSun[0].SH[i] + gs_SamplesCoeffsSun[1].SH[i] + gs_SamplesCoeffsSun[2].SH[i] + gs_SamplesCoeffsSun[3].SH[i];
+				#endif
+			}
+
+			// Filter out dynamic
+			FilterLanczos( SHDynamic.SH, 3.0 );		// Nice result
+
+			#if $(indirectLighting/update/dynamicSunUpdate)
+				// Filter out Sun
+				FilterLanczos( SHDynamicSun.SH, 2.0 );	// Nice result
+// 				FilterHanning( SHDynamicSun.SH, 2.0 );
+// 				FilterGaussian( SHDynamicSun.SH, 4.0 );	// 2.0 => Covers the entire sphere even for a very directional source, 4 is okay bit like lanczos 2.0
+			#endif
+
+			// Write final results...
+			@(indirectLighting/update/bufferProbesSH_Dynamic)[Probe.Index] = SHDynamic;
+			#if $(indirectLighting/update/dynamicSunUpdate)
+				@(indirectLighting/update/bufferProbesSH_StaticSun)[Probe.Index] = SHDynamicSun;
+			#endif
+		}
+	}
+}

@@ -1,0 +1,22 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+	hlsl_fp_main {
+		float depth = $(Identity/BufferDepthIn).SampleLevel( $pointClamp, $texcoord, 0.0f ).x;
+		@sv_depth = depth;
+	}
+}

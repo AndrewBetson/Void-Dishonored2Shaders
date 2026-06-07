@@ -1,0 +1,43 @@
+{ newstyle
+	parms {
+		stageSort	sortCoverage
+	}
+	state {
+		depthfunc	ALWAYS
+		depthWrite 0
+		depthEnable	0
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
+	}
+	hlsl_prefix {
+		#include <vertex>
+	}
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		
+		@sv_position = vout._projPosition;
+		@legacy_texcoord.xy = $vertex_texcoord;
+		@legacy_texcoord.zw = 0.f.xx;
+	}
+	hlsl_fp_main {
+		@sv_target = $textureMap.Sample( $anisotropicSampler, $legacy_texcoord.xy );
+	}
+	hlsl_fp_main {
+#if 0
+
+#if defined( PC ) || defined( ORBIS ) || defined( DURANGO )
+		// texelFetch requires unnormalized texcoords
+		float2 texcoord = $legacy_texcoord.xy * float2( 1.0 / $positionToViewTexture.z, 1.0 / $positionToViewTexture.w );
+		int2 texcoordi = int2( texcoord.x, texcoord.y );
+		@sv_target.xyz = tex2DMSFetch( $textureMapMultisample, texcoordi.xy, 0 ).xyz;
+#else
+		@sv_target = $textureMapMultisample.Sample( $anisotropicSampler, $legacy_texcoord.xy );
+#endif
+		@sv_target.w = $testImageAlpha.x;
+#endif // 0
+		@sv_target = float4( 1.f, 0.f, 0.f, 1.f );
+	}
+}

@@ -1,0 +1,155 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef TRANSLUCENCY_INCLUDED
+		#define TRANSLUCENCY_INCLUDED
+		#include <helper>
+
+		// Computes a fake translucency using a bent normal
+		//	_TranslucencyWeight, a "material translucency" weight value in [0,1] where black is no translucency and white is full translucency (usually painted in a texture alpha or in vertex colors)
+		//	_Irradiance, the irradiance arriving to the other end of the surface (typically, light power attenuated with 1/r²)
+		//	_View, the view vector in world space
+		//	_Light, the light vector in world space
+		//	_Normal, the VERTEX normal of the surface (don't try using the normal mapped normal because it adds too many disturbing details for a not so great result)
+		//
+		float3	ComputeTranslucency( float _TranslucencyWeight, float3 _Irradiance, float3 _Normal, float3 _Light, float3 _View ) {
+			float3	LightVec = _Light + $(translucency/distortion) * _Normal;
+//			float	LdotV = pow( saturate( -dot( _View, LightVec ) ), $(translucency/power) );								// Phase between view and light, raised to a power to change glow aspect
+			float	LdotV = exp2( saturate( -dot( _View, LightVec ) ) * $(translucency/power) - $(translucency/power) );	// Cheap/fast approx. from http://colinbarrebrisebois.com/2012/04/09/approximating-translucency-revisited-with-simplified-spherical-gaussian/
+
+			float3	Intensity = $(translucency/intensity) * _TranslucencyWeight * _Irradiance;
+
+			// Compute the ramp interpolation
+			float	MaxIntensity = max( max( Intensity.x, Intensity.y ), Intensity.z );
+			float	Translucency = $(translucency/min) + $(translucency/scale) * MaxIntensity * LdotV;
+
+			// Use a color ramp to interpolate between key colors
+			// The order is black => inner => medium => outer => white
+			float3	RampColor = lerp( float3( 0, 0, 0 ), lerp( $(translucency/ramp/innerColor), lerp( $(translucency/ramp/mediumColor), lerp( $(translucency/ramp/outerColor), float3( 1, 1, 1 ), 
+										saturate( (Translucency-0.9) / 0.1 ) ),	// 3->4 in t>0.9
+										saturate( (Translucency-0.7) / 0.2 ) ),	// 2->3 in t€[0.7,0.9]
+										saturate( (Translucency-0.4) / 0.3 ) ),	// 1->2 in t€[0.4,0.7]
+										saturate( Translucency / 0.4 ) );		// 0->1 in t€[0,0.4]
+
+			return Intensity * RampColor;
+		}
+
+		void GetShadowMapZandPos(  float3 _wsPos, float4x4 _worldToShadowMat, float4x4 _shadowToWorldMat, uint _sliceIndex, bool _isDirectionalLight,
+									out float _outShadowCoordZ, out float _outShadowMapZ, out float3 _outShadowWSPos ) {
+			if( _isDirectionalLight ) {
+				float3 shadowCoord = mul( (float3x4) _worldToShadowMat, float4( _wsPos.xyz, 1.0 ) );
+				_outShadowCoordZ = shadowCoord.z;
+				_outShadowMapZ = $lightDepthCompareMap.SampleLevel( $bilinearSampler, float3( shadowCoord.xy, _sliceIndex ), 0 ).x;
+				_outShadowWSPos = mul( (float3x4) _shadowToWorldMat, float4( shadowCoord.xy, _outShadowMapZ, 1.0 ) );
+			}
+			else {
+				float4 shadowCoord = mul( float4( _wsPos.xyz, 1.0 ), _worldToShadowMat );
+				shadowCoord.xyz /= shadowCoord.w;
+				_outShadowCoordZ = shadowCoord.z;
+				_outShadowMapZ = $shadowMapAtlas.SampleLevel( $bilinearSampler, float3(shadowCoord.xy, _sliceIndex), 0 ).x;
+				float4 wsPos2 = mul( float4( shadowCoord.xy, _outShadowMapZ, 1.0 ), _shadowToWorldMat );
+				_outShadowWSPos = wsPos2.w > 1e-4 ? wsPos2.xyz / wsPos2.w : _wsPos;
+			}
+		}
+
+		float3 GetShadowMapZandPos(	float3 _wsPos,
+									float3 _wsNormal,
+									float4x4 _worldToShadowMat,
+									float4x4 _shadowToWorldMat,
+									uint _sliceIndex,
+									bool _isDirectionalLight ) {
+			const float offset = 0.005;
+			float3 shrinkedPos = float3(_wsPos - offset * _wsNormal);
+			float3 outShadowWSPos;
+
+			float shadowDepth;
+			if( _isDirectionalLight ) {
+				float3 shadowCoord = mul( (float3x4) _worldToShadowMat, float4( shrinkedPos.xyz, 1.0 ) );
+				shadowDepth = $lightDepthCompareMap.SampleLevel( $pointSampler, float3( shadowCoord.xy, _sliceIndex ), 0 );
+				outShadowWSPos = mul( (float3x4) _shadowToWorldMat, float4( shadowCoord.xy, shadowDepth - offset, 1.0 ) );
+			}
+			else {
+				float4 shadowCoord = mul( float4( shrinkedPos.xyz, 1.0 ), _worldToShadowMat );
+				shadowCoord.xyz /= shadowCoord.w;
+				shadowDepth = $shadowMapAtlas.SampleLevel( $pointSampler, float3(shadowCoord.xy, _sliceIndex), 0 );
+				float4 wsPos2 = mul( float4( shadowCoord.xy, shadowDepth - offset, 1.0 ), _shadowToWorldMat );
+				outShadowWSPos = wsPos2.w > 1e-4 ? wsPos2.xyz / wsPos2.w : _wsPos;
+			}
+			return outShadowWSPos;
+		}
+
+		//This method uses the shadow map to compute the thickness of the mesh in the direction of the light
+		float3 ComputeTranslucencyHQ( float3 _wsPos, float _geometricNdotL, float _shadowCoordZ, float _shadowMapZ, float3 _shadowWSpos
+			#if $(translucency_hq/useFakeNormalMap)
+				, float3 _wsFakeTranslucencyNormal, float3 _lightDir
+			#endif
+		) {
+			float3 translucency = float3( 0, 0, 0 );
+
+			float depth = _shadowCoordZ - _shadowMapZ;
+
+			if( depth > 0.0001f )
+			{		
+				float thickness = distance( _wsPos, _shadowWSpos );
+			
+				float grazingFactor = _geometricNdotL * _geometricNdotL;
+				grazingFactor = smoothstep( $(translucency_hq/minMaxAngle).x, $(translucency_hq/minMaxAngle).y, grazingFactor );
+
+				translucency = exp( - thickness * $(translucency_hq/extinction) * 1000.0f ) * grazingFactor;
+			
+				#if $(translucency_hq/useFakeNormalMap)
+					translucency *= max( dot( _wsFakeTranslucencyNormal, - _lightDir ), 0.0f );
+				#endif
+			}
+			
+			return translucency;
+		}
+
+		float3 ComputeTranslucency2Sided(	float3 _Irradiance,
+											float3 _wsDirection,
+											float3 _SSBumpOcclusion,
+											float3 _wsHL2Basis_R,
+											float3 _wsHL2Basis_G,
+											float3 _wsHL2Basis_B ) {
+			// Compute the weight of each direction of occlusion depending on the provided direction
+			float3	BasisWeights = saturate( float3( dot( _wsDirection, _wsHL2Basis_R ),
+													 dot( _wsDirection, _wsHL2Basis_G ),
+													 dot( _wsDirection, _wsHL2Basis_B )) );
+			// Sum each weight, itself weighted by the values from the SSBumpMap
+			float	Occlusion = dot( _SSBumpOcclusion, BasisWeights );					
+			//return Occlusion * float3(_Irradiance.g,0,0);
+			return Occlusion * _Irradiance;
+		}
+
+		float3 SSSTransmittance(	float _translucency,
+									float3 _wsNormal,
+									float3 _wsPos,
+									float3 _shadowWSpos,
+									float3 _lightDir ) {
+			// Calculate the scale of the effect.
+			float scale = 8.25 * (1.0 - _translucency) / ( $(translucency/scale) * $(translucency_hq/transmittance) );
+
+			// Now we calculate the thickness from the light point of view:
+			float3 d = (_wsPos - _shadowWSpos);
+			float dLen = dot(d,d);
+			float dd = -(scale*scale) * dLen;
+
+			// Armed with the thickness, we can now calculate the color by means of the
+			// precalculated transmittance profile.
+			float3 profile = float3(0.233, 0.455, 0.649) * exp(dd / 0.0064) +
+							 float3(0.1  , 0.336, 0.344) * exp(dd / 0.0484) +
+							 float3(0.118, 0.198, 0.0  ) * exp(dd / 0.187 ) +
+							 float3(0.113, 0.007, 0.007) * exp(dd / 0.567 ) +
+							 float3(0.358, 0.004, 0.0  ) * exp(dd / 1.99  ) +
+							 float3(0.078, 0.0  , 0.0  ) * exp(dd / 7.41  );
+							 
+			float3 translucency = profile;
+			translucency *= saturate(0.3 + dot( _lightDir, -_wsNormal ) );
+			translucency *= LinearStep( 0.0, 0.52, dot( _lightDir, -d ) );
+			
+			return translucency;
+		}
+
+		#endif	// #ifndef TRANSLUCENCY_INCLUDED
+	}
+}

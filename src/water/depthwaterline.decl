@@ -1,0 +1,54 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <arkOceanHelpers>
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+		//Compute world space position
+		float2 ndcPos = screenPosToNdc( $sv_position.xy );
+		float3 csPos = float3( ndcPos, 0.05 );	// Remember we look at -Z!
+		float4 wsPos = mul( $inverseViewProjectionMatrix, float4( csPos, 1.0 ) );	// Now in WORLD space...
+		wsPos /= wsPos.w;
+
+		//Compute wave height
+		float2 globalMapsUV = wsPos.xy / $(ocean/MasksExtent).x;
+		globalMapsUV += 0.5f;
+		globalMapsUV.x = 1.0f - globalMapsUV.x;
+
+		float2 wsPosScaled = wsPos.xy;
+		wsPosScaled.x *= $(ocean/ScaleX);
+		wsPosScaled.y *= $(ocean/ScaleY);
+
+		//Mask
+		float waveAmplitudeMask = $(ocean/WaveAmplitudeMask).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+		float shoreDist = $(ocean/ShoreDistanceFieldTex).SampleLevel( $bilinearClamp, globalMapsUV, 0 ).x;
+
+		// Shore waves
+		float shoreWavesFoam;
+		float3 shoreWaves = ComputeShoreWaves( wsPosScaled, waveAmplitudeMask, shoreDist, shoreWavesFoam );
+
+		// FFT waves
+		float fftWave = 0.0;
+		float2 fftUV = wsPosScaled * 0.02f; //TODO don't hardcode
+		//Code path for "collision detection" (no lateral displacement, only vertical)
+		fftWave = $(ocean/FFTCollisionHeightMap).SampleLevel( $bilinearSampler, fftUV, 0.0f ).x;
+		fftWave	*= waveAmplitudeMask * $(ocean/ScaleZ);
+		fftWave += shoreWaves.z;
+		fftWave += $(ocean/WaterLevel);
+		fftWave += 0.02;
+
+		@sv_target = (wsPos.z <= fftWave) ? 1.0 : 0.0;
+	}
+}

@@ -1,0 +1,294 @@
+{
+	newstyle
+	hlsl_prefix {
+	#ifndef HELPER_COMMON
+	#define HELPER_COMMON
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Trigonometrics
+
+		//	acos(x) ~= PI/2 * sqrt(1-x) when x € [0,1]
+		float	FastAcos_HalfRange( float _cos ) {
+			return 1.5707963267948966192313216916398 * sqrt( 1.0 - _cos );
+		}
+
+		// This one covers the full range x € [-1,1]
+		float	FastAcos_FullRange( float _cos ) {
+			float	a = sqrt( 1.0 - abs(_cos) );
+			return 1.5707963267948966192313216916398 * lerp( 1-a, a, step(0.0,_cos) );
+		}
+
+		float DegreesToRadians(float degrees) { return degrees * PI / 180.0; }
+		float RadiansToDegrees(float radians) { return radians * 180.0 / PI; }
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Interpolation
+		float LinearStep( float min, float max, float t)
+		{ return saturate( (t-min) / (max-min) ); }
+
+		float3 LinearStep( float3 min, float3 max, float3 t)
+		{ return saturate( (t-min) / (max-min) ); }
+
+// ARKANE: bmayaux (2014-06-04) What's the point of this except adding confusion?
+// 		//Standard version
+// 		float Smoothstep(float min, float max, float x)
+// 		{
+// 			// Scale, and clamp x to 0..1 range
+// 			x = LinearStep(min,max,x);
+// 			// Evaluate polynomial
+// 			return (x*x) * ( 3 - (2*x) );
+// 		}
+
+		//Ken Perlin version
+		float Smootherstep(float min, float max, float x) {
+			// Scale, and clamp x to 0..1 range
+			x = LinearStep(min,max,x);
+			// Evaluate polynomial
+			return x*x*x*(x*(x*6 - 15) + 10);
+		}
+
+		float Smootheststep(float min, float max, float x) {
+			// Scale, and clamp x to 0..1 range
+			x = LinearStep(min,max,x);
+			// Evaluate polynomial
+			return 1 - pow( 1-x , 4*x*x );
+		}
+
+		float3 Smootheststep(float3 min, float3 max, float3 x) {
+			// Scale, and clamp x to 0..1 range
+			x = LinearStep(min,max,x);
+			// Evaluate polynomial
+			return 1 - pow( 1-x , 4*x*x );
+		}
+
+		float3 Slerp( float3 a, float3 b, float t ) {
+			float angle = safeAcos( dot(a,b) );
+			return ( angle > 0.0 && angle < PI ) ? (sin((1.0-t)*angle)/sin(angle))*a + (sin(t*angle)/sin(angle))*b : a;
+		}
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Random functions
+		float rand(float2 base, float2 seed) {
+			return fmod(dot(base,seed) * float(65537.0), float(257.0)) * float(1.0/257.0);
+		}
+		float2 rand(float2 coord, float width, float height) //generating noise-pattern texture for dithering
+		{
+			float noiseX = ((frac(1.0-coord.x*(width/2.0))*0.25)+(frac(coord.y*(height/2.0))*0.75))*2.0-1.0;
+			float noiseY = ((frac(1.0-coord.x*(width/2.0))*0.75)+(frac(coord.y*(height/2.0))*0.25))*2.0-1.0;
+			noiseX = clamp(frac(sin(dot(coord ,float2(12.9898,78.233))) * 43758.5453),0.0,1.0)*2.0-1.0;
+			noiseY = clamp(frac(sin(dot(coord ,float2(12.9898,78.233)*2.0)) * 43758.5453),0.0,1.0)*2.0-1.0;
+			return float2(noiseX,noiseY);
+		}
+		float rand( float2 n ) {
+			return frac(sin(dot(n.xy, float2(12.9898, 78.233)))* 43758.5453);
+		}
+		float rand(float n) {
+			return frac(sin(n)*43758.5453123);
+		}
+		float rand24b(float2 seed) {
+			uint n = asuint(seed.y * 214013.153 + seed.x * 2531011.731);
+			n = n * (n * n * 15731u + 789221u);
+			n = (n >> 9u) | 0x3F800000u;
+			return 2.0 - asfloat(n);
+		}
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Procedural Bayer Matrix
+		// https://www.shadertoy.com/view/Mlt3z8
+		//
+		// Seed
+		uint B2( uint2 _P ) {
+			return ((_P.y << 1) + _P.x + 1) & 3;
+		}
+		// Generates the 4x4 matrix
+		uint B4( uint2 _P ) {
+			uint2	P1 = _P & 1;
+			uint2	P2 = (_P & 3) >> 1;
+			return (B2(P1) << 2) + B2(P2);
+		}
+		// Generates the 8x8 matrix
+		uint B8( uint2 _P ) {
+			uint2	P1 = _P & 1;
+			uint2	P2 = (_P & 3) >> 1;
+			uint2	P4 = (_P & 7) >> 2;
+			return (((B2(P1) << 2) + B2(P2)) << 2) + B2(P4);
+		}
+		// Generates the 16x16 matrix
+		uint B16( uint2 _P ) {
+			uint2	P1 = _P & 1;
+			uint2	P2 = (_P & 3) >> 1;
+			uint2	P4 = (_P & 7) >> 2;
+			uint2	P8 = (_P & 15) >> 3;
+			return (((((B2(P1) << 2) + B2(P2)) << 2) + B2(P4)) << 2) + B2(P8);
+		}
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Fast octahedron vector encoding/decoding
+		// The goal of these functions is to encode a unit vector like a normal into a [-1,+1]² vector as explained in http://lgdv.cs.fau.de/get/1602
+		// The source can be found at https://knarkowicz.wordpress.com/2014/04/16/octahedron-normal-vector-encoding/
+		//
+		// The idea simply is to project the unit vector onto an octahedron then unwrap the tetrahedron as described in the paper
+		// This is both efficient and fast and more precise than other traditional techniques
+		//
+		float2 OctWrap(float2 V) {
+			return (1.0 - abs(V.yx)) * sign_fast(V.xy);
+		}
+ 
+		float2	OctahedronPack( float3 V ) {
+			V /= dot(abs(V), float3(1.0, 1.0, 1.0));
+			return lerp(OctWrap(V.xy), V.xy, step(0.0, V.z));
+		}
+ 
+		float3	OctahedronUnpack( float2 P ) {
+			float3	V;
+			V.z = 1.0 - abs(P.x) - abs(P.y);
+			V.xy = lerp( OctWrap(P.xy), P.xy, step(0.0, V.z) );
+			return normalize(V);
+		}
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Color Helpers
+		//
+		void colorSaturation( inout float4x4 colorTransform, const float sat ) {
+			float s1 = (0.33333f * (1.0f - sat)) + (1.0f * sat);
+			float s2 = (1.0f - s1) / 2.0f;
+
+			const float4x4 satMat =
+				{ s1, s2 , s2 , 0,
+				  s2 , s1, s2 , 0,
+				  s2 , s2 , s1, 0,
+				  0  , 0  , 0 , 1 };
+
+			colorTransform = mul(colorTransform, satMat);
+		}
+
+		void colorMultiply( inout float4x4 colorTransform, const float4 c ) {
+			const float4x4 mult =
+				{ c.r, 0, 0, 0,
+				  0, c.g, 0, 0,
+				  0, 0, c.b, 0,
+				  0, 0, 0, c.a };
+			colorTransform = mul(colorTransform, mult);
+		}
+
+		void colorAdd( inout float4x4 colorTransform, const float4 c ) {
+			colorTransform[3] += c;
+		}
+
+		void colorInvert( inout float4x4 colorTransform ) {
+			colorMultiply( colorTransform, float4(-1,-1,-1,1) );
+			colorAdd( colorTransform, float4(1,1,1,0) );
+		}
+
+		void colorScreen( inout float4x4 colorTransform, const float4 c ) {
+			colorInvert(colorTransform);
+			colorMultiply(colorTransform, float4(1.0 - c.r, 1.0 - c.g, 1.0 - c.b, 1.0));
+			colorInvert(colorTransform);
+		}
+
+		void colorFadeToIdentity( inout float4x4 colorTransform, const float val ) {
+			float value  = saturate(val);
+			float invVal = 1.0f - value;
+
+			float4x4 ident =
+				{ 1, 0, 0, 0,
+				  0, 1, 0, 0,
+				  0, 0, 1, 0,
+				  0, 0, 0, 1 };
+
+			for (int x = 0; x < 4; x++) {
+			for (int y = 0; y < 4; y++) {
+				colorTransform[x][y] = invVal * colorTransform[x][y] + value * ident[x][y];
+			}}
+		}
+
+		/////////////////////////////////////////////////////////////////////////////////////////////
+		// Transform helpers
+		float2 cartToPolar(float2 coords, float2 scale) {
+			float mag = length(coords) * scale.y;
+			float angle = atan2(coords.x, coords.y);
+
+			coords.x = angle * scale.x;
+			coords.y = mag;
+			return coords;
+		}
+
+		float2 polarToCart(float2 coords) {
+		   float2 carts;
+		   float  sinx, cosx;
+		   sincos(coords.x,sinx,cosx);
+		   carts.x = coords.y * sinx;
+		   carts.y = coords.y * cosx;
+		   return carts;
+		}
+
+		float2 cartToPolarPhotoshop(float2 coords, float2 scale) {
+			float mag = length(coords) * scale.y;
+			float angle = atan2(coords.x, coords.y);
+
+			angle += PI;
+			angle /= TWOPI;
+
+			coords.y = angle * scale.x;
+			coords.x = (1-mag);
+			return coords;
+		}
+
+		float2 polarToCartPhotoshop(float2 coords) {
+		   float2 carts;
+		   coords.y *= TWOPI;
+		   coords.y += PI/2;
+		   coords.x = (1 - coords.x);
+		   float  siny, cosy;
+		   sincos(coords.y,siny,cosy);
+		   carts.x = coords.x * cosy;
+		   carts.y = coords.x * -siny;
+		   return carts;
+		}
+
+		float2 twirl(float2 coords, float2 scale) {
+			float2 tc;
+			tc.x = length( coords ) * scale.x;
+			tc.y = (scale.y - coords.y);
+			return tc;
+		}
+
+		float2 swirl(float2 coords, float2 center, float radius, float angle, float time) {
+			float2 tc = coords - center;
+			float dist = length(tc);
+
+			//swirl
+			float percent = (radius - dist) / radius;
+			float theta = (percent * percent * angle * 8) + time;
+			float s = sin(theta);
+			float c = cos(theta);
+			tc = float2(dot(tc, float2(c, -s)), dot(tc, float2(s, c)));
+			tc += center;
+
+			//radius clamp
+			tc = lerp(tc, coords, saturate(dist/radius));
+
+			return tc;
+		}
+
+		float CompressGlassDistortion( float angle, float strength ) {
+			//Compress angle (12bits)
+			float modAngle = fmod(angle, TWOPI) / TWOPI;
+			uint uValue = ((uint)(modAngle * 4095.0 + 0.5)); 
+
+			//Compres strength (4bits)
+			uValue |= ((uint)(round(strength))) << 12;
+
+			return asfloat(f16tof32(uValue));
+		}
+
+		float2 DecompressGlassDistortion( float compress ) {
+			uint rawInt = f32tof16(compress);
+			float angle = (((rawInt) & 0xFFF) / 4095.0) * TWOPI;
+			float strength = (float)((rawInt >> 12) & 0xF);
+			return float2(angle, strength);
+		}
+
+	#endif	//HELPER_COMMON
+	}
+}

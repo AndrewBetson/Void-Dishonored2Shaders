@@ -1,0 +1,406 @@
+{
+	newstyle
+
+	options {
+		isDecal				1
+		forcePixelShader	1
+	}
+
+	parms {
+		stageSort	sortDecal
+		stageSortAdjust	4.000000
+	}
+
+	state {
+		blend SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthfunc GEQUAL
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <BRDF_ward>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <fogHelpers>
+		#if $useParallaxMapping
+			#include <parallaxSelfShadow>
+		#endif
+
+		#define USE_SV_CLIPDISTANCE ( $decalType == DECAL_TYPE_CLIP_MODEL )
+		#define USE_SV_CLIPDISTANCE1 ( $decalType == DECAL_TYPE_CLIP_MODEL )
+		#define USE_SV_CULLDISTANCE ( $decalType == DECAL_TYPE_CULL_MODEL )
+		#define USE_SV_CULLDISTANCE1 ( $decalType == DECAL_TYPE_CULL_MODEL )
+
+		#if DURANGO
+			#if $alphaTest
+				#define __XBOX_FORCE_PS_ZORDER_RE_Z 1
+			#endif
+		#endif
+
+		// =======================================================================
+		//   ___ _    ___ ___   ___  ___ ___   _   _
+		//  / __| |  |_ _| _ \ |   \| __/ __| /_\ | |
+		// | (__| |__ | ||  _/ | |) | _| (__ / _ \| |__
+		//  \___|____|___|_|   |___/|___\___/_/ \_\____|
+		//
+		// =======================================================================
+		float Length2(float3 v) {
+			return dot(v, v);
+		}
+
+		float3 MinDiff(float3 Po, float3 Pr, float3 Pl) {
+			float3 V1 = Pr - Po;
+			float3 V2 = Po - Pl;
+			return (Length2(V1) < Length2(V2)) ? V1 : V2;
+		}
+		
+		void InitAndClipForDecal( inout arkPixelContext_t _pixelCtx, inout float3 _ddx, inout float3 _ddy ) {
+			#if $decalType == DECAL_TYPE_CLIP_MODEL || $decalType == DECAL_TYPE_CULL_MODEL
+				#if $useMultiInstancing
+					$arkDecalInstance_t decalInstance = $decalBuffer[ $decalBufferOffset + _pixelCtx.m_decalIndex ];
+					float3x4 World2Decal = float3x4( decalInstance.m_world2DecalX, decalInstance.m_world2DecalY, decalInstance.m_world2DecalZ );
+				#else
+					float3x4 World2Decal = float3x4( $world2DecalMatrixX, $world2DecalMatrixY, $world2DecalMatrixZ );
+				#endif
+
+				// clip on normal pointing backward
+				float3 dsNormal = mul( World2Decal, float4( _pixelCtx.m_wsVertexNormal, 0.0 ) );
+				clip( dsNormal.z -0.0001 );
+
+				#if $decalType == DECAL_TYPE_CULL_MODEL
+					// clip to decal box
+					float3 dsPosition = mul( World2Decal, float4( _pixelCtx.m_wsPosition, 1.0 ) );
+					float3 decalBoxMin = float3( 1.0 + dsPosition.x, 1.0 + dsPosition.y, 1.0 + dsPosition.z );
+					float3 decalBoxMax = float3( 1.0 - dsPosition.x, 1.0 - dsPosition.y, 0.0 - dsPosition.z );
+					clip( decalBoxMin );
+					clip( decalBoxMax );
+				#endif
+
+				_pixelCtx.m_wsTangent = _pixelCtx.m_wsVertexTangent = normalize( cross( World2Decal[1].xyz, _pixelCtx.m_wsVertexNormal ) );
+				_pixelCtx.m_wsBiTangent = _pixelCtx.m_wsVertexBiTangent	= cross( _pixelCtx.m_wsVertexNormal, _pixelCtx.m_wsVertexTangent );
+
+			#elif $decalType == DECAL_TYPE_DEPTH_BOX
+				// retrieve world position of pixel
+				float2 screenTexCoords = screenPosToTexcoord( _pixelCtx.m_ssPosition.xy, $positionToViewTexture );
+				float Zproj = $zBuffer.SampleLevel( $pointSampler, screenTexCoords * $resolutionScale.xy, 0.0 ).x;
+				
+				float2 ndcPos = screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+				
+				float4 wsPos = mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, Zproj, 1.0 ) );
+				wsPos /= wsPos.w;
+
+				// world space to model space
+				float3x4 World2Decal = float3x4( $inverseModelMatrixX, $inverseModelMatrixY, $inverseModelMatrixZ );
+				float3 msPosition = mul( World2Decal, wsPos );
+
+				// Discard out of the box pixels
+				clip( float3( 1.0 + msPosition.x, 1.0 + msPosition.y, 1.0 + msPosition.z ) );
+				clip( float3( 1.0 - msPosition.x, 1.0 - msPosition.y, 0.0 - msPosition.z ) );	// NOTE: top of _decalBox is 0, not 1 !
+
+				// reconstruct normal from depth of neighbours
+				float2 screenTexPosL = _pixelCtx.m_ssPosition.xy + float2( -1.0, 0.0 );
+				float2 screenTexPosR = _pixelCtx.m_ssPosition.xy + float2( +1.0, 0.0 );
+				float2 screenTexPosU = _pixelCtx.m_ssPosition.xy + float2( 0.0, -1.0 );
+				float2 screenTexPosD = _pixelCtx.m_ssPosition.xy + float2( 0.0, +1.0 );
+				float ZprojL = $zBuffer.SampleLevel( $pointSampler, screenTexPosL * $positionToViewTexture.zw * $resolutionScale.xy, 0.0 ).x;
+				float ZprojR = $zBuffer.SampleLevel( $pointSampler, screenTexPosR * $positionToViewTexture.zw * $resolutionScale.xy, 0.0 ).x;
+				float ZprojU = $zBuffer.SampleLevel( $pointSampler, screenTexPosU * $positionToViewTexture.zw * $resolutionScale.xy, 0.0 ).x;
+				float ZprojD = $zBuffer.SampleLevel( $pointSampler, screenTexPosD * $positionToViewTexture.zw * $resolutionScale.xy, 0.0 ).x;
+
+				float4 Pr, Pl, Pt, Pb;
+				Pl = mul( $inverseViewProjectionMatrix, float4( screenPosToNdc(screenTexPosL), ZprojL, 1.0 ) );	Pl /= Pl.w;
+				Pr = mul( $inverseViewProjectionMatrix, float4( screenPosToNdc(screenTexPosR), ZprojR, 1.0 ) );	Pr /= Pr.w;
+				Pb = mul( $inverseViewProjectionMatrix, float4( screenPosToNdc(screenTexPosU), ZprojU, 1.0 ) );	Pb /= Pb.w;
+				Pt = mul( $inverseViewProjectionMatrix, float4( screenPosToNdc(screenTexPosD), ZprojD, 1.0 ) );	Pt /= Pt.w;
+				float3 dPdu = MinDiff(wsPos.xyz, Pr.xyz, Pl.xyz);
+				float3 dPdv = MinDiff(wsPos.xyz, Pb.xyz, Pt.xyz);
+
+				_pixelCtx.m_wsVertexNormal = _pixelCtx.m_wsNormal = cross( normalize(dPdu), normalize(dPdv) );
+				_pixelCtx.m_wsTangent = _pixelCtx.m_wsVertexTangent = normalize( cross( World2Decal[1].xyz, _pixelCtx.m_wsNormal ) );
+				_pixelCtx.m_wsBiTangent = _pixelCtx.m_wsVertexBiTangent = cross( _pixelCtx.m_wsVertexTangent, _pixelCtx.m_wsNormal );
+				_ddx = ddx_coarse( dPdu );
+				_ddy = ddy_coarse( dPdv );
+
+				_pixelCtx.m_wsPosition = wsPos.xyz;
+
+				_pixelCtx.m_diffuseAlbedo.a = abs(msPosition.z * 2.0);	// alpha from height.
+				_pixelCtx.m_diffuseAlbedo.a *= smoothstep( -0.9, 1.0, dot( _pixelCtx.m_wsVertexNormal,  World2Decal[2].xyz ) ); // alpha from normal
+
+				// sphere projection
+				float3 rayDir = -msPosition;
+				float3 L = msPosition; //rayOrigin;
+				float a = dot(rayDir,rayDir);
+				float b = 2.0 * dot(rayDir, L);
+				float c = dot(L,L) - $decalBoxProjection.x;
+				float t0, t1;
+
+				if(!SolveQuadratic(a, b, c, t0, t1)) {
+					_pixelCtx.m_texCoords = msPosition.xyxy * 0.5 + 0.5; //planar projection
+				}
+				else {
+					float radius = dot(msPosition,msPosition);
+					float2 h0 = msPosition.xy + rayDir.xy * t0;
+					_pixelCtx.m_texCoords = h0.xyxy * 0.5 + 0.5;
+					_pixelCtx.m_diffuseAlbedo.a *= smoothstep( 1.0, $decalBoxProjection.y, radius );
+				}
+				_pixelCtx.initLayeredTexcoord();
+
+				// bmayaux (2015-06-12) We must now reconstruct view and distance
+				_pixelCtx.m_wsView = $wsCamPos - _pixelCtx.m_wsPosition;
+				_pixelCtx.m_distance = length( _pixelCtx.m_wsView );
+				_pixelCtx.m_wsView *= _pixelCtx.m_distance > 1e-8 ? 1.0 / _pixelCtx.m_distance : 0.0;
+
+				const float BC7epsilon = 0.01569; // BC7 compression is not accurate and can add some noise on alpha low value
+				_pixelCtx.m_diffuseAlbedo = max( _pixelCtx.m_diffuseAlbedo, BC7epsilon );
+
+			#endif
+		}
+		
+		void Decal_FetchDiffuseAlbedo( inout arkPixelContext_t _pixelCtx, float3 _ddx, float3 _ddy ) {
+			// ==== Sample diffuse albedo ====
+			#if $decalType == DECAL_TYPE_DEPTH_BOX
+				float4 Layer0_DiffuseTexture = $diffusemap.SampleGrad( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0], _ddx.x, _ddy.x );
+				_pixelCtx.m_diffuseAlbedo = Layer0_DiffuseTexture;
+			#else
+				float4 Layer0_DiffuseTexture = $diffusemap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] );
+				_pixelCtx.m_diffuseAlbedo = Layer0_DiffuseTexture;
+			#endif
+
+			#if $alphaTest && !$(tool/unlit)
+				clip( _pixelCtx.m_diffuseAlbedo.w - 0.5 );
+			#endif
+
+			#if $use_Layer0_ColorConstant
+				float4 layer0_ColorConstant = lerp( float4(1,1,1,1), $Layer0_ColorConstant, _pixelCtx.m_masks[0] );
+				_pixelCtx.m_diffuseAlbedo *= layer0_ColorConstant;
+			#endif
+
+			#if $(tool/unlit)
+				float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, _pixelCtx.m_diffuseAlbedo.a) ), _pixelCtx.m_diffuseAlbedo, $wireFrameBlend);
+				color *= _pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+				#if $alphaTest
+					clip( color.a - $wireFrameBlend * 0.5 );
+				#endif
+				_pixelCtx.m_diffuseAlbedo = color;
+			#endif
+
+			#if $VtxColorMultiply
+				_pixelCtx.m_diffuseAlbedo *= _pixelCtx.m_vertexColor;
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					_pixelCtx.m_diffuseAlbedo.xyz = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+		}
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		// #if $decalType != DECAL_TYPE_DEPTH_BOX && !$isShadow && !$isMasking && !$isOutline
+		// vout._worldPosition.xyz += $zbias.x * $wsCamForwardDir;
+		// vout._projPosition = mul( $viewProjectionMatrix, float4( vout._worldPosition.xyz, 1.0 ) );
+		// #endif
+
+		@sv_position = vout._projPosition;
+		
+		#if $decalType != DECAL_TYPE_DEPTH_BOX && !$isShadow && !$isMasking && !$isOutline
+			@sv_position.z -= $zbias.x;  //ARKANE (2015-06-12) - depth inversion
+		#endif
+
+		#if ($decalType != DECAL_TYPE_DEPTH_BOX) && ( $alphaTest || $isZPrePassAlpha || ( !$isShadow && !$isZPrePass ) )
+			@texcoords = vout._texcoords;
+		#endif
+
+		#if (!$(tool/unlit)) && ( $decalType != DECAL_TYPE_DEPTH_BOX && !$isShadow && !$isZPrePass ) || $decalType == DECAL_TYPE_CULL_MODEL
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		#if ($decalType == DECAL_TYPE_NONE) && !$isShadow && !$isZPrePass && !$(tool/unlit)
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+
+		#if !$isShadow && (!$isZPrePass || $isZPrePassAlpha) && !$isOutline
+			#if ( $VtxColorMultiply || (!$(tool/unlit) && $(translucency/enable) && $translucencyUseVertexColor) || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) ) )
+				@legacy_color = $vertex_color;
+			#endif
+		#endif
+
+		#if $decalType == DECAL_TYPE_CLIP_MODEL || $decalType == DECAL_TYPE_CULL_MODEL
+			// clip/cull to decal box
+			#if $useMultiInstancing
+				uint decalIndex = $instanceBufferIndex[ $instanceBufferOffset + victx._instanceID ] >> MAX_DECAL_INSTANCES_BITSHIFT;
+				$arkDecalInstance_t decalInstance = $decalBuffer[ $decalBufferOffset + decalIndex ];
+				float3x4 World2Decal = float3x4( decalInstance.m_world2DecalX, decalInstance.m_world2DecalY, decalInstance.m_world2DecalZ );
+				@vertex_iblprobeindex = decalIndex.xxx;
+			#else
+				float3x4 World2Decal = float3x4( $world2DecalMatrixX, $world2DecalMatrixY, $world2DecalMatrixZ );
+			#endif
+
+			float3 dsPosition = mul( World2Decal, float4( vout._worldPosition, 1.0 ) );
+			float4 decalBoxMin = float4( 1.0 + dsPosition.x, 1.0 + dsPosition.y, 1.0 + dsPosition.z, 0.0 );
+			float4 decalBoxMax = float4( 1.0 - dsPosition.x, 1.0 - dsPosition.y, 0.0 - dsPosition.z, 0.0 );
+
+			#if $decalType == DECAL_TYPE_CLIP_MODEL
+				@sv_clipDistance = decalBoxMin;
+				@sv_clipDistance1 = decalBoxMax;
+			#elif $decalType == DECAL_TYPE_CULL_MODEL
+				@sv_cullDistance = decalBoxMin;
+				@sv_cullDistance1 = decalBoxMax;
+			#endif
+
+			@wsNormal = vout.m_wsNormal;
+
+			#if $alphaTest || ( !$isShadow && (!$isZPrePass || $isZPrePassAlpha) )
+				@texcoords = float2( dsPosition.x * 0.5 + 0.5, dsPosition.y * 0.5 + 0.5 ).xyxy;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+
+		float3 normalDdx = 0.0;
+		float3 normalDdy = 0.0;
+		InitAndClipForDecal( pixelCtx, normalDdx, normalDdy );
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if $isShadow || ( $isZPrePass && ! $isZPrePassAlpha )
+			ClipZorShadowPass( pixelCtx );
+			return;
+		#elif $(tool/unlit)
+			LQ_FetchMasks( pixelCtx );
+			LQ_FetchDiffuseAlbedo( pixelCtx );
+
+			// =======================================================================
+			// tguichard: add the fade alpha animation for FX decals
+			#if $(fx/opt/use_for_fx)
+				pixelCtx.m_diffuseAlbedo *= $color_Adjust;
+				float alpha_fade = $(fx/opacity).Sample( $bilinearSampler, pixelCtx.m_texCoords.xy ).x;
+				alpha_fade =  saturate(  ( alpha_fade * pixelCtx.m_diffuseAlbedo.a ) - $color.x  ) * pixelCtx.m_diffuseAlbedo.a;
+				pixelCtx.m_diffuseAlbedo.a *= smoothstep ( $color.y, $color.y + $liquid_Alpha_blur, alpha_fade ) * $color.w;
+			#endif
+
+			// =======================================================================
+			//@sv_target = pixelCtx.m_diffuseAlbedo;
+			#if $isAlpha && $decalType != DECAL_TYPE_NONE && !$isMainPassAlpha
+				writePixel( pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target = pixelCtx.m_diffuseAlbedo;
+			#endif
+
+		// =======================================================================
+		// Standard Pass
+		#else
+
+			SurfaceContext	surf;
+			surf.Clear();
+			ComputeLightingResult	result;
+			result.Clear();
+
+			#if $decalType == DECAL_TYPE_DEPTH_BOX
+				float alpha = pixelCtx.m_diffuseAlbedo.a;
+			#endif
+
+			// High quality
+			#if $isZPrePassAlpha && ($decalType != DECAL_TYPE_DEPTH_BOX)
+				LQ_FetchMasks( pixelCtx );
+				Decal_FetchDiffuseAlbedo( pixelCtx, normalDdx, normalDdy );
+			#else
+				HQ_DoParallaxMapping( pixelCtx );
+				LQ_FetchMasks( pixelCtx );
+				Decal_FetchDiffuseAlbedo( pixelCtx, normalDdx, normalDdy );
+			#endif
+
+			// =======================================================================
+			// tguichard: add the fade alpha animation for FX decals
+			#if $(fx/opt/use_for_fx)
+				pixelCtx.m_diffuseAlbedo *= $color_Adjust;
+				float alpha_fade = $(fx/opacity).Sample( $bilinearSampler, pixelCtx.m_texCoords.xy ).x;
+				alpha_fade =  saturate(  ( alpha_fade * pixelCtx.m_diffuseAlbedo.a ) - $color.x  ) * pixelCtx.m_diffuseAlbedo.a;
+				pixelCtx.m_diffuseAlbedo.a *= smoothstep ( $color.y, $color.y + $liquid_Alpha_blur, alpha_fade ) * $color.w;
+			#endif
+			// =======================================================================
+
+			#if !$isZPrePassAlpha
+				LQ_FetchAndComputeNormalAndTBN( pixelCtx );
+			#endif
+
+			#if $decalType == DECAL_TYPE_CLIP_MODEL || $decalType == DECAL_TYPE_CULL_MODEL
+				#if $useMultiInstancing
+					$arkDecalInstance_t decalInstance = $decalBuffer[ $decalBufferOffset + pixelCtx.m_decalIndex ];
+					float4 decalColor = decalInstance.m_color;
+				#else
+					float4 decalColor = $color;
+				#endif
+				#if $(fx/opt/use_for_fx ) == 0
+					pixelCtx.m_diffuseAlbedo *= decalColor;
+				#endif
+
+			#elif $decalType == DECAL_TYPE_DEPTH_BOX
+				#if $(fx/opt/use_for_fx) == 0
+					pixelCtx.m_diffuseAlbedo *= $color;
+				#endif
+				pixelCtx.m_diffuseAlbedo *= alpha;
+			#endif
+
+			#if $isZPrePassAlpha
+				clip( pixelCtx.m_diffuseAlbedo.a - $DefaultAlphaTest );
+				return;
+			#else
+
+				HQ_ComputeLightingParams( pixelCtx, surf );
+				HQ_FetchMetallicSpecularFresnelAndIOR( pixelCtx, surf );
+
+				#if $decalType == DECAL_TYPE_DEPTH_BOX
+					surf.wsPositionHacked = pixelCtx.m_wsPosition;
+				#endif
+				
+				result = IntegrateLighting( surf, HIGH_QUALITY );
+
+				#if $isAlpha && !$isMainPassAlpha
+					ComputeGlassTransmittance( surf, pixelCtx, result );
+					result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+					writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				#else
+					@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+					@sv_target.w = saturate(pixelCtx.m_diffuseAlbedo.a);
+				#endif
+
+				// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+				#if defined( PC ) && !defined( RETAIL )
+					// Debug draw
+					DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+					// Write MRT info for probe rendering
+					#inlinefile <includes/resultOverrideIL.inc>
+					WRITE_IL_MRT( pixelCtx, surf, result )
+				#endif //defined( PC )
+
+			#endif
+		#endif
+	}
+}

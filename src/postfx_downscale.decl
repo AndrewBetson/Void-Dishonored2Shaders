@@ -1,0 +1,102 @@
+{
+	newstyle
+
+	parms {
+	}
+
+	state {
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		
+		float dist2( float3 v0, float3 v1 ) {
+			float3 tmp = v0 - v1;
+			return dot(tmp, tmp);
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+
+		@legacy_texcoord.xy = $vertex_texcoord + (float2(-1.0f, -1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord.zw = $vertex_texcoord + (float2( 1.0f, -1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord1.xy = $vertex_texcoord + (float2(-1.0f,  1.0f) * $(Downscale/TexelSize));
+		@legacy_texcoord1.zw = $vertex_texcoord + (float2( 1.0f,  1.0f) * $(Downscale/TexelSize));
+	}
+
+	hlsl_fp_main {
+		float4 output = 0;
+		#if $(Downscale/TYPE) == 5 //AVG_CLEAR A=0
+			float3 downscaleColor = RangeCompressColorToR11G11B10( $(Downscale/Color).rgb );
+			float threshold = 0.0;
+
+			
+			float3 c0 = $(Downscale/BufferIn).SampleLevel( $pointSampler, $legacy_texcoord.xy , 0.0).rgb;
+			float3 c1 = $(Downscale/BufferIn).SampleLevel( $pointSampler, $legacy_texcoord.zw , 0.0).rgb;
+			float3 c2 = $(Downscale/BufferIn).SampleLevel( $pointSampler, $legacy_texcoord1.xy, 0.0).rgb;
+			float3 c3 = $(Downscale/BufferIn).SampleLevel( $pointSampler, $legacy_texcoord1.zw, 0.0).rgb;
+
+			bool d0 = dist2( downscaleColor, c0 ) > threshold;
+			bool d1 = dist2( downscaleColor, c1 ) > threshold;
+			bool d2 = dist2( downscaleColor, c2 ) > threshold;
+			bool d3 = dist2( downscaleColor, c3 ) > threshold; 
+
+			c0 = d0 ? c0 : d1 ? c1 : d2 ? c2 : d3 ? c3 : 0.0;
+			c1 = d1 ? c1 : d0 ? c0 : d2 ? c2 : d3 ? c3 : 0.0;
+			c2 = d2 ? c2 : d1 ? c1 : d0 ? c0 : d3 ? c3 : 0.0;
+			c3 = d3 ? c3 : d1 ? c1 : d2 ? c2 : d0 ? c0 : 0.0;
+
+			output.rgb = (c0 + c1 + c2 + c3) * 0.25;
+			output.a = 0.0;
+		#elif $(Downscale/TYPE) == 4 //AVG_RGB A=0
+			output.rgb  = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.xy , 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.zw , 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0).rgb;
+			output *= 0.25;
+			output.a = 0.0;
+		#elif $(Downscale/TYPE) == 3 //MIN_G16R16
+			float4 s01, s02;
+			s01.xy = $(Downscale/BufferIn).SampleLevel( $pointClamp, $legacy_texcoord.xy , 0.0).rg;
+			s01.zw = $(Downscale/BufferIn).SampleLevel( $pointClamp, $legacy_texcoord.zw , 0.0).rg;
+			s02.xy = $(Downscale/BufferIn).SampleLevel( $pointClamp, $legacy_texcoord1.xy, 0.0).rg;
+			s02.zw = $(Downscale/BufferIn).SampleLevel( $pointClamp, $legacy_texcoord1.zw, 0.0).rg;
+			float4 s0102 = min(s01,s02);
+			float2 smin = min(s0102.xy,s0102.zw);
+			output = smin.xyxy;
+		#elif $(Downscale/TYPE) == 2 //MAX_ARGB
+			float4 s01, s02, s03, s04;
+			s01 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.xy , 0.0);
+			s02 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.zw , 0.0);
+			s03 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0);
+			s04 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0);
+			float4 s0102 = max(s01,s02);
+			float4 s0304 = max(s03,s04);
+			float4 smax = max(s0102,s0304);
+			output = smax;
+		#elif $(Downscale/TYPE) == 1 //MIN_ARGB
+			float4 s01, s02, s03, s04;
+			s01 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.xy , 0.0);
+			s02 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.zw , 0.0);
+			s03 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0);
+			s04 = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0);
+			float4 s0102 = min(s01,s02);
+			float4 s0304 = min(s03,s04);
+			float4 smin = min(s0102,s0304);
+			output = smin;
+		#else	//AVG_ARGB
+			output  = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.xy , 0.0);
+			output += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.zw , 0.0);
+			output += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0);
+			output += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0);
+			output *= 0.25;
+		#endif
+
+		@sv_target = output;
+	}
+}

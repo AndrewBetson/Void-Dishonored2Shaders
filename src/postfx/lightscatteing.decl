@@ -1,0 +1,122 @@
+{
+	newstyle
+
+	state {
+		depthEnable	0
+		depthWrite 0
+		depthfunc	ALWAYS
+		cull none
+		blendOp			ADD
+		alphaBlendOp	ADD
+		//Alpha-blended
+		//blend			SRC_ALPHA	ONE_MINUS_SRC_ALPHA
+		//alphaBlend		ONE			ONE_MINUS_SRC_ALPHA
+		//Additive
+		blend			ONE		ONE
+		alphaBlend		ZERO	ONE
+	}
+	
+	hlsl_prefix {
+		#include <vertex>
+		#include <intersection>
+		#include <lightContext>
+		#include <lightscattering>
+		#include <helper>
+
+		float3 ReconstructWorldSpacePositionFromLinearZ( float2 _ndcPixelPos, float _linearDepth )
+		{
+			float4 wsZFarPos = mul( $inverseViewProjectionMatrix, float4( _ndcPixelPos, 0.0, 1.0 ) );  //ARKANE (2015-06-12) - depth inversion
+			wsZFarPos /=  wsZFarPos.w;
+			float3 wsRayDir = wsZFarPos.xyz - $wsCamPos;
+			float zfar = $globalViewInfos.w;
+			return $wsCamPos + wsRayDir * ( _linearDepth / zfar );
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+
+	hlsl_fp_main {
+
+		uint halfRes = 2;
+		uint maxLights = 32;
+		uint2 _pixelAddr = uint2( $sv_position.xy * halfRes );
+		uint nNumLightsInThisTile = 0;
+		LightContext light;
+
+		//Rebuild world space position
+		float2 screenTexCoords = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture );
+		float2 texCoords =  float2(screenTexCoords.x * 2.0 - 1.0, 1.0 - screenTexCoords.y * 2.0);
+		float depth = $(water/DownsampledDepthBuffer2)[(uint2)$sv_position.xy].y;
+		float3 wsPosition = ReconstructWorldSpacePositionFromLinearZ( texCoords, depth );
+
+		//-->
+		/*
+			depth = $(atm/distanceFog/TexDepth)[_pixelAddr].x;
+			float4 ndcPos = float4( texCoords.xy, depth, 1.0 );
+			float4 wsPos = mul( $inverseViewProjectionMatrix, ndcPos );
+			wsPos.xyz /= wsPos.w;
+			
+			if($alwaysOne) {
+				wsPosition = wsPos.xyz;
+			}
+		*/
+		//<--
+
+		//Build world space View
+		float3 wsView	= $wsCamPos - wsPosition;
+		float dist	= length( wsView );
+		wsView *= dist > 1e-8 ? (1.0 / dist) : 0.0;
+		
+		float4	accumPoint = 0.0;
+		float4	accumHalfPoint = 0.0;
+		float4	accumSpot = 0.0;
+		
+		//LIGHT_TYPE_POINT 0
+		light = CreateLightContext( wsPosition, _pixelAddr, LIGHT_TYPE_POINT );
+		while( light.NextLightData( maxLights ) ) {
+			int lightIndex;
+			if (light.LightIndex(lightIndex)) {
+				light.FetchLightData(lightIndex);
+				float4 accum = ComputeLightScattering( LIGHT_TYPE_POINT, (uint2)$sv_position.xy, wsView, dist, light, AVERAGE_QUALITY ); 
+				float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+				accumPoint.rgb += accum.rgb;
+				accumPoint.a += accum.a * lightLum;
+			}
+		}
+		//LIGHT_TYPE_HALF_POINT 1
+		light = CreateLightContext( wsPosition, _pixelAddr, LIGHT_TYPE_HALF_POINT );
+		while( light.NextLightData( maxLights ) ) {
+			int lightIndex;
+			if (light.LightIndex(lightIndex)) {
+				light.FetchLightData(lightIndex);
+				float4 accum = ComputeLightScattering( LIGHT_TYPE_HALF_POINT, (uint2)$sv_position.xy, wsView, dist, light, AVERAGE_QUALITY );
+				float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+				accumHalfPoint.rgb += accum.rgb;
+				accumHalfPoint.a += accum.a * lightLum;
+			}
+		}
+		//LIGHT_TYPE_SPOT 2
+		light = CreateLightContext( wsPosition, _pixelAddr, LIGHT_TYPE_SPOT );
+		while( light.NextLightData( maxLights ) ) {
+			int lightIndex;
+			if (light.LightIndex(lightIndex)) {
+				light.FetchLightData(lightIndex);
+				float4 accum = ComputeLightScattering( LIGHT_TYPE_SPOT, (uint2)$sv_position.xy, wsView, dist, light, AVERAGE_QUALITY );
+				float lightLum = saturate( max( accum.r, max( accum.g, accum.b ) ) );
+				accumSpot.rgb += accum.rgb;
+				accumSpot.a += accum.a * lightLum;
+			}
+		}
+		//accumulate all lights
+		//and compute light-scattering density
+		float4 accumScattering;
+		accumScattering.rgb = accumPoint.rgb + accumHalfPoint.rgb + accumSpot.rgb;
+		accumScattering.a = min( 1.0, max(accumScattering.r, max( accumScattering.g, accumScattering.b ) ) );
+		float density = saturate(accumPoint.a + accumHalfPoint.a + accumSpot.a);
+
+		accumScattering.rgb *= accumScattering.a; 
+		@sv_target = float4( accumScattering.rgb, density );
+	}
+}

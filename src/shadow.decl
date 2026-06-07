@@ -1,0 +1,283 @@
+{
+	newstyle
+	hlsl_prefix {
+		#ifndef SHADOW_INCLUDED
+		#define SHADOW_INCLUDED
+		#include <shadowCommon>
+		
+		//Helper function
+		float SampleShadowMap( Texture2DArray<float> _shadowMap, float2 _baseUV, float _u, float _v, float2 _shadowMapSizeInv, uint _sliceIdx,  in float _depthCmp ) {
+			float2 uv = _baseUV + float2( _u, _v ) * _shadowMapSizeInv;
+			return _shadowMap.SampleCmpLevelZero($(shadowHardwarePCFSampler), float3(uv, _sliceIdx), _depthCmp);
+		}
+		
+		// optimized PCF, from a sample courtesy of Ignacio Castaño 
+		float SampleShadowMapOptimizedPCF( Texture2DArray<float> _shadowMap, float3 _shadowPos, uint _sliceIdx, float2 _shadowMapSize,
+										  const int _qualityLevel // Compile-time var !
+										  ) {
+											  
+			float lightDepth = _shadowPos.z;
+			float2 uv = _shadowPos.xy * _shadowMapSize; // 1 unit - 1 texel
+			float2 shadowMapSizeInv = 1.0 / _shadowMapSize;
+
+			float2 base_uv;
+			base_uv.x = floor(uv.x + 0.5);
+			base_uv.y = floor(uv.y + 0.5);
+
+			float s = (uv.x + 0.5 - base_uv.x);
+			float t = (uv.y + 0.5 - base_uv.y);
+
+			base_uv -= float2(0.5, 0.5);
+			base_uv *= shadowMapSizeInv;
+
+			float sum = 0;
+			float result = 0;
+
+	        if ( _qualityLevel == 0 ) {
+				// 2x2
+				result = _shadowMap.SampleCmpLevelZero($(shadowHardwarePCFSampler), float3(_shadowPos.xy, _sliceIdx), lightDepth);
+			} else if ( _qualityLevel == 1 ) {
+				// 3x3
+				float uw0 = (3 - 2 * s);
+				float uw1 = (1 + 2 * s);
+
+				float u0 = (2 - s) / uw0 - 1;
+				float u1 = s / uw1 + 1;
+
+				float vw0 = (3 - 2 * t);
+				float vw1 = (1 + 2 * t);
+
+				float v0 = (2 - t) / vw0 - 1;
+				float v1 = t / vw1 + 1;
+
+				sum += uw0 * vw0 * SampleShadowMap(_shadowMap, base_uv, u0, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw1 * vw0 * SampleShadowMap(_shadowMap, base_uv, u1, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw0 * vw1 * SampleShadowMap(_shadowMap, base_uv, u0, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw1 * vw1 * SampleShadowMap(_shadowMap, base_uv, u1, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+				result = sum * (1.0f / 16);
+			} else {
+				// 5x5
+				float uw0 = (4 - 3 * s);
+				float uw1 = 7;
+				float uw2 = (1 + 3 * s);
+
+				float u0 = (3 - 2 * s) / uw0 - 2;
+				float u1 = (3 + s) / uw1;
+				float u2 = s / uw2 + 2;
+
+				float vw0 = (4 - 3 * t);
+				float vw1 = 7;
+				float vw2 = (1 + 3 * t);
+
+				float v0 = (3 - 2 * t) / vw0 - 2;
+				float v1 = (3 + t) / vw1;
+				float v2 = t / vw2 + 2;
+
+				sum += uw0 * vw0 * SampleShadowMap(_shadowMap, base_uv, u0, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw1 * vw0 * SampleShadowMap(_shadowMap, base_uv, u1, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw2 * vw0 * SampleShadowMap(_shadowMap, base_uv, u2, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+																											
+				sum += uw0 * vw1 * SampleShadowMap(_shadowMap, base_uv, u0, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw1 * vw1 * SampleShadowMap(_shadowMap, base_uv, u1, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw2 * vw1 * SampleShadowMap(_shadowMap, base_uv, u2, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+																											
+				sum += uw0 * vw2 * SampleShadowMap(_shadowMap, base_uv, u0, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw1 * vw2 * SampleShadowMap(_shadowMap, base_uv, u1, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+				sum += uw2 * vw2 * SampleShadowMap(_shadowMap, base_uv, u2, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+				result = sum * (1.0f / 144);
+			}
+
+			// 7x7, for the next-next-next-generation ;)
+			/*float uw0 = (5 * s - 6);
+			float uw1 = (11 * s - 28);
+			float uw2 = -(11 * s + 17);
+			float uw3 = -(5 * s + 1);
+
+			float u0 = (4 * s - 5) / uw0 - 3;
+			float u1 = (4 * s - 16) / uw1 - 1;
+			float u2 = -(7 * s + 5) / uw2 + 1;
+			float u3 = -s / uw3 + 3;
+
+			float vw0 = (5 * t - 6);
+			float vw1 = (11 * t - 28);
+			float vw2 = -(11 * t + 17);
+			float vw3 = -(5 * t + 1);
+
+			float v0 = (4 * t - 5) / vw0 - 3;
+			float v1 = (4 * t - 16) / vw1 - 1;
+			float v2 = -(7 * t + 5) / vw2 + 1;
+			float v3 = -t / vw3 + 3;
+
+			sum += uw0 * vw0 * SampleShadowMap(_shadowMap, base_uv, u0, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw1 * vw0 * SampleShadowMap(_shadowMap, base_uv, u1, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw2 * vw0 * SampleShadowMap(_shadowMap, base_uv, u2, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw3 * vw0 * SampleShadowMap(_shadowMap, base_uv, u3, v0, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+			sum += uw0 * vw1 * SampleShadowMap(_shadowMap, base_uv, u0, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw1 * vw1 * SampleShadowMap(_shadowMap, base_uv, u1, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw2 * vw1 * SampleShadowMap(_shadowMap, base_uv, u2, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw3 * vw1 * SampleShadowMap(_shadowMap, base_uv, u3, v1, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+			sum += uw0 * vw2 * SampleShadowMap(_shadowMap, base_uv, u0, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw1 * vw2 * SampleShadowMap(_shadowMap, base_uv, u1, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw2 * vw2 * SampleShadowMap(_shadowMap, base_uv, u2, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw3 * vw2 * SampleShadowMap(_shadowMap, base_uv, u3, v2, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+			sum += uw0 * vw3 * SampleShadowMap(_shadowMap, base_uv, u0, v3, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw1 * vw3 * SampleShadowMap(_shadowMap, base_uv, u1, v3, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw2 * vw3 * SampleShadowMap(_shadowMap, base_uv, u2, v3, shadowMapSizeInv, _sliceIdx, lightDepth);
+			sum += uw3 * vw3 * SampleShadowMap(_shadowMap, base_uv, u3, v3, shadowMapSizeInv, _sliceIdx, lightDepth);
+
+			result = sum * (1.0f / 2704);
+			*/
+			
+			return saturate(result);
+		}
+
+		float SampleOmniShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, const int _quality ) {
+			float4 shadowMapPos = ComputeShadowOffset( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir );
+			uint sliceIndex = SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo);
+			
+			switch( _quality ) {
+			case HIGH_QUALITY :
+				{
+					return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions),
+														$shadowFilteringQuality ); // compile-time option
+				}
+				break;
+			case AVERAGE_QUALITY:
+				{
+					#if QUALITY <= 0
+						return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 0 );
+					#else
+						return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 1 );				
+					#endif
+				}
+				break;
+			case LOW_QUALITY:
+				{
+					return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 0 );
+				}
+				break;
+			}
+			return 1.0;
+		}
+		
+		float SampleOmniShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsLightDir, const int _quality  ) {
+			float3 wsNormalFake = float3(0,1,0);
+			return SampleOmniShadowMap( _shadowMapInfo, _wsPosition, wsNormalFake, _wsLightDir, _quality );
+		}
+		
+		float SampleSpotShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, float3 _wsNormal, float3 _wsLightDir, const int _quality ) {
+			float4 shadowMapPos = ComputeShadowOffset( _shadowMapInfo, _wsPosition, _wsNormal, _wsLightDir );
+			uint sliceIndex = SHADOW_SLICE_INDEX(_shadowMapInfo.mInfo);
+			
+			switch( _quality ) {
+			case HIGH_QUALITY :
+				{
+					return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions),
+														$shadowFilteringQuality ); // compile-time option
+				}
+				break;
+			case AVERAGE_QUALITY:
+				{
+					#if QUALITY <= 0
+						return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 0 );
+					#else
+						return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 1 );				
+					#endif
+				}
+				break;
+			case LOW_QUALITY:
+				{
+					return SampleShadowMapOptimizedPCF( $(shadowMapAtlas), shadowMapPos.xyz, sliceIndex, $(shadowMapAtlasSliceDimensions), 0 );
+				}
+				break;
+			}
+			return 1.0;
+		}
+
+		float SampleSpotShadowMap( $(tlf/shadow_t) _shadowMapInfo, float3 _wsPosition, const int _quality ) {
+			float3 wsNormalFake = float3(0,1,0);
+			float3 wsLitghDirFake = float3(0,0,1);
+			return SampleSpotShadowMap( _shadowMapInfo, _wsPosition, wsNormalFake, wsLitghDirFake, _quality );
+		}
+
+		float SampleDirectionalShadowMap( float4 _shadowTexCoord, int _sliceIndex, const int _quality ) {
+			// TEMPORARILY REPLACE BY AN IF/ELSEIF TO AVOID A PS4 INTERNAL COMPILER ERROR
+			/*switch( _quality ) {
+			case HIGH_QUALITY:
+				return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions),
+														$shadowFilteringQuality ); // compile-time option
+				break;
+			case AVERAGE_QUALITY:
+				#if QUALITY <= 0
+					return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 0 );
+				#else
+					return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 1 );				
+				#endif
+				break;
+			case LOW_QUALITY:
+					return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 0 );
+				break;
+			default:
+					return 0.0;
+				break;
+			}*/
+
+			if( _quality == HIGH_QUALITY ){
+				return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions),
+														$shadowFilteringQuality ); // compile-time option
+			} else if ( _quality == AVERAGE_QUALITY ) {
+					#if QUALITY <= 0
+						return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 0 );
+					#else
+						return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 1 );				
+					#endif
+			} else if ( _quality == LOW_QUALITY ) {
+					return SampleShadowMapOptimizedPCF( $(lightDepthCompareMap), _shadowTexCoord.xyz, _sliceIndex, $(parallelShadowMapSliceDimensions), 0 );
+			} else {				
+				return 0.0;
+			}
+
+		}
+
+		float	ComputeParallelShadow( const float3 _wsPosition, const float3 _wsNormal, out float4x4 _worldToShadowMat, out float4x4 _shadowToWorldMat, out uint _sliceIdxOut, const int _quality ) {
+			/// BE CAREFUL: when this function is called from screenShadow, _wsNormal is not available !
+			//              This doesn't matter has normal offset is disabled within this context, but DO NOT use the variable arg for something else !
+			float4	wsPos = float4( _wsPosition, 1.0 );
+			float	parallelShadow = 1.0;
+			#if $parallelLightHasShadow
+				
+
+				// select slice
+				float	viewZ = -dot( wsPos, $viewMatrix[2] );
+				float4	slicesFar = $parallelLightSliceFars; 
+				float4	slicesMask = step( slicesFar, viewZ );
+				uint	sliceIndex = uint( slicesMask.x + slicesMask.y + slicesMask.z + slicesMask.w );
+				_worldToShadowMat = $shadowProjections[sliceIndex];
+
+				#if SHADOW_INVERSE_TRANSFORM_REQUIRED
+					_shadowToWorldMat = $shadowInvProjections[sliceIndex];
+				#else
+					_shadowToWorldMat = _worldToShadowMat; //just to avoid the compiler from complaining about unitialized output variable
+				#endif
+
+				float4	shadowCoords = ComputeShadowOffset($shadowProjections[sliceIndex], _wsPosition, _wsNormal, $(atm/sky/SunDirection), true /*isDirectional*/ );	 //todo optimize: we may use only 2 or 3 rows of the matrices if changing here the 'majorness' and revert the mul (we could for directional as the projection is orthogonal => invert = transpose, but probably not for spot/omnis)							
+				parallelShadow = SampleDirectionalShadowMap( shadowCoords, sliceIndex, _quality );
+				_sliceIdxOut = sliceIndex;
+			#endif
+
+			//Account for cloud shadowing
+			#if SHADOW_USE_TAPS != 1 && !$(translucency/enable)
+				parallelShadow *= GetFastCloudShadowing( _wsPosition );
+			#endif
+
+			return parallelShadow;
+		}
+
+		#endif // #ifndef SHADOW_INCLUDED
+	}
+}

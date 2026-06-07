@@ -1,0 +1,37 @@
+{
+	newstyle
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+		cull none
+	}
+	
+	hlsl_prefix {
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+	}
+	hlsl_fp_main {
+
+	
+		float2 UV = screenPosToTexcoord( $sv_position.xy + $(subpixelOffset).xy, $positionToViewTexture);
+		float2	dUV = $(env/bloom/veil_size) * $(PostFX/Bloom/dUV).xy;
+		float2	UVl = min( UV - dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+		float2	UVr = min( UV + dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+
+		// Used coefficients from http://www.gamerendering.com/2008/10/11/gaussian-blur-filter-shader/
+		float4	Sum  = 0.18 * $viewColorMap.SampleLevel( $linearMirror, UV , 0.0 );
+				Sum += 0.15 * $viewColorMap.SampleLevel( $linearMirror, UVl, 0.0 );	UVl = min( UV - dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.15 * $viewColorMap.SampleLevel( $linearMirror, UVr, 0.0 );	UVr = min( UV + dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.12 * $viewColorMap.SampleLevel( $linearMirror, UVl, 0.0 );	UVl = min( UV - dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.12 * $viewColorMap.SampleLevel( $linearMirror, UVr, 0.0 );	UVr = min( UV + dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.09 * $viewColorMap.SampleLevel( $linearMirror, UVl, 0.0 );	UVl = min( UV - dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.09 * $viewColorMap.SampleLevel( $linearMirror, UVr, 0.0 );	UVr = min( UV + dUV.xy, $resolutionScale.xy-$positionToViewTexture.zw );
+				Sum += 0.05 * $viewColorMap.SampleLevel( $linearMirror, UVl, 0.0 );
+				Sum += 0.05 * $viewColorMap.SampleLevel( $linearMirror, UVr, 0.0 );
+
+		@sv_target = Sum;
+	}
+}

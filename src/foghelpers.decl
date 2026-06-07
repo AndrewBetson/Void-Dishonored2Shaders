@@ -1,0 +1,327 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <atm/common>
+		#include <shadow>
+
+		//=============================================================================
+		// HELPERS - WORLD FOG - POST-PROCESS (OPAQUE PRIMITIVES)
+		//=============================================================================
+		void ComputeDistance(float2 texCoords, inout float3 wsViewDir, out float Distance, out float DistanceVertical, out float DistanceScene, out float Zscene) {
+			Zscene = $(atm/distanceFog/TexDepthHalf).SampleLevel( $linearClamp, texCoords, 0.0 ).y; //x=min y=max
+			float ZtoDistance = length( wsViewDir );
+
+			// substract interior volume contribution
+			Zscene -=  $(atm/worldDistanceFog/interiorTexture).SampleLevel( $linearClamp, texCoords, 0.0 ).x;
+			
+			wsViewDir /= ZtoDistance;
+
+			// We want to use distance to avoid a fog changing with camera orientation
+			DistanceScene = ZtoDistance * Zscene;
+			//Fog Distance - Normalized distance
+			Distance = saturate( (DistanceScene - $(atm/worldDistanceFog/InterpolationInfos).x) * $(atm/worldDistanceFog/InterpolationInfos).y );
+			//Fog Vertical - Normalized distance
+			DistanceVertical = saturate( (DistanceScene - $(atm/worldVerticalFog/InterpolationInfos).x) * $(atm/worldVerticalFog/InterpolationInfos).y );
+		}
+
+		float4 ComputeDistanceFogColor( float Distance ) {
+			float4 FogColor;
+			FogColor = lerp( $(atm/worldDistanceFog/ColorStart), $(atm/worldDistanceFog/ColorEnd), Distance );
+			FogColor.a = $(atm/worldDistanceFog/colorLUT).SampleLevel( $bilinearClamp, float2( Distance, 0.5f ), 0 ).x;
+
+			return FogColor;
+		}
+
+		float4 ComputeDistanceFog(float Distance) {
+			// Compute fog color
+			float4	FogColor = ComputeDistanceFogColor( Distance );
+
+			// Compute extinction
+			float	ExtinctionCoeff = $(atm/worldDistanceFog/InterpolationInfos).z;
+			FogColor.a = 1.0 - exp( -ExtinctionCoeff * FogColor.a );
+
+			return FogColor;
+		}
+
+		float4 ComputeWorldDistanceFog(float Distance) {
+			#if $(atm/worldDistanceFog/EnabledDistanceFogOption)
+				return ComputeDistanceFog(Distance);
+			#else
+				return float4(0.0,0.0,0.0,0.0);
+			#endif
+		}
+
+		float4 ComputeVerticalFog(float3 View, float Distance, float DistanceScene) {
+			float4 FogColor;
+			// Compute horizontal opacity
+			FogColor.a = 1.0 - exp( -$(atm/worldVerticalFog/InterpolationInfos).z * Distance );
+
+			// Remind the world position is Z-up (not Y-up)!
+			// Account for exponential density falloff
+			float	Altitude = $wsCamPos.z - $(atm/worldVerticalFog/VerticalStartDistance);
+			float	signView = sign( View.z );
+			signView = step( 0.1f, signView ) * 2.f - 1.f;
+			float	dy = View.z + ( 0.00001f * signView );
+			float	HitDistance = DistanceScene;
+			float	Falloff = $(atm/worldVerticalFog/DensityFalloffSpeed); //vertical extinction
+
+			// Compute extinction
+			//from http://www.iquilezles.org/www/articles/fog/fog.htm
+			// this version has precision problem when x is big with exp(x)
+			// if x < -200 => exp(x) == 0
+			//dy *= Falloff;	// We're only going to use dy multiplied by falloff after that anyway...
+			//float	TotalDensity = (ExtinctionCoeff / dy) * exp( -Falloff * Altitude ) * (1.0 - exp( -dy * HitDistance ));
+
+			float	hitAltitude = Altitude + HitDistance * dy;
+			float	TotalDensity = (exp( -Falloff * Altitude ) - exp( -Falloff * hitAltitude )) / (Falloff * dy);
+			float	Extinction = 1.0 - saturate( exp( -TotalDensity ) );
+
+			float	planeAltitude_Start = $(atm/worldVerticalFog/VerticalStartDistance);
+			float	planeAltitude_End = $(atm/worldVerticalFog/VerticalEndDistance);
+			float	normalizedHeight = saturate( (hitAltitude - planeAltitude_Start) / (planeAltitude_End - planeAltitude_Start) );
+			FogColor.rgb = Extinction * lerp( $(atm/worldVerticalFog/ColorStart), $(atm/worldVerticalFog/ColorEnd), normalizedHeight ).rgb;
+			FogColor.a *= Extinction;
+
+			return FogColor;
+		}
+
+		float4 ComputeWorldVerticalFog(float3 wsViewDir, float Distance, float DistanceScene) {
+			#if $(atm/worldVerticalFog/EnableVaryingDensityOption)
+				return ComputeVerticalFog(wsViewDir, Distance, DistanceScene);
+			#else
+				return float4(0.0,0.0,0.0,0.0);
+			#endif
+		}
+
+		float3 ComputeScatteringIntensity( float Phase, float3 Color ) {
+			float intensity = 0.0;
+			intensity = $(atm/worldFog/ScatteringIntensity) * Phase;
+			return Color * intensity;
+		}
+
+		//=============================================================================
+		// HELPERS - WORLD FOG - ALPHA PRIMITIVES
+		//=============================================================================
+		float4 ComputeWorldFog(float3 viewDir, float viewDistance, float2 UV) {
+			if( dot($(atm/alphaFog/worldType), 1.0) <= 0.0 )
+				return float4(0.0,0.0,0.0,0.0);
+
+			bool enableDistanceFog = $(atm/alphaFog/worldType).x > 0;
+			bool enableVerticalFog = $(atm/alphaFog/worldType).z > 0;
+			bool enableScattering = $(atm/alphaFog/worldType).y > 0;
+
+			float ZtoDistance =  length( viewDir );
+			viewDir /= ZtoDistance;
+
+			//Compute distance Fog
+			float4 distanceFog = float4(0.0,0.0,0.0,0.0);
+			if (enableDistanceFog) {
+				float Distance = saturate( (viewDistance - $(atm/worldDistanceFog/InterpolationInfos).x) * $(atm/worldDistanceFog/InterpolationInfos).y );
+				distanceFog = ComputeDistanceFog(Distance);
+			}
+
+			//Compute vertical Fog
+			float4 verticalFog = float4(0.0,0.0,0.0,0.0);
+			if(enableVerticalFog) {
+				float Distance = saturate( (viewDistance - $(atm/worldVerticalFog/InterpolationInfos).x) * $(atm/worldVerticalFog/InterpolationInfos).y );
+				verticalFog =  ComputeVerticalFog(viewDir, Distance, viewDistance);
+			}
+
+			//Mix Fogs
+			float4 MixedColor = lerp( distanceFog, verticalFog, verticalFog.a );
+
+			//Compute sun scattering
+			//TODO
+
+			if( $(atm/worldFogTurbulence/useTurbulence) ) {
+				float dynamicCanvasValue = $dynamicCanvas.SampleLevel( $bilinearSampler, UV, 0.0 ).x;
+				float range = $(atm/worldFogTurbulence/EndDistance).x - $(atm/worldFogTurbulence/StartDistance).x;
+				float dyncanFactor = saturate( (viewDistance - $(atm/worldFogTurbulence/StartDistance).x) / (range) );
+
+				float3 noisyColor = lerp(MixedColor.rgb, $(atm/worldDistanceFog/ColorEnd).rgb, dynamicCanvasValue);
+				float3 finalColor = lerp(MixedColor.rgb, noisyColor.rgb, dyncanFactor);
+				MixedColor = float4(finalColor, MixedColor.a );
+			}
+
+			return MixedColor;
+		}
+
+		//=============================================================================
+		// HELPERS - VOLUME FOG
+		//=============================================================================
+		float4 ComputeVolumeFog(float3 viewDir, float viewDistance) {
+			if($(atm/alphaFog/volumeType).x <= 0)
+				return float4(0.0,0.0,0.0,0.0);
+
+			// Compute distance
+			viewDistance  = min( viewDistance, $(atm/alphaFog/ZMinMaxAcc).y );
+			viewDistance -= max(0.0,$(atm/alphaFog/ZMinMaxAcc).x);
+			float	Distance = saturate( (viewDistance - $(env/atm/distanceFog/InterpolationInfos).x) * $(env/atm/distanceFog/InterpolationInfos).y );	// Normalized distance
+
+			// Compute fog color
+			float4	FogColor;
+			FogColor.rgb = lerp( $(env/atm/distanceFog/ColorStart).xyz, $(env/atm/distanceFog/ColorEnd).xyz, Distance );
+			FogColor.a = 1.0;
+
+			//#if $(atm/alphaFog/EnableScattering) || $(atm/alphaFog/EnableVaryingDensity)
+			float	ZtoDistance = 0.0;
+			float3	View = float(0.0).xxx;
+			if($(atm/alphaFog/volumeType).y > 0 || $(atm/alphaFog/volumeType).z > 0 )
+			{
+				ZtoDistance = length(viewDir);
+				View = viewDir / ZtoDistance;
+			}
+
+			// Compute extinction
+			float	ExtinctionCoeff = $(env/atm/distanceFog/InterpolationInfos).z;
+
+			//#if $(atm/alphaFog/EnableVaryingDensity)
+			float	Extinction = 1.0;
+			if($(atm/alphaFog/volumeType).z > 0)
+			{
+				// Account for exponential density falloff
+				float	StartZ = $(atm/alphaFog/ZMinMaxAcc).x < $(atm/alphaFog/ZMinMaxAcc).y ? $(atm/alphaFog/ZMinMaxAcc).x : 0.0;		// Start at 0 if inside the volume
+				float	StartDistance = ZtoDistance * StartZ;
+
+				float	CameraAltitude = $wsCamPos.z;
+				float	Altitude = CameraAltitude + StartDistance * View.z;
+				float	signView = sign( View.z );
+				signView = step( 0.1f, signView ) * 2.f - 1.f;
+				float	dy = View.z + ( 0.00001f * signView );
+
+				Distance *= $(env/atm/distanceFog/DensityFactor);
+
+				float	Falloff = $(env/atm/distanceFog/DensityFalloffSpeed);
+
+				// this version has precision problem when x is big with exp(x)
+				// if x < -200 => exp(x) == 0
+				//dy *= Falloff;	// We're only going to use dy multiplied by falloff after that anyway...
+				//float	TotalDensity = (ExtinctionCoeff / dy) * exp( -Falloff * Altitude ) * (1.0 - exp( -dy * Distance ));
+
+				//this version is better
+				float	TotalDensity = ExtinctionCoeff * (exp( -Falloff * Altitude ) - exp( -Falloff * (Altitude + dy * Distance) )) / (Falloff * dy);
+				Extinction = 1.0 - saturate( exp( -TotalDensity ) );
+			}
+			else
+			{
+				Extinction = 1.0 - saturate( exp( -ExtinctionCoeff * Distance ) );
+			}
+
+			//#if $(atm/alphaFog/EnableScattering)
+			if($(atm/alphaFog/volumeType).y > 0)
+			{
+				// Change fog color based on angle with Sun direction
+				float	PhaseAngle = dot( $(env/atm/distanceFog/ScatteringDirection), View );
+				float	Phase = PhaseFunctionMie( PhaseAngle, $(env/atm/distanceFog/ScatteringPhase) );
+				FogColor.rgb += $(env/atm/distanceFog/ScatteringIntensity) * Phase * $(env/atm/distanceFog/ScatteringColor);
+			}
+
+			// Alpha-pre multiply
+			FogColor.a *= Extinction;
+			return FogColor;
+		}
+
+		//=============================================================================
+		// HELPERS - FOG
+		//=============================================================================
+		float3 ComputeFogWithLightScattering(float3 finalizedColor, float3 accumScattering, in arkPixelContext_t _pixelCtx) {
+			#if $isAlpha && !$(tool/unlit) && !$isMainPassAlpha
+				//compute UV
+				float2	UV = screenPosToTexcoord( _pixelCtx.m_ssPosition.xy, $positionToViewTexture, $resolutionScale );
+
+				//fetch fog
+				float4 precomputedFog;
+				precomputedFog = $(atm/worldFog/FogGodRaysLightScattering).SampleLevel( $bilinearClamp, UV, 0 );
+
+				float3 view = -_pixelCtx.m_wsView;
+				float viewDistance = _pixelCtx.m_ssPosition.w;
+				float4 worldFog = ComputeWorldFog(view, viewDistance, UV);
+				float4 volumeFog = ComputeVolumeFog(view, viewDistance);
+				worldFog.rgb *= worldFog.a;
+
+				//Alpha-blended fogs
+				//blend			SRC_ALPHA	ONE_MINUS_SRC_ALPHA
+				//alphaBlend	ONE			ONE_MINUS_SRC_ALPHA
+				float4 mixedFog;
+				mixedFog.rgb  = volumeFog.rgb * volumeFog.a + worldFog.rgb * ( 1.0 - volumeFog.a );
+				mixedFog.a    = saturate( volumeFog.a + worldFog.a * ( 1.0 - volumeFog.a ) );
+
+				//Additive light-scattering
+				//blend			ONE		ONE
+				//alphaBlend	ZERO	ONE
+				mixedFog.rgb += accumScattering;
+
+				//Blend precomputed fog and computed fog based on depth ratio
+				const float zNear = $globalViewInfos.z;
+				#if $isParticle && !$(fx/opt/use_mesh)
+					float ratioParam = _pixelCtx.m_ssPosition.w / (zNear + _pixelCtx.m_opaqueZscene);
+					mixedFog = lerp( mixedFog, precomputedFog, ratioParam );
+				#else
+					float ratioParam = ( 1.0 - _pixelCtx.m_ssPosition.z ) / ( 1.0001 - _pixelCtx.m_opaqueZproj);
+					mixedFog = lerp( mixedFog, precomputedFog, ratioParam );
+				#endif
+
+				//Composite
+				//blend			ONE		ONE_MINUS_SRC_ALPHA
+				//alphaBlend	ZERO	ONE
+				return  mixedFog.rgb + finalizedColor.rgb * ( 1.0 - mixedFog.a );
+			#else
+				return finalizedColor;
+			#endif
+		}
+
+		float4 ComputeFogPerVertex(float4 csPosition, float3 wsPosition) {
+			#if $isAlpha && !$(tool/unlit) && !$isMainPassAlpha
+				float2 coords = csPosition.xy / csPosition.w;
+				coords = coords * 0.5 + 0.5;
+				coords.y = 1.0 - coords.y;
+				float4 precomputedFog = $(atm/worldFog/FogGodRaysLightScattering).SampleLevel( $bilinearClamp, coords * $resolutionScale, 0 );
+
+				float viewDistance = csPosition.w;
+				float3 wsView = wsPosition - $wsCamPos;
+				float4 worldFog = ComputeWorldFog(wsView, viewDistance, coords);
+				float4 volumeFog = ComputeVolumeFog(wsView, viewDistance);
+				worldFog.rgb *= worldFog.a;
+
+				//Alpha-blended fogs
+				//blend			SRC_ALPHA	ONE_MINUS_SRC_ALPHA
+				//alphaBlend	ONE			ONE_MINUS_SRC_ALPHA
+				float4 mixedFog;
+				mixedFog.rgb  = volumeFog.rgb * volumeFog.a + worldFog.rgb * ( 1.0 - volumeFog.a );
+				mixedFog.a    = saturate( volumeFog.a + worldFog.a * ( 1.0 - volumeFog.a ) );
+
+				//Blend precomputed fog and computed fog based on depth ratio
+				float opaqueZproj = $(fx/depthFull).SampleLevel( $linearClamp, coords * $resolutionScale, 0.0 ).x;
+				const float zNear = $globalViewInfos.z;
+				#if $(fx/opt/use_mesh)
+					float ratioParam = saturate( ( 1.0 - csPosition.z ) / ( 1.0001 - opaqueZproj) );
+					mixedFog = lerp( mixedFog, precomputedFog, ratioParam );
+				#else
+					float opaqueZscene = ComputeLinearZ(opaqueZproj);
+					float ratioParam = saturate( csPosition.w / (zNear + opaqueZscene) );
+					mixedFog = lerp( mixedFog, precomputedFog, ratioParam );
+				#endif
+
+				return mixedFog;
+			#else
+				return 0;
+			#endif
+		}
+
+		float3 ComputeFogFromVertex(float3 finalizedColor, float3 accumScattering, float4 mixedFog, in arkPixelContext_t _pixelCtx) {
+			#if $isAlpha && !$(tool/unlit) && !$isMainPassAlpha
+				//Additive light-scattering
+				//blend			ONE		ONE
+				//alphaBlend	ZERO	ONE
+				mixedFog.rgb += accumScattering;
+
+				//Composite
+				//blend			ONE		ONE_MINUS_SRC_ALPHA
+				//alphaBlend	ZERO	ONE
+				return  mixedFog.rgb + finalizedColor.rgb * ( 1.0 - mixedFog.a );
+			#else
+				return finalizedColor;
+			#endif
+		}
+	}
+}

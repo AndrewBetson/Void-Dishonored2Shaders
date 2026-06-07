@@ -1,0 +1,75 @@
+{
+	newstyle
+	options {
+	}
+	hlsl_prefix {
+
+		#include <helper>
+
+//		static const float	SAMPLES_FACTOR = 2.0;		// A global factor to affect the global amount of samples to use
+static const float	SAMPLES_FACTOR = 4.0;		// A global factor to affect the global amount of samples to use
+		static const float	EPS = 0.2;					// The epsilon at which we perform the computations
+
+		// Accumulates N samples from the cube map using stratified sampling
+		//	_Alpha, the aperture half angle
+		//	_wsDirection, the direction of the specular lobe's main axis
+		//	_wsAxisX/Y, the orthogonal plane to the lobe's axis
+		//	_SamplesCountTheta, amount of samples along the latitude
+		//
+		float4	ImportanceSample( float _Alpha, float3 _wsDirection, float3 _wsAxisX, float3 _wsAxisY, uint _SamplesCountTheta, float _RandSeed=0.0 )
+		{
+			float	m = min( 1.0, tan(_Alpha) / sqrt( -log( EPS / cos(_Alpha) ) ) );
+			float	dTheta = _Alpha / _SamplesCountTheta;
+
+			float4	Accum = 0.0;
+			for ( uint ThetaIndex=0; ThetaIndex < _SamplesCountTheta; ThetaIndex++ )
+			{
+				// Here, the amount of samples along phi depends on the radius of the lobe at average theta
+				float	AverageTheta = sqrt( -m*m * log( (ThetaIndex + 0.5) / _SamplesCountTheta ) );
+				float	Radius = sin( AverageTheta );
+				uint	SamplesCountPhi = ceil( TWOPI * Radius / dTheta );
+				float	dPhi = TWOPI / SamplesCountPhi;
+
+				for ( uint PhiIndex=0; PhiIndex < SamplesCountPhi; PhiIndex++ )
+				{
+					float	RandIndex = _RandSeed + 2*(PhiIndex*_SamplesCountTheta+ThetaIndex);
+					float	Theta = sqrt( -m*m * log( max( 1e-6, (ThetaIndex + 1.0 - rand( RandIndex+0 )) / _SamplesCountTheta ) ) );	// According to ward's monte-carlo sampling method (stratified version, not importance sampling!)
+					float	Phi = (PhiIndex + rand( RandIndex+1 )) * dPhi;
+
+					float	SinTheta, CosTheta;
+					sincos( Theta, SinTheta, CosTheta );
+					float	SinPhi, CosPhi;
+					sincos( Phi, SinPhi, CosPhi );
+
+					float3	tsSamplingDirection = float3(
+							SinTheta * CosPhi,
+							SinTheta * SinPhi,
+							CosTheta
+						);
+
+					// Compute world space sampling direction
+					float3	wsSamplingDirection = tsSamplingDirection.x * _wsAxisX + tsSamplingDirection.y * _wsAxisY + tsSamplingDirection.z * _wsDirection;
+
+					// Sample the cube map and weight by the reflectance
+					float	Reflectance = exp( -square( tan( Theta ) / m ) );	// Gaussian lobe reflectance in that direction, normalized against amount of samples taken
+					float	NdotL = CosTheta;
+					float	SolidAngle = SinTheta * dTheta * dPhi;
+					float4	L_omega = $(cubeMap/generateMips/sourceMip).SampleLevel( $anisotropicSampler, wsSamplingDirection, 0.0 );
+
+//###
+//L_omega = min( 1.0, L_omega );
+
+
+					Accum += Reflectance * L_omega * NdotL * SolidAngle;
+				}
+			}
+
+			// Normalize samples' reflectance
+			Accum *= 1.0 / (PI * m * m);	// Ward normalizer
+
+// Alpha mip 1 = 0.0130312499
+// m = 0.01027270933332858064644200064383
+			return Accum;
+		}
+	}
+}

@@ -1,0 +1,263 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 16
+		NUMTHREADY 16
+		NUMTHREADZ 1
+	}
+
+	hlsl_prefix {
+		#include <PostFX/ToneMapping/common>
+		#include <PostFX/Luminance/common>
+		#include <arkFiltering>
+		#include <colorimetry>
+		#include <helper>
+
+		#define GROUP_X						16
+		#define GROUP_Y						16
+		#define BUFFER_X					(GROUP_X + 2)
+		#define BUFFER_Y					(GROUP_Y + 2)
+		#define RENAMED_GROUP_Y				((GROUP_X * GROUP_Y) / BUFFER_X)
+
+		#define TAA_DITHER					0.3	// 0-1
+		#define TAA_CLAMPING_FACTOR			1.0	// larger values produces less clamping, but introduces ghosting
+		#define TAA_MIN_LUMA				0.1
+		
+		#if defined( DURANGO )
+			#define __XBOX_CONTROL_NONIEEE 0
+			#define __XBOX_PRESERVE_MAD_LEGACY  1
+			#define __XBOX_DISABLE_NONIEEE_OPTIMIZATION_MASK0 7
+		#endif
+
+		groupshared float4 s_ColorsAndLengths[BUFFER_Y][BUFFER_X];
+		groupshared float2 s_MotionVectors[BUFFER_Y][BUFFER_X];
+
+		float3 ApproximativeToneMap( float3 x, float exposure )
+		{
+			x *= exposure;
+			return ToneMap( x );
+		}
+
+		float3 ApproximativeInverseToneMap( float3 x, float exposure )
+		{
+			x = InverseToneMap( x );
+			x /= exposure;
+			return x;
+		}
+
+		void Bicubic2DCatmullRom( in float2 UV, in float2 InvSize, out float2 Pos[3], out float2 Weight[3] )
+		{
+			float2 tc = floor( UV - 0.5 ) + 0.5;
+			float2 f = UV - tc;
+			float2 f2 = f * f;
+			float2 f3 = f2 * f;
+
+			float2 w0 = f2 - 0.5 * (f3 + f);
+			float2 w1 = 1.5 * f3 - 2.5 * f2 + 1;
+			float2 w3 = 0.5 * (f3 - f2);
+			float2 w2 = 1 - w0 - w1 - w3;
+
+			Weight[0] = w0;
+			Weight[1] = w1 + w2;
+			Weight[2] = w3;
+
+			Pos[0] = tc - 1;
+			Pos[1] = tc + w2 / Weight[1];
+			Pos[2] = tc + 2;
+
+			Pos[0] *= InvSize;
+			Pos[1] *= InvSize;
+			Pos[2] *= InvSize;
+		}
+
+#if !$taaR11G11B10
+	// IMPORTANT: YCoCg very rarely produces strange gray outlines for some luma-chroma combinations...
+	// it doesn't look incorrect, but you can feel that something goes wrong...
+	#define COLOR_TO(c)						RGB2YCoCg(c)
+	#define COLOR_FROM(c)					YCoCg2RGB(c)
+	#define COLOR_LUMA(c)					c.x
+	#define COLOR_SCALE_LUMA(c, scale)		c.x *= 1.0 + scale * (1.0 - c.x)
+#else
+	#define COLOR_TO(c)						c
+	#define COLOR_FROM(c)					c
+	#define COLOR_LUMA(c)					dot(c, LUMINANCE)
+	#define COLOR_SCALE_LUMA(c, scale)		c *= 1.0 + scale * (1.0 - COLOR_LUMA(c))
+#endif
+
+		void Preload(int2 sharedID, int2 globalID, float exposure)
+		{
+			float3 color = $viewColorMap[globalID].xyz;
+			color = ApproximativeToneMap(color, exposure);
+			color = COLOR_TO(color);
+
+			float2 motion = $motionVectors[globalID].xy;
+			float motionLength = dot(motion, motion);
+
+			s_ColorsAndLengths[sharedID.y][sharedID.x] = float4(color, motionLength);
+			s_MotionVectors[sharedID.y][sharedID.x] = motion;
+		}
+	}
+
+	hlsl_cp_main {
+	
+		int2 localID = int2($sv_groupThreadID.xy);
+		int2 globalID = int2($sv_dispatchThreadID.xy);
+		uint threadID = $sv_groupIndex;
+		
+		// Rename the 16x16 group into a 18x14 group + 4 idle threads in the end
+
+		float linearID = localID.y * GROUP_X + localID.x;
+		linearID = (linearID + 0.5) / float(BUFFER_X);
+		
+		int2 newID;
+		newID.y = int( floor(linearID) );
+		newID.x = int( floor(frac(linearID) * BUFFER_X) );
+		
+		int2 groupBase = globalID - localID - 1;
+		
+		// Compute exposure from one thread and store in shared memory
+		
+		#if $(PostFX/AutoExposure/enable)
+			// Histogram Auto-exposure
+			$(PostFX/Luminance/autoExposure_t)	Adaptation = ReadAutoExposureParameters();
+			float exposure = Adaptation.EngineLuminanceFactor * exp2( -$(PostFX/Luminance/customEVBias).x );
+		#else
+			float exposure = ComputeExposureFactor();	// Only use the EV settings provided by the env (default is 1)
+		#endif
+
+		// Preload the colors and motion vectors into shared memory
+
+		if( newID.y < RENAMED_GROUP_Y )
+			Preload(newID, groupBase + newID, exposure);
+
+		newID.y += RENAMED_GROUP_Y;
+
+		if( newID.y < BUFFER_Y )
+			Preload(newID, groupBase + newID, exposure);
+
+		GroupMemoryBarrierWithGroupSync();
+
+		// Calculate the color distribution and find the longest MV in the neighbourhood
+
+		float3 colorMoment1 = 0;
+		float3 colorMoment2 = 0;
+		float longestMVLength = -1;
+		int2 longestMVPos = 0;
+		float3 thisPixelColor;
+		
+		float2 pixelCoord_f = float2(globalID) + 0.5;
+
+		// IMPORTANT: I like jitter! Why not to use it? It hides banding and scattering upsampling artifacts...
+		float jitter = rand24b(pixelCoord_f + $taaDitherAndViewportSize.xy);
+		jitter = lerp(-TAA_DITHER, TAA_DITHER, jitter);
+
+		[unroll]
+		for (int dy = 0; dy <= 2; dy++)
+		{
+			[unroll]
+			for (int dx = 0; dx <= 2; dx++)
+			{
+				int2 pos = localID.xy + int2(dx, dy);
+
+				float4 colorAndLength = s_ColorsAndLengths[pos.y][pos.x];
+				float3 color = colorAndLength.rgb;
+				float motionLength = colorAndLength.a;
+				
+				if (dx == 1 && dy == 1)
+				{
+					thisPixelColor = color;
+
+					// Dither
+					COLOR_SCALE_LUMA(thisPixelColor, jitter);
+				}
+
+				colorMoment1 += color;
+				colorMoment2 += color * color;
+
+				[flatten]
+				if (motionLength > longestMVLength)
+				{
+					longestMVPos = pos;
+					longestMVLength = motionLength;
+				}
+			}
+		}
+
+		colorMoment1 *= 1.0 / 9.0;
+		colorMoment2 *= 1.0 / 9.0;
+
+		float3 colorVariance = colorMoment2 - colorMoment1 * colorMoment1;
+		float3 colorSigma = sqrt(max(0, colorVariance)) * TAA_CLAMPING_FACTOR;
+		float3 colorMin = colorMoment1 - colorSigma;
+		float3 colorMax = colorMoment1 + colorSigma;
+		
+		colorMin = min(thisPixelColor, colorMin);
+		colorMax = max(thisPixelColor, colorMax);
+		
+		// Sample the previous frame using the longest MV
+
+		float2 longestMV = s_MotionVectors[longestMVPos.y][longestMVPos.x];
+		float2 sourcePos = pixelCoord_f - longestMV * $taaDitherAndViewportSize.zw;
+		
+		float2 sampleLoc[3], sampleWeight[3];
+		Bicubic2DCatmullRom( sourcePos * ( $prevResolutionScale.xy / $resolutionScale.xy ), $taaTexSize.zw, sampleLoc, sampleWeight);
+
+		float3 history = 0;
+		float hcolorMoment1 = 0;
+		float hcolorMin = 1e32;
+		float hcolorMax = -1e32;
+		float2 screenLimit = $prevResolutionScale.xy - $positionToViewTexture.zw * 0.5f;
+		
+		[unroll]
+		for (int i = 0; i < 3; i++) 
+		{
+			[unroll]
+			for(int j = 0; j < 3; j++) 
+			{
+				float2 uv = clamp( float2(sampleLoc[j].x, sampleLoc[i].y) * $prevResolutionScale, float2(0, 0), screenLimit );
+				float3 temp = $(taaHistory_read).SampleLevel($linearClamp, uv, 0).rgb;
+
+				history += temp * (sampleWeight[j].x * sampleWeight[i].y);
+
+				float luma = COLOR_LUMA(temp);
+				
+				hcolorMoment1 += luma;
+
+				hcolorMin = min(hcolorMin, luma);
+				hcolorMax = max(hcolorMax, luma);
+			}
+		}
+
+		hcolorMoment1 *= 1.0 / 9.0;
+		history = min(colorMax, max(colorMin, history));
+		
+		// Anti-flicker
+		float a = max(COLOR_LUMA(colorMax) - COLOR_LUMA(colorMin), TAA_MIN_LUMA) * max(hcolorMoment1, TAA_MIN_LUMA);
+		float b = max(hcolorMax - hcolorMin, TAA_MIN_LUMA) * max(COLOR_LUMA(colorMoment1), TAA_MIN_LUMA);
+		float c = smoothstep(1.0, 2.0, a / b);
+		float frameWeight = $(taaAmount) * (1.0 - c) + 0.01;
+
+		//--> Avoid NaN spreading
+		#if defined( DURANGO )
+			frameWeight = isnan(frameWeight) ? 0.0 : frameWeight;
+			thisPixelColor.x = isnan(thisPixelColor.x) ? history.x : thisPixelColor.x;
+			thisPixelColor.y = isnan(thisPixelColor.y) ? history.y : thisPixelColor.y;
+			thisPixelColor.z = isnan(thisPixelColor.z) ? history.z : thisPixelColor.z;
+		#endif
+		//<-- Avoid NaN spreading
+
+
+		// Blend the old color with the new color and store output
+		float3 result = lerp(history, thisPixelColor, frameWeight );
+
+		// NOTE: store history (LDR)
+		@(taaHistory_write)[globalID] = result;
+
+		result = COLOR_FROM(result);
+		result = saturate(result);
+		result = ApproximativeInverseToneMap(result, exposure);
+
+		// NOTE: store antialiased output (HDR)
+		@(taaResult)[globalID] = result;
+	}
+}

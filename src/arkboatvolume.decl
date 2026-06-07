@@ -1,0 +1,29 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortBoatVolume
+	}
+	state {
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+	}
+
+	hlsl_fp_main {
+		//@sv_target = float4( 1,0,0,1 );// whatever, we don't write in any color buffer anyway
+	}
+}

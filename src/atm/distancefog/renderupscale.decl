@@ -1,0 +1,57 @@
+{
+	newstyle
+	state {
+		depthEnable		0
+		depthWrite		0					// No Z write
+ 		depthfunc		ALWAYS				// No Z read
+ 		cull			NONE
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			ONE		ONE_MINUS_SRC_ALPHA
+		alphaBlend		ZERO	ONE
+
+	}
+
+	hlsl_prefix {
+		float FetchDepth(float2 uv) {
+			float Zproj = $(atm/distanceFog/TexDepth).Sample( $pointClamp, uv ).x;
+			float Zscene = ComputeLinearZ( Zproj );
+			return Zscene;
+		}
+
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+
+	hlsl_fp_main {
+		
+		float2	uv = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		//Upscale
+		float2 slope;
+		float  pixelDepth;
+		float4 depthVal1;
+		float2 offset =  screenPosToTexcoord( float2(2.0,2.0), $positionToViewTexture, $resolutionScale.xy );
+
+		pixelDepth  = FetchDepth( uv + float2( 0, 0) );
+		depthVal1.r = FetchDepth( uv + float2(-offset.x, 0) );
+		depthVal1.g = FetchDepth( uv + float2( offset.x, 0) );
+		depthVal1.b = FetchDepth( uv + float2( 0,-offset.y) );
+		depthVal1.a = FetchDepth( uv + float2( 0, offset.y) );
+
+		float4 ratio = $(atm/distanceFog/ratio);
+		float signX = (depthVal1.g - depthVal1.r) * ratio.x;
+		float signY = (depthVal1.a - depthVal1.b) * ratio.z;
+
+		slope.x = ((pixelDepth - depthVal1.g) + (pixelDepth - depthVal1.r)) * signX;
+		slope.y = ((pixelDepth - depthVal1.b) + (pixelDepth - depthVal1.a)) * signY;
+		slope.x = clamp(slope.x, ratio.y, ratio.x) * 0.5;
+		slope.y = clamp(slope.y, ratio.w, ratio.z) * 0.5;
+
+		float4 color = $(atm/distanceFog/TexSourceImage).SampleLevel( $pointSampler, (uv + slope), 0.0 );
+
+		@sv_target.xyz = RangeCompressColorToR11G11B10( color.xyz );
+		@sv_target.w = saturate(color.w);
+	}
+}

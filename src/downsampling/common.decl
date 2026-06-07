@@ -1,0 +1,19 @@
+{
+	newstyle
+	hlsl_prefix {
+		// You can sample the downsampled depth buffer using UVs returned by this function...
+		float2	GetDownsampledDepthBufferUV( float2 _UV ) {
+			return _UV * $(downsampling/depthBufferUVFactor).xy;
+		}
+
+		float4	SampleLevelDownsampledDepthBufferLinear( float2 _UV, float _MipLevel ) {
+			float2	UV = GetDownsampledDepthBufferUV( _UV );
+			return $(downsampling/downsampledDepthBuffer).SampleLevel( $linearClamp, UV, _MipLevel );
+		}
+
+		float4	SampleLevelDownsampledDepthBufferPoint( float2 _UV, float _MipLevel ) {
+			float2	UV = GetDownsampledDepthBufferUV( _UV );
+			return $(downsampling/downsampledDepthBuffer).SampleLevel( $pointClamp, UV, _MipLevel );
+		}
+	}
+}

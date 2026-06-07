@@ -1,0 +1,20 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 8
+		NUMTHREADZ 1
+		isAsyncCompute 1
+	}
+
+	hlsl_prefix {
+		#include <PostFX/DWAO/blurCommon>
+	}
+	hlsl_cp_main {	
+		int2	position = int2( $sv_dispatchThreadID.xy );	// Pixel position
+		if ( all( position < $(DWAO/bufferSize) ) ) {
+			const float		depthThreshold	= $(DWAO/Params0).z;
+			@(DWAO/AOBuffer_UAV)[position] = Blur( position, int2( 1, 0 ), depthThreshold );
+		}
+	}
+}

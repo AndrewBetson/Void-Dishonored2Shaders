@@ -1,0 +1,162 @@
+{
+	newstyle
+	hlsl_prefix {
+
+		`include <atm/vol/common>	// We need volumetric support
+
+		`define	ANIMATE_NOISE		// Define this to move noise with time
+
+		static const float3		FOG_NOISE_HI_UNIFORM_SCALE = float3( 1, 1, 180.0/16.0 );	// The 3D noise texture is 180x180x16 so if we want cubic voxel we need to multiply any sampling frequency by this value...
+		static const float		FOG_NOISE_HI_MIP_BIAS = -7.491853096329674710777797317385;	// log2(1/180)
+
+		float3	World2UVWNear( float3 _WorldPos )	{ return (_WorldPos - $(atm/fog/volumeBoundMinNear)) * $(atm/fog/volumeBoundNormNear); }
+		float3	World2UVWFar( float3 _WorldPos )	{ return (_WorldPos - $(atm/fog/volumeBoundMinFar)) * $(atm/fog/volumeBoundNormFar); }
+
+		// Samples light + density from the near field
+		float4	SampleNearField( float3 _WorldPos )
+		{
+			float3	UVW = World2UVWNear( _WorldPos );
+			return $(atm/fog/texFogVolumeNear).SampleLevel( $linearClamp, UVW, 0.0 );
+		}
+
+		// Samples light + density from the far field
+		float4	SampleFarField( float3 _WorldPos )
+		{
+			float3	UVW = World2UVWFar( _WorldPos );
+			return $(atm/fog/texFogVolumeFar).SampleLevel( $linearClamp, UVW, 0.0 );
+		}
+
+		// Shape the density using bias/contrast/gamma
+		float	ShapeDensity( float _Density )
+		{
+			_Density = max( 0.0, $(atm/fog/noiseDensityShape).y * (_Density + $(atm/fog/noiseDensityShape).x) );
+			_Density = pow( _Density, $(atm/fog/noiseDensityShape).z );
+
+			return _Density;
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Builds the final fog density, adding hi-frequency noise
+		//	_PositionWorld, the world position where to sample the noise
+		//	_Density, a density coming from the near or far fog field's W component
+		//	_MipBias, used to sample the hi-frequency noise
+		//	_HiFrequencyAttenuation, this is a factor that will globally attenuate the impact of the hi-frequency noise (used to "grow" the fog in the low-res depth pre-pass to avoid missing details)
+		float	BuildFinalDensity( float _Density, float3 _PositionWorld, float _MipBias=0.0, float _HiFrequencyAttenuation=1.0 )
+		{
+			if ( _Density < 1e-3 )
+				return 0.0;	// No need to sample anything else!
+
+			// Sample high frequency noise
+`ifdef ANIMATE_NOISE
+			float3	UVW1 = $(atm/fog/noiseParmsHi).x * FOG_NOISE_HI_UNIFORM_SCALE * ($(atm/fog/noiseOffsetHi).xyz + _PositionWorld);
+`else
+			float3	UVW1 = $(atm/fog/noiseParmsHi).x * FOG_NOISE_HI_UNIFORM_SCALE * _PositionWorld;
+`endif
+			float	Density_hi = _HiFrequencyAttenuation * max( 0.0, $(atm/fog/noiseParmsHi).y + $(atm/fog/noiseParmsHi).z * $(atm/fog/texNoiseHi).SampleLevel( $(atm/fog/noiseHiFreqSampler), UVW1, _MipBias ).x );
+			_Density -= Density_hi;	// Always add negative density, otherwise the low-freq bounds from the TFM won't stand!
+
+			return ShapeDensity( _Density );
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Gets the fog density at the specified world position
+		//	_DistanceFromCamera, the distance of the sampling point from the camera, to help us choose which field we should sample
+		//
+		float	GetFogDensity( float3 _PositionWorld, float _DistanceFromCamera, float _MipBias=0.0 )
+		{
+			// Sample fog field
+			float	Density = 0.0;
+			if ( _DistanceFromCamera < $(atm/fog/globalParms).x )
+			{	// Near field
+				Density = SampleNearField( _PositionWorld ).w;
+			}
+			else
+			{	// Far field
+				Density = SampleFarField( _PositionWorld ).w;
+			}
+
+			return BuildFinalDensity( Density, _PositionWorld, _MipBias );
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Packs/Unpacks a TFM value
+
+		// Pnpacks all the TFM components into a uint4
+		uint4	Pack2TFM( float2 _DistancesMinMax, uint _BitField, float4 _DCT0, float _DCT1 )
+		{
+			uint	PackedZMinMax = asuint( f32tof16( _DistancesMinMax.y ) ) | ( asuint( f32tof16( _DistancesMinMax.x ) ) << 16 );					// MSW=ZMax, LSW=ZMin
+			uint	PackedBitFieldDCT = (_BitField << 16) | uint( 65535.0 * saturate( 0.5 * _DCT0.x ) );											// MSW=Bitfield, LSW=DCT #0
+			uint	PackedDCT0 = (uint( 65535.0 * saturate( 0.5 * (1.0 + _DCT0.y) ) ) << 16) | uint( 65535.0 * saturate( 0.5 * (1.0 + _DCT0.z) ) );	// LSW=DCT #1, MSW=DCT #2
+			uint	PackedDCT1 = (uint( 65535.0 * saturate( 0.5 * (1.0 + _DCT0.w) ) ) << 16) | uint( 65535.0 * saturate( 0.5 * (1.0 + _DCT1) ) );	// LSW=DCT #3, MSW=DCT #4
+
+			return uint4( PackedZMinMax, PackedBitFieldDCT, PackedDCT0, PackedDCT1 );
+		}
+
+		// Unpacks a uint4 into all the TFM components
+		//	_TFM, the uint4 read back from the TFM texture
+		void	UnpackTFM( uint4 _TFM, out float2 _DistancesMinMax, out uint _BitField, out float4 _DCT0, out float _DCT1 )
+		{
+			_DistancesMinMax.y = f16tof32( _TFM.x & 0xFFFF );
+			_DistancesMinMax.x = f16tof32( _TFM.x >> 16 );
+			_BitField = _TFM.y >> 16;
+			_DCT0.x = (2.0 / 65535.0) * (_TFM.y & 0xFFFF);
+			_DCT0.y = (_TFM.z >> 16) * (2.0 / 65535.0) - 1.0;
+			_DCT0.z = (_TFM.z & 0xFFFF) * (2.0 / 65535.0) - 1.0;
+			_DCT0.w = (_TFM.w >> 16) * (2.0 / 65535.0) - 1.0;
+			_DCT1 = (_TFM.w & 0xFFFF) * (2.0 / 65535.0) - 1.0;
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Transmittance Function Map readback
+		// For a reminder about the DCT, see http://en.wikipedia.org/wiki/Discrete_cosine_transform#DCT-III
+		// Note that the inverse of DCT-II we used for encoding is the DCT-III that we're applying here.
+		// It's really important since the DC term must be treated carefully!
+		//
+		//	_Distance, the distance of your sampling point from the camera (= Z * length of view vector before normalization)
+		//	_DistancesMinMax, _DCT0, _DCT1, the various DCT parameters returned by UnpackTFM
+		float	DecodeFogTransmittance( float _Distance, float2 _DistancesMinMax, float4 _DCT0, float _DCT1 )
+		{
+			if ( _Distance < _DistancesMinMax.x )
+				return 1.0;	// Not even in the fog yet!
+			if ( _Distance > _DistancesMinMax.y )
+				return 0.0;	// Fully shadowed
+
+// const float	FULLY_OPAQUE_INTERPOLATION_INTERVAL = 0.05;	// Smooth interpolation to full opacity in this interval
+// 			float	FullOpacity = smoothstep( MaxZ+(0.8*FULLY_OPAQUE_INTERPOLATION_INTERVAL), MaxZ-(0.2*FULLY_OPAQUE_INTERPOLATION_INTERVAL), _Distance );	// Will yield 0 after blocker distance+epsilon
+//  			if ( FullOpacity < 1e-3 )
+//  				return FullOpacity;	// We're in the fully opaque zone anyway...
+
+			float	x = saturate( (_Distance - _DistancesMinMax.x) / (_DistancesMinMax.y - _DistancesMinMax.x) );
+
+			const float4	CosTerm0 = PI * float4( 1, 2, 3, 4 );
+
+			float4	Temp0 = FastCos( CosTerm0 * x );
+			float4	Cos0 = float4( 0.5, Temp0.xyz );
+			float	Cos1 = Temp0.w;
+
+			return saturate( dot( Cos0, _DCT0 ) + Cos1 * _DCT1 );
+		}
+
+		////////////////////////////////////////////////////////////////////////////////////////
+		// Samples the screen-space TFM for opacity
+		// Very useful to determine the initial opacity of a transparent object like a particle...
+		// For example, you can multiply the light emitted by a particle by this value so it gets nicely attenuated by the volumetrics.
+		//
+		//	_UV, the screen UV coordinates of your pixel
+		//	_Distance, the distance of your sampling point from the camera (= Z * length of view vector before normalization)
+		float	GetFogOpacity( float2 _UV, float _Distance )
+		{
+//			float4	C0 = $(atm/fog/texScreenTFM).SampleLevel( $linearClamp, float3( _UV, 0 ), 0.0 );
+
+			float2	DistancesMinMax;
+			uint	BitField;
+			float4	DCT0;
+			float	DCT1;
+			uint2	Pixel = uint2( floor( $(atm/fog/screenTFMdUV).zw * _UV ) );
+			uint4	TFM = $(atm/fog/texScreenTFM)[Pixel];
+			UnpackTFM( TFM, DistancesMinMax, BitField, DCT0, DCT1 );
+
+			return DecodeFogTransmittance( _Distance, DistancesMinMax, DCT0, DCT1 );
+		}
+	}
+}

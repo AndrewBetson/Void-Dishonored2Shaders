@@ -1,0 +1,55 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		static const float	DEBUG_PROBES_COUNT_PER_LINE = 32;		// Amount of probes we can show per line
+
+		// Displays small rotating spheres for each SH probe in the array
+		//
+		void	DEBUG_DisplaySHProbes( float2 _UV, inout float3 _Color, float _ExposureFactor=0.01 ) {
+			const float2	PROBE_SIZE_UV = float2( 1.0 / DEBUG_PROBES_COUNT_PER_LINE, 16.0/9.0 * 1.0 / DEBUG_PROBES_COUNT_PER_LINE );
+			const uint		PROBE_LINES_COUNT = ceil( float( $(PostFX/ToneMapping/debug/SHProbesCount) ) / DEBUG_PROBES_COUNT_PER_LINE );
+
+			const float2	Size = float2( 1.0, PROBE_LINES_COUNT*PROBE_SIZE_UV.y );
+			if ( _UV.y < 1.0-Size.y || _UV.x > Size.x*DEBUG_PROBES_COUNT_PER_LINE )
+				return;	// Outside the inset rectangle where we're drawing...
+
+
+			_UV.y = _UV.y-1.0+Size.y;
+			_UV /= PROBE_SIZE_UV;
+
+			uint2	ColumnRowIndex = uint2( floor( _UV ) );
+
+			uint	SHProbeIndex = ColumnRowIndex.x + DEBUG_PROBES_COUNT_PER_LINE * ColumnRowIndex.y;
+			if ( SHProbeIndex > $(PostFX/ToneMapping/debug/SHProbesCount) )
+				return;	// Out of range...
+
+			_UV = frac( _UV );
+
+			float3	Direction = float3( 2.0 * _UV.x - 1.0, 1.0 - 2.0 * _UV.y, 0.0 );
+			float	L = dot( Direction.xy, Direction.xy );
+			if ( L >= 1.0 )
+				return;	// Outside the circle...
+
+			_Color = 0.0;
+
+			Direction.z = sqrt( 1.0 - L );
+
+			float2	SC;
+			sincos( $time.x, SC.x, SC.y );
+			float3x3	Rot = float3x3(
+				float3( -SC.x, SC.y, 0 ),
+				float3( 0, 0, 1 ),
+				float3( SC.y, SC.x, 0 )
+			);
+			Direction = mul( Direction, Rot );
+
+			$(indirectLighting/SH3)	Probe = LoadProbeSH( SHProbeIndex );
+			_Color = max( 0.0, EvaluateSHIrradiance( Direction, Probe.SH ) );
+//			_Color = max( 0.0, EvaluateSH( Direction, Probe.SH ) );	// Direct radiance
+
+			_Color *= _ExposureFactor;
+		}
+	}
+}

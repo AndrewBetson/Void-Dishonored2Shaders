@@ -1,0 +1,106 @@
+{
+	newstyle
+
+	state {
+		depthfunc	ALWAYS
+		depthWrite	0
+		depthEnable	0
+ 		cull none
+	}
+
+	options {
+	}
+
+	hlsl_prefix {
+		#include <helper>
+
+		float3 ReconstructWorldSpacePositionFromLinearZ( float2 _ndcPixelPos, float _linearDepth ) {
+			float4 wsZFarPos = mul( $inverseViewProjectionMatrix, float4( _ndcPixelPos, 0.0, 1.0 ) );  //ARKANE (2015-06-12) - depth inversion
+			wsZFarPos /=  wsZFarPos.w;
+			float3 wsRayDir = wsZFarPos.xyz - $wsCamPos;
+			float zfar = $globalViewInfos.w;
+			return $wsCamPos + wsRayDir * ( _linearDepth / zfar );
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0f );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+
+		float maxOpaqueDepth = $globalViewInfos.z; // z near
+		float minOpaqueDepth = $globalViewInfos.w; // z far
+		float minWaterDepth = $globalViewInfos.w; // z far
+
+		float2 cpPos = float2($texcoord.x * 2.0 - 1.0, 1.0 - $texcoord.y * 2.0);
+		// flower pattern
+		// central tap
+		float	centerOpaqueDepthRaw = $(water/OpaqueDepthBuffer).SampleLevel( $pointClamp, $texcoord, 0.0f );
+		float	centerOpaqueDepthLinear = ComputeLinearZ( centerOpaqueDepthRaw );
+		float	centerWaterDepthProj =  $(water/WaterDepthBuffer).SampleLevel( $pointClamp, $texcoord, 0.0f );
+		float	centerWaterDepthLinear = ComputeLinearZ( centerWaterDepthProj );
+
+		float3	wsOpaque = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, centerOpaqueDepthLinear );
+		float3	wsWater = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, centerWaterDepthLinear );
+
+		int2  gatherTapOffsets[12] = { int2(  0, -2 )
+									 , int2(  1,  0 )
+									 , int2( -1,  1 )
+									 , int2( -2,  1 )
+									 , int2(  0, -4 )
+									 , int2(  2, -2 )
+									 , int2(  3,  0 )
+									 , int2(  1,  2 )
+									 , int2( -1,  3 )
+									 , int2( -3,  1 )
+									 , int2( -4, -1 )
+									 , int2( -2, -3 ) };
+
+		for( int i = 0; i<4; ++i ) {
+				float4	opaqueDepthRaw = $(water/OpaqueDepthBuffer).Gather( $pointClamp, $texcoord, gatherTapOffsets[i] );
+				float4	opaqueDepthLinear = float4(ComputeLinearZ( opaqueDepthRaw.x ), ComputeLinearZ( opaqueDepthRaw.y ), ComputeLinearZ( opaqueDepthRaw.z ), ComputeLinearZ( opaqueDepthRaw.w ));
+				float4	waterDepthProj =  $(water/WaterDepthBuffer).Gather( $pointClamp, $texcoord, gatherTapOffsets[i] );
+				float4	waterDepthLinear = float4(ComputeLinearZ( waterDepthProj.x ), ComputeLinearZ( waterDepthProj.y ), ComputeLinearZ( waterDepthProj.z ), ComputeLinearZ( waterDepthProj.w ));
+
+				maxOpaqueDepth = max( maxOpaqueDepth, max(max(opaqueDepthLinear.x, opaqueDepthLinear.y), max(opaqueDepthLinear.z, opaqueDepthLinear.w)) );
+				minOpaqueDepth = min( minOpaqueDepth, min(min(opaqueDepthLinear.x, opaqueDepthLinear.y), min(opaqueDepthLinear.z, opaqueDepthLinear.w)) );
+				minWaterDepth = min( minWaterDepth, min(min(waterDepthLinear.x, waterDepthLinear.y), min(waterDepthLinear.z, waterDepthLinear.w)) );
+		}
+
+
+		float3 wsMinOpaque = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, minOpaqueDepth );
+		float3 wsMaxOpaque = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, maxOpaqueDepth );
+		float3 wsMinWater = ReconstructWorldSpacePositionFromLinearZ( cpPos.xy, minWaterDepth );
+
+		float3 dirMin = ( wsMinOpaque - wsMinWater );
+		float sqrDistMin = dot(dirMin,dirMin);
+
+		float3 dirMax = ( wsMaxOpaque - wsMinWater );
+		float sqrDistMax = dot(dirMax,dirMax);
+
+		// 50 meter --> 10 meter depth delta
+		// 1 meter --> 0.05 meter depth delta
+		float highBound = LinearStep( 1, 50.0, minWaterDepth);
+		float lowBound = lerp( highBound, 0.1, highBound );
+		float pitchfactor = lerp( highBound, lowBound, $wsCamForwardDir.z * $wsCamForwardDir.z );
+
+		float frontComponentDepthThreashold = max( 0.005, (0.19 * centerWaterDepthLinear - 0.19)* pitchfactor );
+		float frontComponent = (sqrDistMin > 0.001) ? smoothstep( frontComponentDepthThreashold, 0.0, sqrDistMax ) : 0.0;
+
+		//Todo clip water depth if too far from water plane
+		float3 centralWaterToMin = ( wsMinOpaque - wsWater );
+		float centralWaterSqrtDistToMin = dot(centralWaterToMin,centralWaterToMin);
+
+		float3 centralWaterToCenterOpaque = ( wsOpaque - wsWater );
+		float sqrtDist = dot(centralWaterToCenterOpaque,centralWaterToCenterOpaque);
+
+		float backComponentDepthThreashold = 0.05;
+
+		float backComponent = ( centralWaterSqrtDistToMin > 0.001 && minOpaqueDepth < centerWaterDepthLinear && sqrtDist > 0.001 ) ? smoothstep( backComponentDepthThreashold, 0.0, centralWaterSqrtDistToMin ) : 0.0;
+
+		@sv_target.r = max( frontComponent, backComponent ) * LinearStep( 250.0, 0.0, centerWaterDepthLinear );
+		@sv_target.gba = 1.0f;
+	}
+}

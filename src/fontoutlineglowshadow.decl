@@ -1,0 +1,72 @@
+{
+	newstyle
+	
+	parms {
+		stageSort	sortTrans
+	}
+	state {
+		blend	SRC_ALPHA ONE_MINUS_SRC_ALPHA
+		depthWrite 0
+		cull none
+	}
+	
+	hlsl_vp_main {
+		@sv_position.x = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixX );
+		@sv_position.y = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixY );
+		@sv_position.z = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixZ );
+		@sv_position.w = dot( float4( $vertex_position.xyz, 1 ), $mvpMatrixW );
+
+		float3 viewDir = @sv_position.xyz - $wsCamPos;
+		float viewDistance = length( viewDir );
+		@(font/tc) = float4( $vertex_texcoord.xy, viewDistance, 0 );
+		@(font/color) = swizzleColor( $vertex_color );
+	}
+	hlsl_fp_main {
+		const float pixelDeltaScalar = 32.0f; // should we be able to adjust this and make this a slider?  32-128.0f;
+		const float edgeThreshold = 0.5f;
+		const float dist = $transMap.Sample( $defaultSamp, $(font/tc).xy ).a;
+		const float2 tc = $(font/tc).xy;
+		float pixelDelta = ( abs( ddx( tc.x ) ) + abs( ddy( tc.y ) ) ) * pixelDeltaScalar;
+		pixelDelta = clamp( pixelDelta, 0.0f, edgeThreshold );
+		const float fontGlyphEdgeMin = edgeThreshold - pixelDelta;
+		const float fontGlyphEdgeMax = edgeThreshold + pixelDelta;
+		float alpha = smoothstep( fontGlyphEdgeMin, fontGlyphEdgeMax, dist );
+		float3 color = $(font/color).xyz;
+
+		// outline
+		BRANCH if ( $fontFXParms.x > 0.0f ) {
+			const float sharpOutlineDistanceFade = smoothstep( 0.15f, 0.25f, pixelDelta );
+			const float outlineThickness = $fontFXParms.x;
+			const float outlineThicknessRange = 0.5f;
+			const float outlineThicknessBlendRange = 0.05f;
+			const float outlineMinDistance = outlineThicknessRange * ( 1.0f - outlineThickness );
+			const float outlineMaxDistance = outlineMinDistance + outlineThicknessBlendRange;
+			const float outlineAlpha = smoothstep( outlineMinDistance, outlineMaxDistance, dist );
+			// composite the outline with the curent font color
+			float3 finalOutlineColor = lerp( ( $fontFXOutlineColor.xyz * outlineAlpha ), color, alpha );
+			float finalOutlineAlpha = max( alpha, outlineAlpha * $fontFXOutlineColor.a );
+			// lerp the final outline color in and out based on distance 
+			color = lerp( finalOutlineColor, color, sharpOutlineDistanceFade );
+			alpha = lerp( finalOutlineAlpha, alpha, sharpOutlineDistanceFade );
+		}
+
+		// glows and shadows
+		BRANCH if ( $fontFXParms.y > 0.0f ) {
+			const float2 glowTC = $(font/tc).xy + ( $fontFXGlowParms.xy / $fontFXParms.zw );
+			float4 glowTexel = $transmap.Sample( $defaultSamp, glowTC );
+			const float glowThickness = $fontFXParms.y;
+			const float glowThicknessRange = 0.25f;
+			const float glowThicknessBlendRange = 0.5f;
+			const float glowMinDistance = glowThicknessRange * ( 1.0f - glowThickness );
+			const float glowMaxDistance = glowMinDistance + glowThicknessBlendRange;
+			const float glowAlpha = smoothstep( glowMinDistance, glowMaxDistance, glowTexel.a );
+			float3 finalGlow = $fontFXGlowColor.xyz;
+			// composite the glow / shadow with the curent font color
+			color = lerp( finalGlow, color, alpha );
+			alpha = max( alpha, glowAlpha * $fontFXGlowColor.a );
+		}
+
+		@sv_target.xyz = color;
+		@sv_target.w = alpha * $(font/color).w;
+	}
+}

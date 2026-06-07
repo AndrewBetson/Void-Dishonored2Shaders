@@ -1,0 +1,38 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		// Displays the specified image with options
+		//
+		void	DEBUG_DisplayDebugImage( float2 _UV, inout float3 _Color )
+		{
+			float	InsetSize = asfloat( $(PostFX/ToneMapping/debugImageOptions).y );
+
+			if ( _UV.y < 1.0-InsetSize || _UV.x > InsetSize )
+				return;	// Outside the inset rectangle where we're drawing...
+
+			_UV.x /= InsetSize;
+			_UV.y = (_UV.y-1.0+InsetSize) / InsetSize;
+
+			uint	options = $(PostFX/ToneMapping/debugImageOptions).x;
+			uint	Channels = options & 0xF;
+			uint	MipLevel = (options & 0xF0) >> 4;
+			bool	PointSampling = (options & 0x100) != 0;
+
+			float4	Value;
+			if ( PointSampling )
+				Value = $(PostFX/ToneMapping/debugImage).SampleLevel( $pointClamp, _UV, MipLevel );
+			else
+				Value = $(PostFX/ToneMapping/debugImage).SampleLevel( $linearClamp, _UV, MipLevel );
+
+			float4	ChannelMask = float4( (Channels & 1), (Channels & 2) >> 1, (Channels & 4) >> 2, (Channels & 8) >> 3 );
+			Value *= ChannelMask;
+
+			if ( Channels == 0x8 )
+				Value = Value.w;	// Only display alpha...
+
+			_Color = Value.xyz;
+		}
+	}
+}

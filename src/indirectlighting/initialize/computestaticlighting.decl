@@ -1,0 +1,157 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 128	// Each thread processes a sample. The amount of threads per probe must match the PROBE_SAMPLES_COUNT define declared in arkEnvProbe.h!
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <sphericalHarmonics>
+		#include <fresnel>
+
+		#define PROBE_SAMPLES_COUNT			NUMTHREADX
+
+		groupshared $(indirectLighting/SH3)	gs_SamplesCoeffs[PROBE_SAMPLES_COUNT];
+	}
+
+	hlsl_cp_main {
+		uint	ProbeIndex = $sv_groupID.x;
+		uint	ProbesCount = $(indirectLighting/update/parmsUint).x;
+
+		//////////////////////////////////////////////////////////////////////////
+		// 1] Compute indirect lighting perceived by each sample (1 sample per thread here)
+		uint									SampleIndex = $sv_groupThreadID.x;
+		$(indirectLighting/update/probeSample)	Sample = $(indirectLighting/update/bufferProbeSampleInfo)[ProbeIndex * PROBE_SAMPLES_COUNT + SampleIndex];
+
+		uint	relightProbeIndex = Sample.RelightProbeIndex_Opacity >> 16;
+		uint	intOpacity = Sample.RelightProbeIndex_Opacity & 0xFFFFU;
+
+		float	opacity = intOpacity / 65535.0;
+
+		float3	Radiance = 0.0;
+		if ( intOpacity > 0U && relightProbeIndex < ProbesCount ) {
+
+			// Unpack normal
+			float	wsNormal_Phi = TWOPI * (Sample.wsNormal_PhiTheta & 0xFFFFU) / 65535.0;
+			float	wsNormal_Theta = PI * ((Sample.wsNormal_PhiTheta >> 16) & 0xFFFFU) / 65535.0;
+			float2	sinCosPhi, sinCosTheta;
+			sincos( wsNormal_Phi, sinCosPhi.x, sinCosPhi.y );
+			sincos( wsNormal_Theta, sinCosTheta.x, sinCosTheta.y );
+
+			float3	wsNormal = float3( sinCosTheta.x * sinCosPhi.y, sinCosTheta.x * sinCosPhi.x, sinCosTheta.y );
+
+			// Unpack albedo and F0
+			float3	diffuseAlbedo;
+			diffuseAlbedo.x = (Sample.Albedo_F0 >> 24) / 255.0;
+			diffuseAlbedo.y = ((Sample.Albedo_F0 >> 16) & 0xFFU) / 255.0;
+			diffuseAlbedo.z = ((Sample.Albedo_F0 >> 8) & 0xFFU) / 255.0;
+			diffuseAlbedo *= diffuseAlbedo;			// Was stored as sqrt( albedo ) to maximize dynamic range
+
+			float	F0 = (Sample.Albedo_F0 & 0xFFU) / 255.0;
+					F0 *= F0;						// Was stored as sqrt( F0 ) to maximize dynamic range
+
+			// Compute diffuse Fresnel
+			float3	wsView = Sample.wsPosition;		// We stored the "view vector" in the position field (the view vector is simply the unit vector pointing from the sample to the probe)
+			float3	wsHalf = normalize( wsView + wsNormal );
+			float	NdotH = saturate( dot( wsNormal, wsHalf ) );
+			float	FresnelDiffuse = 1.0 - FresnelSchlick( F0, NdotH );	// What is not specularly reflected...
+
+			// Compute irradiance perceived by the sample
+			$(indirectLighting/SH3)	relightingProbeSH = $(indirectLighting/update/bufferProbesSH_Static)[relightProbeIndex];	// SH coefficients of previous bounce
+			float3	irradiance_Indirect = EvaluateSHIrradiance( wsNormal, relightingProbeSH.SH );
+
+			// Apply bounce factor associated to the probe
+			$(indirectLighting/update/probeInfo_t)	Probe = $(indirectLighting/update/bufferProbesInfo)[relightProbeIndex];
+			float3		bounceFactor = $(indirectLighting/update/parmsFloat).x * Probe.m_bounceFactorStatic
+									 + $(indirectLighting/update/parmsFloat).y * Probe.m_bounceFactorSun
+									 + $(indirectLighting/update/parmsFloat).z * Probe.m_bounceFactorSky;
+
+			Radiance = opacity * (INVPI * diffuseAlbedo) * FresnelDiffuse * bounceFactor * irradiance_Indirect;		// This is what the probe will perceive from this sample
+		}
+
+		// Encode into SH
+		$(indirectLighting/SH1)	SampleDirection = $(indirectLighting/update/bufferStaticSamples)[SampleIndex];
+		[unroll]
+		for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+			gs_SamplesCoeffs[SampleIndex].SH[i] = Radiance * SampleDirection.SH[i];
+		}
+
+		// Ensure all threads have finished computing their sample radiance
+		GroupMemoryBarrierWithGroupSync();
+
+		//////////////////////////////////////////////////////////////////////////
+		// 2] Perform a parallel reduction of the samples' SH
+		uint	BlockOffset = SampleIndex;
+		if ( SampleIndex < 64 ) {
+			uint	BlockOffset2 = BlockOffset + 64;	// Offset to the next block of 64 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 32 ) {
+			uint	BlockOffset2 = BlockOffset + 32;	// Offset to the next block of 32 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 16 ) {
+			uint	BlockOffset2 = BlockOffset + 16;	// Offset to the next block of 16 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 8 ) {
+			uint	BlockOffset2 = BlockOffset + 8;	// Offset to the next block of 8 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if ( SampleIndex < 4 ) {
+			uint	BlockOffset2 = BlockOffset + 4;	// Offset to the next block of 4 samples
+			[loop]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				gs_SamplesCoeffs[BlockOffset].SH[i] += gs_SamplesCoeffs[BlockOffset2].SH[i];
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+
+		//////////////////////////////////////////////////////////////////////////
+		// 3] Use a single thread to finalize SH
+		// At this point, we have 4 sums of SH coefficients in gs_SamplesCoeffs[0], gs_SamplesCoeffs[1], gs_SamplesCoeffs[2] and gs_SamplesCoeffs[3]
+		// We won't force a barrier for summing 4 samples so we'll collapse them using a single thread
+		//
+		if ( $sv_groupThreadID.x == 0 ) {
+			$(indirectLighting/SH3)	finalSH;
+			finalSH.__PADDING = 0.0;	// Don't care but the compiler whines about that :(
+
+			[unroll]
+			for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+				finalSH.SH[i] = gs_SamplesCoeffs[0].SH[i] + gs_SamplesCoeffs[1].SH[i] + gs_SamplesCoeffs[2].SH[i] + gs_SamplesCoeffs[3].SH[i];
+			}
+
+// 			// Filter out
+// 			FilterLanczos( finalSH.SH, 3.0 );
+
+			// Write final results...
+			@(indirectLighting/update/bufferProbesSH_Dynamic)[ProbeIndex] = finalSH;
+		}
+	}
+}

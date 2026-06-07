@@ -1,0 +1,115 @@
+{
+	newstyle
+	options {
+		NUMTHREADX 256
+		NUMTHREADY 1
+		NUMTHREADZ 1
+	}
+	hlsl_prefix {
+		#include <sphericalHarmonics>
+
+		// This is an even more simplified version of the product between a ZH and a SH (cf. sphericalHarmonics.mrpr)
+		// In our case, the sky's ZH is a lerp between a zenith and horizon color, with a symetry across the equator
+		// Because of that symetry, the ZH[1] coefficient is 0 so we can reduce the amount of operations even more...
+		//
+		void ZHSHProductSky( const in float3 a[3], const in float3 b[9], out float3 r[9] ) {
+			float3	t;
+
+			const float	C0 = 0.282094792935999980;
+			const float	C1 = -0.126156626101000010;
+//			const float	C2 = 0.218509686119999990;
+			const float	C3 = 0.252313259986999990;
+			const float	C4 = 0.180223751576000010;
+//			const float	C5 = 0.156078347226000000;
+			const float	C6 = 0.090111875786499998;
+
+			float3	C0a0 = C0*a[0];	// 1*
+			float3	C1a2 = C1*a[2];	// 1*
+			
+			// 1*
+			r[0] = C0a0*b[0];
+
+			// 1* 1+
+			r[1] = b[1] * (C0a0+C1a2);
+
+			// 8* 4+ -> 2* 1+
+			t = C0a0+C3*a[2];
+			r[2] = t*b[2];
+
+			// 1* 2+
+			r[3] = b[3]*(C0a0+C1a2);
+
+			// 2* 2+
+			r[4] = b[4]*(C0a0-C4*a[2]);
+
+			// 2* 2+
+			r[5] = b[5]*(C0a0+C6*a[2]);
+
+			// 6* 4+
+			r[6] = C0 * (b[6]*a[0] + b[0]*a[2]);
+			t = a[2]*b[6];
+			r[0] += C0*t;
+			r[6] += C4*t;
+
+			// 2* 2+
+			r[7] = b[7]*(C0a0+C6*a[2]);
+
+			// 2* 1+
+			r[8] = b[8]*(C0a0-C4*a[2]);
+			// multiply count=21 (compared to the original 35 of the product)
+			// addition count=15 (compared to the original 19 of the product)
+		}
+	}
+
+	hlsl_cp_main {
+		uint	ProbeIndex = $sv_dispatchThreadID.x;
+		if ( ProbeIndex >= $(indirectLighting/update/parmsUint).x )
+			return;
+
+		$(indirectLighting/update/probeInfo_t)	Probe = $(indirectLighting/update/bufferProbesInfo)[ProbeIndex];
+
+		$(indirectLighting/SH3)	SHStatic = $(indirectLighting/update/bufferProbesSH_Static)[ProbeIndex];
+		$(indirectLighting/SH3)	SHSun = $(indirectLighting/update/bufferProbesSH_StaticSun)[ProbeIndex];
+		$(indirectLighting/SH3)	SHSky = $(indirectLighting/update/bufferProbesSH_SkyOcclusion)[ProbeIndex];
+		$(indirectLighting/SH3)	SHDynamic = $(indirectLighting/update/bufferProbesSH_Dynamic)[ProbeIndex];
+
+		float					globalFactor = $(indirectLighting/update/parmsFloat).x;
+		float3					factorStatic = globalFactor * $(env/indirectLighting/bounceFactor/static) * Probe.m_bounceFactorStatic;
+		float3					factorDynamic = globalFactor * $(env/indirectLighting/bounceFactor/dynamic) * Probe.m_bounceFactorDynamic;
+		float3					factorSun = globalFactor * $(env/indirectLighting/bounceFactor/sun) * Probe.m_bounceFactorSun * $(atm/sky/sunColorAtGroundLevel).xyz;	// Sun color is only injected now
+		float3					factorSky = globalFactor * Probe.m_bounceFactorSky;
+
+		// Build actual occluded sky factors
+		float3					ZHSky[3] = { factorSky * $(indirectLighting/update/skyZH0), factorSky * $(indirectLighting/update/skyZH1), factorSky * $(indirectLighting/update/skyZH2) };
+		$(indirectLighting/SH3)	SHOccludedSky;
+		ZHSHProductSky( ZHSky, SHSky.SH, SHOccludedSky.SH );
+
+		// Mix up all SH sources
+		$(indirectLighting/SH3)	Result;
+		Result.__PADDING = 0.0;	// Don't care but the compiler whines about that :(
+		for ( uint i=0; i < SH_COEFFS_COUNT; i++ ) {
+			Result.SH[i] = factorStatic * SHStatic.SH[i]	// Accumulate static lighting
+						 + factorSun * SHSun.SH[i]			// Accumulate static Sun lighting
+						 + SHOccludedSky.SH[i]				// Accumulate occluded sky coefficients
+						 + factorDynamic * SHDynamic.SH[i];	// Accumulate dynamic lighting
+
+//Result.SH[i] = SHSun.SH[i];
+//Result.SH[i] = SHStaticA.SH[i];
+//Result.SH[i] = float3( ProbeIndex / 100.0, 0, 0 );
+//Result.SH[i] = 10000000.0 * abs(SHDynamic.SH[i]);
+//Result.SH[i] = 0.0;
+		}
+
+
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+Result.SH[0] += $(indirectLighting/update/parmsFloat).y * 3.5449077018110320545963349666822 * Probe.m_ambientFactor * $(indirectLighting/update/ambient);	// bmayaux (2016-03-18) HORRIBLE PER-PROBE AMBIENT TERM!
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+// bmayaux (2016-03-14) HORRIBLE AMBIENT TERM!
+
+
+		@(indirectLighting/bufferProbesSH)[ProbeIndex] = Result;
+	}
+}

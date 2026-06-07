@@ -1,0 +1,57 @@
+{
+	newstyle
+
+	state {
+		blend		ONE	ZERO
+		depthWrite	0
+		depthEnable	0
+		depthfunc	ALWAYS
+		cull none
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+
+		float3 distort( Texture2D tex, float2 texcoord, float2 direction, float3 distortion ) {
+			float r = tex.SampleLevel( $bilinearClamp, ( texcoord + direction * distortion.r ) * $resolutionScale, 0.0).r;
+			float g = tex.SampleLevel( $bilinearClamp, ( texcoord + direction * distortion.g ) * $resolutionScale, 0.0).g;
+			float b = tex.SampleLevel( $bilinearClamp, ( texcoord + direction * distortion.b ) * $resolutionScale, 0.0).b;
+			return float3(r,g,b);
+		}
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1 );
+		@texcoord = $vertex_texcoord;
+	}
+
+	hlsl_fp_main {
+		float3 result = 0.0;
+		const float2 texcoord   = -$texcoord + 1.0; // flip texcoordoords
+		const float2 texelSize  = $positionToViewTexture.zw * $resolutionScale;
+		const float2 ghostVec   = (0.500001 - texcoord) * $(PostFX/LensFlares/Dispersal);
+		const float2 ghostNorm  = normalize(ghostVec);
+		const float2 haloVec    = ghostNorm * $(PostFX/LensFlares/HaloWidth);
+		const float3 distortion = float3(-texelSize.x * $(PostFX/LensFlares/Distortion), 0.0, texelSize.x * $(PostFX/LensFlares/Distortion) );
+
+		// sample ghosts
+		for (uint i = 0; i < $(PostFX/LensFlares/NbSamples); ++i) {
+			float2 offset = frac(texcoord + ghostVec * float(i));
+			float  weight = length(0.5 - offset) / sqrt(0.5);
+			weight = pow(1.0 - weight, 10.0);
+			result += distort( $(PostFX/LensFlares/texLensThreshold), offset, ghostNorm, distortion ) * weight;
+		}
+
+		float2 sampleCoord = float2( length(0.5 - texcoord) / sqrt(0.5), 0.5 );
+		float3 colorFrom = $(PostFX/LensFlares/LensColor_From).SampleLevel( $bilinearClamp, sampleCoord, 0.0 ).rgb;
+		float3 colorTo   = $(PostFX/LensFlares/LensColor_To).SampleLevel( $bilinearClamp, sampleCoord, 0.0 ).rgb;
+		result *= lerp( colorFrom, colorTo, $(PostFX/LensFlares/BlendWeight) );
+
+		//	sample halo
+		float weight = length(0.5 - frac(texcoord + haloVec)) / sqrt(0.5);
+		weight = pow(1.0 - weight, 10.0) * $(PostFX/LensFlares/HaloWeight);
+		result += distort( $(PostFX/LensFlares/texLensThreshold), frac(texcoord + haloVec), ghostNorm, distortion ) * weight;
+
+		@sv_target = float4( result, 1.0 );
+	}
+}

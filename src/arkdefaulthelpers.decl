@@ -1,0 +1,1505 @@
+{
+	newstyle
+	hlsl_prefix {
+		#include <helper>
+		#include <pixel>
+		#include <arkWrinkles>
+		#include <parallaxSelfShadow>
+		#include <oit>
+		#if defined(PC) && !$buildingEnvironmentProbe
+			#include <PostFX/Luminance/common>
+		#endif
+
+		// =======================================================================
+		//   ___ _    ___ ___   _______ ___ ___ ___  _   ___ ___
+		//  / __| |  |_ _| _ \ |_  / _ \ _ \ __| _ \/_\ / __/ __|
+		// | (__| |__ | ||  _/  / /|  _/   / _||  _/ _ \\__ \__ \
+		//  \___|____|___|_|   /___|_| |_|_\___|_|/_/ \_\___/___/
+		//
+		// =======================================================================
+		void ClipZfromDistance( inout arkPixelContext_t _pixelCtx ) {
+			float mask = (1.0 / 17.0) * ( 1.0 + B8( uint2( _pixelCtx.m_ssPosition.xy ) ) / 64.0 );
+			const float ratio   = $DitheringDistance.z;
+			const float distMin = $DitheringDistance.x;
+			const float distMax = $DitheringDistance.y;
+			float alpha = (ratio > 0.0) ? ratio : LinearStep( distMin, distMax, _pixelCtx.m_ssPosition.w );
+			clip( alpha - mask );
+		}
+
+		void ClipZorShadowPass( inout arkPixelContext_t _pixelCtx ) {
+			#if $alphaTest
+				#if $isShadow
+					float alpha = $diffusemap.Sample( $bilinearSampler, _pixelCtx.m_layerTexCoords[0] ).a;
+					clip( alpha - 0.5 );
+				#else
+					float alpha = $diffusemap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).a;
+					clip( alpha - $DefaultAlphaTest );
+				#endif
+			#endif
+			#if $isZPrePassDithering
+				ClipZfromDistance( _pixelCtx );
+			#endif
+		}
+
+		// =======================================================================
+		//  ___  _   ___    _   _    _      _   __  __  __  __   _   ___ ___ ___ _  _  ___
+		// | _ \/_\ | _ \  /_\ | |  | |    /_\  \ \/ / |  \/  | /_\ | _ \ _ \_ _| \| |/ __|
+		// |  _/ _ \|   / / _ \| |__| |__ / _ \  >  <  | |\/| |/ _ \|  _/  _/| || .` | (_ |
+		// |_|/_/ \_\_|_\/_/ \_\____|____/_/ \_\/_/\_\ |_|  |_/_/ \_\_| |_| |___|_|\_|\___|
+		//
+		// =======================================================================
+		void HQ_DoParallaxMapping( inout arkPixelContext_t _pixelCtx ) {
+			#if !$(tool/unlit)
+				// ARKANE: bmayaux (2014-05-19) Parallax Occlusion Mapping will modify tex coords
+				#if $useParallaxMapping
+					float	maxDisplacementHeight_mm = 10.0 * $parallaxHeight_cm;	// In millimeters
+					float3	wsPosition = _pixelCtx.m_wsPosition;
+					float4	Debug = ComputeParallaxDisplacement( $heightMap, maxDisplacementHeight_mm, $texelsPerMeter, $parallaxMaxStepsCount, -_pixelCtx.m_wsView, _pixelCtx.m_wsTangent, _pixelCtx.m_wsBiTangent, _pixelCtx.m_wsNormal, wsPosition, _pixelCtx.m_layerTexCoords[0] );
+
+// Laurent: I know you don't like misaligned stuff but this is made to attract the eye, so I don't forget to find out why this problem is happenning.
+//			If it's correctly aligned, I'll just forget about it...
+// Ignore world position displacement for now because we have no solution to avoid ugly self-shadowing
+// _pixelCtx.m_wsPosition = wsPosition;
+				#endif
+			#endif	// !$(tool/unlit)
+		}
+
+		void AQ_DoParallaxMapping( inout arkPixelContext_t _pixelCtx ) {
+			#if !$(tool/unlit)
+				#if $useParallaxMapping
+					float	maxDisplacementHeight_mm = 10.0 * $parallaxHeight_cm;	// In millimeters
+					float3	wsPosition = _pixelCtx.m_wsPosition;
+					float4	Debug = ComputeParallaxDisplacement( $heightMap, maxDisplacementHeight_mm, $texelsPerMeter, $parallaxMaxStepsCount/2, -_pixelCtx.m_wsView, _pixelCtx.m_wsTangent, _pixelCtx.m_wsBiTangent, _pixelCtx.m_wsNormal, wsPosition, _pixelCtx.m_layerTexCoords[0] );
+				#endif
+			#endif
+		}
+
+		// =======================================================================
+		//  __  __   _   ___ _  _____
+		// |  \/  | /_\ / __| |/ / __|
+		// | |\/| |/ _ \\__ \ ' <\__ \
+		// |_|  |_/_/ \_\___/_|\_\___/
+		//
+		// =======================================================================
+		void HQ_FetchMasks( inout arkPixelContext_t _pixelCtx ) {
+			float layer0_mask = 0.0;
+			#if $use_Layer0_ColorConstant
+				#if $isCloth && $Layer0_MaskMode != 1
+					_pixelCtx.m_masks[0] = 1.0;
+				#else
+					#if $Layer0_MaskMode == 0
+						_pixelCtx.m_masks[0] = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+					#elif $Layer0_MaskMode == 1
+						layer0_mask = $Layer0_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[0]);
+						_pixelCtx.m_masks[0] = layer0_mask;
+					#else
+						layer0_mask = $Layer0_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[0]).r;
+						float L0_M1 = layer0_mask;
+						float L0_M2 = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+						//M1 = M1 * M1;
+						float L0_M = L0_M1 * L0_M2;
+						_pixelCtx.m_masks[0] = LinearStep( $Layer0_RescaleValues.x, $Layer0_RescaleValues.y, L0_M );
+					#endif
+				#endif
+			#else
+				_pixelCtx.m_masks[0] = 0;
+			#endif
+
+			#if $Layer0_InvertMask
+				_pixelCtx.m_masks[0] = 1-_pixelCtx.m_masks[0];
+			#endif
+
+			#if( $extraLayer > 0 )
+				float layer1_mask = 0.0;
+
+				#if $isCloth && $Layer1_MaskMode != 1
+					_pixelCtx.m_masks[1] = 1.0;
+				#else
+					#if $Layer1_MaskMode == 0
+						_pixelCtx.m_masks[1] = _pixelCtx.m_vertexColor[$Layer1_VtxColorMaskChannel];
+					#elif $Layer1_MaskMode == 1
+						#if $Layer1_maskReuseLayer
+							layer1_mask = layer0_mask;
+						#else
+							layer1_mask = $Layer1_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[1]).r;
+						#endif
+						_pixelCtx.m_masks[1] = layer1_mask;
+					#else
+						#if $Layer1_maskReuseLayer
+							layer1_mask = layer0_mask;
+						#else
+							layer1_mask = $Layer1_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[1]).r;
+						#endif
+						float L1_M1 = layer1_mask;
+						float L1_M2 = _pixelCtx.m_vertexColor[$Layer1_VtxColorMaskChannel];
+						//M1 = M1 * M1;
+						float L1_M = L1_M1 * L1_M2;
+						_pixelCtx.m_masks[1] = LinearStep( $Layer1_RescaleValues.x, $Layer1_RescaleValues.y, L1_M );
+					#endif
+				#endif
+
+				#if $Layer1_InvertMask
+					_pixelCtx.m_masks[1] = 1-_pixelCtx.m_masks[1];
+				#endif
+
+				#if( $extraLayer > 1 )
+					float layer2_mask = 0.0;
+
+					#if $isCloth && $Layer2_MaskMode != 1
+						_pixelCtx.m_masks[2] = 1.0;
+					#else
+						#if $Layer2_MaskMode == 0
+							_pixelCtx.m_masks[2] = _pixelCtx.m_vertexColor[$Layer2_VtxColorMaskChannel];
+						#elif $Layer2_MaskMode == 1
+							#if $Layer2_maskReuseLayer == 0
+								layer2_mask = $Layer2_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[2]).r;
+							#elif $Layer2_maskReuseLayer == 1
+								layer2_mask = layer0_mask;
+							#else
+								layer2_mask = layer1_mask;
+							#endif
+							_pixelCtx.m_masks[2] = layer2_mask;
+						#else
+							#if $Layer2_maskReuseLayer == 0
+								layer2_mask = $Layer2_Maskmap.Sample($anisotropicSampler, _pixelCtx.m_maskTexCoords[2]).r;
+							#elif $Layer2_maskReuseLayer == 1
+								layer2_mask = layer0_mask;
+							#else
+								layer2_mask = layer1_mask;
+							#endif
+							float L2_M1 = layer2_mask;
+							float L2_M2 = _pixelCtx.m_vertexColor[$Layer2_VtxColorMaskChannel];
+							float L2_M = L2_M1 * L2_M2;
+							_pixelCtx.m_masks[2] = LinearStep( $Layer2_RescaleValues.x, $Layer2_RescaleValues.y, L2_M );
+						#endif
+					#endif
+					#if $Layer2_InvertMask
+						_pixelCtx.m_masks[2] = 1-_pixelCtx.m_masks[2];
+					#endif
+
+				#endif
+			#endif
+		}
+
+		void AQ_FetchMasks( inout arkPixelContext_t _pixelCtx ) {
+			float layer0_mask = 0.0;
+			#if $use_Layer0_ColorConstant
+				#if $isCloth && $Layer0_MaskMode != 1
+					_pixelCtx.m_masks[0] = 1.0;
+				#else
+					#if $Layer0_MaskMode == 0
+						_pixelCtx.m_masks[0] = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+					#elif $Layer0_MaskMode == 1
+						layer0_mask = $Layer0_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[0]);
+						_pixelCtx.m_masks[0] = layer0_mask;
+					#else
+						layer0_mask = $Layer0_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[0]).r;
+						float L0_M1 = layer0_mask;
+						float L0_M2 = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+						//M1 = M1 * M1;
+						float L0_M = L0_M1 * L0_M2;
+						_pixelCtx.m_masks[0] = LinearStep( $Layer0_RescaleValues.x, $Layer0_RescaleValues.y, L0_M );
+					#endif
+				#endif
+			#else
+				_pixelCtx.m_masks[0] = 0;
+			#endif
+
+			#if $Layer0_InvertMask
+				_pixelCtx.m_masks[0] = 1-_pixelCtx.m_masks[0];
+			#endif
+
+			#if( $extraLayer > 0 )
+				float layer1_mask = 0.0;
+
+				#if $isCloth && $Layer1_MaskMode != 1
+					_pixelCtx.m_masks[1] = 1.0;
+				#else
+					#if $Layer1_MaskMode == 0
+						_pixelCtx.m_masks[1] = _pixelCtx.m_vertexColor[$Layer1_VtxColorMaskChannel];
+					#elif $Layer1_MaskMode == 1
+						#if $Layer1_maskReuseLayer
+							layer1_mask = layer0_mask;
+						#else
+							layer1_mask = $Layer1_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[1]).r;
+						#endif
+						_pixelCtx.m_masks[1] = layer1_mask;
+					#else
+						#if $Layer1_maskReuseLayer
+							layer1_mask = layer0_mask;
+						#else
+							layer1_mask = $Layer1_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[1]).r;
+						#endif
+						float L1_M1 = layer1_mask;
+						float L1_M2 = _pixelCtx.m_vertexColor[$Layer1_VtxColorMaskChannel];
+						//M1 = M1 * M1;
+						float L1_M = L1_M1 * L1_M2;
+						_pixelCtx.m_masks[1] = LinearStep( $Layer1_RescaleValues.x, $Layer1_RescaleValues.y, L1_M );
+					#endif
+				#endif
+				#if $Layer1_InvertMask
+					_pixelCtx.m_masks[1] = 1-_pixelCtx.m_masks[1];
+				#endif
+			#endif
+		}
+
+		void LQ_FetchMasks( inout arkPixelContext_t _pixelCtx ) {
+			float layer0_mask = 0.0;
+			#if $use_Layer0_ColorConstant
+				#if $isCloth && $Layer0_MaskMode != 1
+					_pixelCtx.m_masks[0] = 1.0;
+				#else
+					#if $Layer0_MaskMode == 0
+						_pixelCtx.m_masks[0] = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+					#elif $Layer0_MaskMode == 1
+						layer0_mask = $Layer0_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[0]);
+						_pixelCtx.m_masks[0] = layer0_mask;
+					#else
+						layer0_mask = $Layer0_Maskmap.Sample($trilinearSampler, _pixelCtx.m_maskTexCoords[0]).r;
+						float L0_M1 = layer0_mask;
+						float L0_M2 = _pixelCtx.m_vertexColor[$Layer0_VtxColorMaskChannel];
+						//M1 = M1 * M1;
+						float L0_M = L0_M1 * L0_M2;
+						_pixelCtx.m_masks[0] = LinearStep( $Layer0_RescaleValues.x, $Layer0_RescaleValues.y, L0_M );
+					#endif
+				#endif
+			#else
+				_pixelCtx.m_masks[0] = 0;
+			#endif
+
+			#if $Layer0_InvertMask
+				_pixelCtx.m_masks[0] = 1-_pixelCtx.m_masks[0];
+			#endif
+		}
+
+		// =======================================================================
+		//    _   _    ___ ___ ___   ___
+		//   /_\ | |  | _ ) __|   \ / _ \
+		//  / _ \| |__| _ \ _|| |) | (_) |
+		// /_/ \_\____|___/___|___/ \___/
+		//
+		// =======================================================================
+		void HQ_FetchDiffuseAlbedo( inout arkPixelContext_t _pixelCtx ) {
+			// ==== Sample diffuse albedo ====
+			#if $alphaTest
+				float4 Layer0_DiffuseTexture = $diffusemap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] );
+			#else
+				float4 Layer0_DiffuseTexture = $diffusemap.Sample( $anisotropicSamplerHQ, _pixelCtx.m_layerTexCoords[0] );
+			#endif
+			_pixelCtx.m_diffuseAlbedo = Layer0_DiffuseTexture;
+
+			#if $alphaTest && !$glossInDiffuseAlpha && !$(tool/unlit)
+				clip( _pixelCtx.m_diffuseAlbedo.w - $DefaultAlphaTest );
+			#endif
+
+			#if $use_Layer0_ColorConstant
+				float4 layer0_ColorConstant = lerp( float4(1,1,1,1), $Layer0_ColorConstant, _pixelCtx.m_masks[0] );
+				_pixelCtx.m_diffuseAlbedo *= layer0_ColorConstant;
+			#endif
+
+			#if( $extraLayer > 0 )
+				#if( $Layer1_diffuseReuseLayer )
+					float4 Layer1_DiffuseTexture = Layer0_DiffuseTexture;
+				#else
+					float4 Layer1_DiffuseTexture = $Layer1_diffuseMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[1] );
+				#endif
+				float4 Layer1_Diffuse = Layer1_DiffuseTexture;
+				#if $use_Layer1_ColorConstant
+					Layer1_Diffuse *= $Layer1_ColorConstant;
+				#endif
+
+				_pixelCtx.m_diffuseAlbedo = lerp( _pixelCtx.m_diffuseAlbedo, Layer1_Diffuse, _pixelCtx.m_masks[1] );
+
+				#if( $extraLayer > 1 )
+					#if( $Layer2_diffuseReuseLayer == 2 )
+						float4 Layer2_Diffuse = Layer1_DiffuseTexture;
+					#elif( $Layer2_diffuseReuseLayer == 1 )
+						float4 Layer2_Diffuse = Layer0_DiffuseTexture;
+					#else
+						float4 Layer2_Diffuse = $Layer2_diffuseMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[2] );
+					#endif
+
+					#if $use_Layer2_ColorConstant
+						Layer2_Diffuse *= $Layer2_ColorConstant;
+					#endif
+
+					_pixelCtx.m_diffuseAlbedo = lerp( _pixelCtx.m_diffuseAlbedo, Layer2_Diffuse, _pixelCtx.m_masks[2] );
+				#endif
+			#endif
+
+			#if $staticDecalCount > 0
+				_pixelCtx.m_diffuseAlbedo = lerp( _pixelCtx.m_diffuseAlbedo, _pixelCtx.m_staticDecalDiffuse, _pixelCtx.m_staticDecalDiffuse.a );
+			#endif
+
+			#if $(tool/unlit)
+				float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, _pixelCtx.m_diffuseAlbedo.a) ), _pixelCtx.m_diffuseAlbedo, $wireFrameBlend);
+				color.rgb *= _pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+				#if $alphaTest
+					clip( color.a - $wireFrameBlend * $DefaultAlphaTest );
+				#endif
+				_pixelCtx.m_diffuseAlbedo = color;
+			#endif
+
+			#if $VtxColorMultiply || ($useParticleColorInstancing && !$isShadow && (!$isZPrePass || $isZPrePassAlpha))
+				_pixelCtx.m_diffuseAlbedo *= _pixelCtx.m_vertexColor;
+			#endif
+
+			#if $hasDynamicDecals
+				_pixelCtx.m_diffuseAlbedo.rgb = lerp( _pixelCtx.m_diffuseAlbedo.rgb, _pixelCtx.m_dynamicDecal.rgb, _pixelCtx.m_dynamicDecal.a );
+			#endif
+
+			#if $hasAnimatedEmissive && $emissiveAsGoo
+				float3 gooColor = $emissiveGooColor.xyz * $emissiveGooColor.www;
+				_pixelCtx.m_diffuseAlbedo.xyz = lerp( _pixelCtx.m_diffuseAlbedo.xyz, gooColor, _pixelCtx.m_animatedEmissiveMask);
+			#endif
+
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					_pixelCtx.m_diffuseAlbedo.xyz = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			_pixelCtx.m_diffuseAlbedo = max( _pixelCtx.m_diffuseAlbedo, 0.00001 );
+		}
+
+		void AQ_FetchDiffuseAlbedo( inout arkPixelContext_t _pixelCtx ) {
+			// ==== Sample diffuse albedo ====
+			float4 Layer0_DiffuseTexture = $diffusemap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] );
+			_pixelCtx.m_diffuseAlbedo = Layer0_DiffuseTexture;
+
+			#if $alphaTest && !$(tool/unlit)
+				clip( _pixelCtx.m_diffuseAlbedo.w - 0.5 );
+			#endif
+
+			#if $use_Layer0_ColorConstant
+				float4 layer0_ColorConstant = lerp( float4(1,1,1,1), $Layer0_ColorConstant, _pixelCtx.m_masks[0] );
+				_pixelCtx.m_diffuseAlbedo *= layer0_ColorConstant;
+			#endif
+
+			#if( $extraLayer > 0 )
+				#if( $Layer1_diffuseReuseLayer )
+					float4 Layer1_DiffuseTexture = Layer0_DiffuseTexture;
+				#else
+					float4 Layer1_DiffuseTexture = $Layer1_diffuseMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[1] );
+				#endif
+				float4 Layer1_Diffuse = Layer1_DiffuseTexture;
+				#if $use_Layer1_ColorConstant
+					Layer1_Diffuse *= $Layer1_ColorConstant;
+				#endif
+
+				_pixelCtx.m_diffuseAlbedo = lerp( _pixelCtx.m_diffuseAlbedo, Layer1_Diffuse, _pixelCtx.m_masks[1] );
+			#endif
+
+			#if $staticDecalCount > 0
+				_pixelCtx.m_diffuseAlbedo = lerp( _pixelCtx.m_diffuseAlbedo, _pixelCtx.m_staticDecalDiffuse, _pixelCtx.m_staticDecalDiffuse.a );
+			#endif
+
+			#if $(tool/unlit)
+				float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, _pixelCtx.m_diffuseAlbedo.a) ), _pixelCtx.m_diffuseAlbedo, $wireFrameBlend);
+				color *= _pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+				#if $alphaTest
+					clip( color.a - $wireFrameBlend * 0.5 );
+				#endif
+				_pixelCtx.m_diffuseAlbedo = color;
+			#endif
+
+			#if $VtxColorMultiply
+				_pixelCtx.m_diffuseAlbedo *= _pixelCtx.m_vertexColor;
+			#endif
+
+			#if $hasDynamicDecals
+				_pixelCtx.m_diffuseAlbedo.rgb = lerp( _pixelCtx.m_diffuseAlbedo.rgb, _pixelCtx.m_dynamicDecal.rgb, _pixelCtx.m_dynamicDecal.a );
+			#endif
+
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					_pixelCtx.m_diffuseAlbedo = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			_pixelCtx.m_diffuseAlbedo = max( _pixelCtx.m_diffuseAlbedo, 0.00001 );
+		}
+
+		void LQ_FetchDiffuseAlbedo( inout arkPixelContext_t _pixelCtx ) {
+			// ==== Sample diffuse albedo ====
+			float4 Layer0_DiffuseTexture = $diffusemap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] );
+			_pixelCtx.m_diffuseAlbedo = Layer0_DiffuseTexture;
+
+			#if $alphaTest && !$(tool/unlit)
+				clip( _pixelCtx.m_diffuseAlbedo.w - 0.5 );
+			#endif
+
+			#if $use_Layer0_ColorConstant
+				float4 layer0_ColorConstant = lerp( float4(1,1,1,1), $Layer0_ColorConstant, _pixelCtx.m_masks[0] );
+				_pixelCtx.m_diffuseAlbedo *= layer0_ColorConstant;
+			#endif
+
+			#if $(tool/unlit)
+				float4 color = lerp(float4($wireFrameColor.rgb, lerp(0.25, 0.75, _pixelCtx.m_diffuseAlbedo.a) ), _pixelCtx.m_diffuseAlbedo, $wireFrameBlend);
+				color *= _pixelCtx.m_frontFaceFactor < 0.0 ? 0.5 : 1.0;
+				#if $alphaTest
+					clip( color.a - $wireFrameBlend * 0.5 );
+				#endif
+				_pixelCtx.m_diffuseAlbedo = color;
+			#endif
+
+			#if $VtxColorMultiply
+				_pixelCtx.m_diffuseAlbedo *= _pixelCtx.m_vertexColor;
+			#endif
+
+			#if $hasDynamicDecals
+				_pixelCtx.m_diffuseAlbedo.rgb = lerp( _pixelCtx.m_diffuseAlbedo.rgb, _pixelCtx.m_dynamicDecal.rgb, _pixelCtx.m_dynamicDecal.a );
+			#endif
+
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
+					_pixelCtx.m_diffuseAlbedo = 0.5;	// Replace by a 50% reflector
+				}
+			#endif
+
+			_pixelCtx.m_diffuseAlbedo = max( _pixelCtx.m_diffuseAlbedo, 0.00001 );
+		}
+
+		// =======================================================================
+		//  _____ ___ _  _
+		// |_   _| _ ) \| |
+		//   | | | _ \ .` |
+		//   |_| |___/_|\_|
+		//
+		// Compute tangent space & normal, returns tangent space normal
+        // =======================================================================
+		float3 HQ_FetchAndComputeNormalAndTBN( inout arkPixelContext_t _pixelCtx ) {
+			#if $hasBumpMap
+				float2 Layer0_rawTsNormal = $bumpmap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).xy;
+				float2 rawTsNormal = Layer0_rawTsNormal;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_bumpReuseLayer )
+						float2 Layer1_rawTsNormal = $Layer1_bumpMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[1] ).xy;
+						rawTsNormal = lerp( rawTsNormal, Layer1_rawTsNormal, _pixelCtx.m_masks[1] );
+					#endif
+
+					#if( $extraLayer > 1 )
+
+						#if( $Layer2_bumpReuseLayer == 2 )
+							float2 Layer2_rawTsNormal = Layer1_rawTsNormal;
+						#elif( $Layer2_bumpReuseLayer == 1 )
+							float2 Layer2_rawTsNormal = Layer0_rawTsNormal;
+						#else
+							float2 Layer2_rawTsNormal = $Layer2_bumpMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[2] ).xy;
+						#endif
+
+						rawTsNormal = lerp( rawTsNormal, Layer2_rawTsNormal, _pixelCtx.m_masks[2] );
+					#endif
+				#endif
+
+				#if $staticDecalCount > 0
+					rawTsNormal *= lerp( 1.0, (1.0-$decals_baseNormalOverrideFactor.x), _pixelCtx.m_staticDecalDiffuse.a);
+				#endif
+
+				#if $(hasDetailBumpMap)
+					float decalDetailFactor = 1.0;
+					#if $staticDecalCount > 0
+						decalDetailFactor = lerp( 1.0, (1.0-$decals_detailNormalOverrideFactor.x), _pixelCtx.m_staticDecalDiffuse.a);
+					#endif
+					rawTsNormal += decalDetailFactor * $detailBumpmap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] * $detailBumpmapTiling.x ).xy * $detailBumpmapIntensity.x;
+				#endif
+
+				#if $staticDecalCount > 0
+					rawTsNormal += _pixelCtx.m_staticDecalTSnormal * _pixelCtx.m_staticDecalDiffuse.a;
+				#endif
+
+				float3	tsNormal = UnpackBC5NormalMap( rawTsNormal );
+
+				#if $hasAnimatedEmissive && $emissiveAsGoo
+					tsNormal = lerp( tsNormal, float3(0,0,1), saturate( _pixelCtx.m_animatedEmissiveMask-(1.0-$emissiveGooNormalSmoothing.x) ));
+				#endif
+
+				#if $hasDynamicDecals
+					tsNormal = lerp( tsNormal, float3(0,0,1), saturate( (1.0-( pow( 1.0-_pixelCtx.m_dynamicDecal.a, $dynamicDecalNormalSmoothingPower.x ) ))-(1.0-$dynamicDecalNormalSmoothing.x) ));
+				#endif
+
+				#if $(Wrinkles/enable)
+					ApplyWrinkles( _pixelCtx.m_wrinkle, _pixelCtx.m_layerTexCoords[0], 0.0f, tsNormal );
+				#endif
+
+				// Compute final world space tangent space
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
+				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
+
+				return tsNormal;
+
+			#elif $useParallaxMapping
+				// Determine normal from height map alone
+				float	maxDisplacementHeight_mm = 10.0 * $parallaxHeight_cm;	// In millimeters
+				float3  tsNormal  = ReComputeNormalFromHeightMap( $heightMap, maxDisplacementHeight_mm, $texelsPerMeter, _pixelCtx.m_layerTexCoords[0].xy, $parallaxNormalSmoothFactor, _pixelCtx.m_wsTangent, _pixelCtx.m_wsBiTangent, _pixelCtx.m_wsNormal );
+				return tsNormal;
+
+			#else
+				return float3( 0.0, 0.0, 1.0 );
+			#endif
+		}
+
+		float3 AQ_FetchAndComputeNormalAndTBN( inout arkPixelContext_t _pixelCtx ) {
+			#if $hasBumpMap
+				float2 Layer0_rawTsNormal = $bumpmap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).xy;
+				float2 rawTsNormal = Layer0_rawTsNormal;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_bumpReuseLayer )
+						float2 Layer1_rawTsNormal = $Layer1_bumpMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[1] ).xy;
+						rawTsNormal = lerp( rawTsNormal, Layer1_rawTsNormal, _pixelCtx.m_masks[1] );
+					#endif
+				#endif
+
+				#if $staticDecalCount > 0
+					rawTsNormal += _pixelCtx.m_staticDecalTSnormal * _pixelCtx.m_staticDecalDiffuse.a;
+				#endif
+
+				float3	tsNormal = UnpackBC5NormalMap( rawTsNormal );
+
+				// Compute final world space tangent space
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
+				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
+				return tsNormal;
+			#endif
+			return float3( 0.0, 0.0, 1.0 );
+		}
+
+		float3 LQ_FetchAndComputeNormalAndTBN( inout arkPixelContext_t _pixelCtx ) {
+			#if $hasBumpMap
+				float2 rawTsNormal = $bumpmap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).xy;
+				float3	tsNormal = UnpackBC5NormalMap( rawTsNormal );
+
+				// Compute final world space tangent space
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
+				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
+				return tsNormal;
+			#elif $useParallaxMapping
+				// Determine normal from height map alone
+				float	maxDisplacementHeight_mm = 10.0 * $parallaxHeight_cm;	// In millimeters
+				float3  tsNormal  = ReComputeNormalFromHeightMap( $heightMap, maxDisplacementHeight_mm, $texelsPerMeter, _pixelCtx.m_layerTexCoords[0].xy, $parallaxNormalSmoothFactor, _pixelCtx.m_wsTangent, _pixelCtx.m_wsBiTangent, _pixelCtx.m_wsNormal );
+				return tsNormal;
+
+			#else
+				return float3( 0.0, 0.0, 1.0 );
+			#endif
+		}
+
+		// =======================================================================
+		//    _   ___
+		//   /_\ / _ \
+		//  / _ \ (_) |
+		// /_/ \_\___/
+		//
+		// =======================================================================
+		float HQ_FetchAO( float2 texcoord ) {
+			float AOFactor = 1.0f;
+			#if($hasOcclusionMap)
+				AOFactor = $occlusionMap.Sample( $trilinearSampler, texcoord ).r;
+			#endif
+			return AOFactor;
+		}
+
+		float AQ_FetchAO( float2 texcoord ) {
+			float AOFactor = 1.0f;
+			#if($hasOcclusionMap)
+				AOFactor = $occlusionMap.Sample( $trilinearSampler, texcoord ).r;
+			#endif
+			return AOFactor;
+		}
+
+		float LQ_FetchAO( ) {
+			return 1.0;
+		}
+
+		#if $useSelfShadowedBumpMap
+			// Builds the world-space HL2 basis (required by self-shadowed bump mapping)
+			// From http://www2.ati.com/developer/gdc/d3dtutorial10_half-life2_shading.pdf
+			//
+			void BuildWorldSpaceHL2Basis( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+				const float3 tsHL2Basis_R = float3(  sqrt(2.0/3.0),            0.0, sqrt(1.0/3.0) );
+				const float3 tsHL2Basis_G = float3( -sqrt(1.0/6.0),  sqrt(1.0/2.0), sqrt(1.0/3.0) );
+				const float3 tsHL2Basis_B = float3( -sqrt(1.0/6.0), -sqrt(1.0/2.0), sqrt(1.0/3.0) );
+
+				// Transformation to world space must use the original geometric TBN since HL2 basis is expressed in that original tangent space
+				_surf.wsHL2Basis_R = tsHL2Basis_R.x * _pixelCtx.m_wsVertexTangent + tsHL2Basis_R.y * _pixelCtx.m_wsVertexBiTangent + tsHL2Basis_R.z * _pixelCtx.m_wsVertexNormal;
+				_surf.wsHL2Basis_G = tsHL2Basis_G.x * _pixelCtx.m_wsVertexTangent + tsHL2Basis_G.y * _pixelCtx.m_wsVertexBiTangent + tsHL2Basis_G.z * _pixelCtx.m_wsVertexNormal;
+				_surf.wsHL2Basis_B = tsHL2Basis_B.x * _pixelCtx.m_wsVertexTangent + tsHL2Basis_B.y * _pixelCtx.m_wsVertexBiTangent + tsHL2Basis_B.z * _pixelCtx.m_wsVertexNormal;
+				_surf.wsHL2Basis_N = _pixelCtx.m_wsVertexNormal;
+			}
+		#endif
+
+		void HQ_ComputeAO( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			// Sample ambient occlusion
+			#if !$useSelfShadowedBumpMap
+				_surf.AO = HQ_FetchAO( _pixelCtx.m_layerTexCoords[0] );
+			#else
+				// We get the standard AO and directional occlusion factors in a 4D vector
+				// AO is stored in alpha but must be first component
+				_surf.AO = $selfShadowedBumpMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).wxyz;
+
+				BuildWorldSpaceHL2Basis( _pixelCtx, _surf );
+			#endif
+		}
+
+		void AQ_ComputeAO( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			// Sample ambient occlusion
+			#if !$useSelfShadowedBumpMap
+				_surf.AO = AQ_FetchAO( _pixelCtx.m_layerTexCoords[0] );
+			#else
+				// We get the standard AO and directional occlusion factors in a 4D vector
+				_surf.AO = $selfShadowedBumpMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).wxyz;	// AO is stored in alpha but must be first component
+
+				BuildWorldSpaceHL2Basis( _pixelCtx, _surf );
+			#endif
+		}
+
+		void LQ_ComputeAO( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			// Sample ambient occlusion
+			#if !$useSelfShadowedBumpMap
+				_surf.AO = LQ_FetchAO( );
+			#endif
+		}
+
+		// =======================================================================
+		//   ___ _    ___  ___ ___
+		//  / __| |  / _ \/ __/ __|
+		// | (_ | |_| (_) \__ \__ \
+		//  \___|____\___/|___/___/
+		//
+		// =======================================================================
+		float HQ_FetchGloss( inout arkPixelContext_t _pixelCtx ) {
+			#if $glossInDiffuseAlpha
+				// Use already masked and interpolated gloss that we find in diffuse alpha
+				float gloss = lerp( $wardRoughness.x, $wardRoughness.y, _pixelCtx.m_diffuseAlbedo.w );
+				_pixelCtx.m_diffuseAlbedo.w = 1.0;	// Now that we don't need the alpha anymore, make the diffuse fully opaque
+
+			#else	// !$glossInDiffuseAlpha
+
+				#if $hasGlossMap
+					// Fetch and interpolate gloss from distinct maps
+					float Layer0_Gloss = $glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+
+					float	gloss = Layer0_Gloss;
+					#if( $extraLayer > 0 )
+						#if( $Layer1_glossReuseLayer )
+							float Layer1_Gloss = Layer0_Gloss;
+						#else
+							float Layer1_Gloss = $Layer1_glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[1] ).x;
+							gloss = lerp( gloss, Layer1_Gloss, _pixelCtx.m_masks[1] );
+						#endif
+
+						#if( $extraLayer > 1 )
+							#if( $Layer2_glossReuseLayer == 2 )
+								float Layer2_Gloss = Layer1_Gloss;
+							#elif( $Layer2_glossReuseLayer == 1 )
+								float Layer2_Gloss = Layer0_Gloss;
+							#else
+								float Layer2_Gloss = $Layer2_glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[2] );
+							#endif
+							gloss = lerp( gloss, Layer2_Gloss, _pixelCtx.m_masks[2] );
+						#endif
+					#endif
+
+					gloss = lerp( $wardRoughness.x, $wardRoughness.y, gloss );
+
+				#else	// !$hasGlossMap
+					float gloss = $wardRoughness.y;	// Default is max value
+				#endif
+
+			#endif	// !$glossInDiffuseAlpha
+
+			#if $staticDecalCount > 0
+				#if $hasDecal1Gloss || $hasDecal2Gloss || $hasDecal3Gloss
+					gloss = lerp( gloss, _pixelCtx.m_staticDecalGloss, _pixelCtx.m_staticDecalDiffuse.a);
+				#endif
+			#endif
+
+			#if $hasAnimatedEmissive && $emissiveAsGoo
+				gloss = lerp( gloss, $emissiveGooGloss.x, _pixelCtx.m_animatedEmissiveMask);
+			#endif
+
+			#if $hasDynamicDecals
+				gloss = lerp( gloss, $dynamicDecalGloss.x, 1.0-( pow( 1.0-_pixelCtx.m_dynamicDecal.a, $dynamicDecalGlossPower.x ) ) );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 128) != 0 ) {
+					gloss = $(indirectLighting/glossMetalOverrides).x;	// Override gloss
+				}
+			#endif
+
+			return gloss;
+		}
+
+		float3 HQ_FetchGloss2( const arkPixelContext_t _pixelCtx ) {
+			float3 gloss = float3( $wardRoughness.y, $wardRoughness2.y, $wardRoughness3.y );	// Default is max value
+
+			#if $hasGlossMap
+				float Layer0_Gloss = $glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				gloss = Layer0_Gloss.xxx;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_glossReuseLayer )
+						float Layer1_Gloss = $Layer1_glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[1] ).x;
+						gloss = lerp( gloss, Layer1_Gloss.xxx, _pixelCtx.m_masks[1] );
+					#endif
+
+					#if( $extraLayer > 1 )
+						#if( $Layer2_glossReuseLayer == 2 )
+							float Layer2_Gloss = Layer1_Gloss;
+						#elif( $Layer2_glossReuseLayer == 1 )
+							float Layer2_Gloss = Layer0_Gloss;
+						#else
+							float Layer2_Gloss = $Layer2_glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[2] );
+						#endif
+						gloss = lerp( gloss, Layer2_Gloss.xxx, _pixelCtx.m_masks[2] );
+					#endif
+				#endif
+
+				gloss.x = lerp( $wardRoughness.x, $wardRoughness.y, gloss.x );
+				gloss.y = lerp( $wardRoughness2.x, $wardRoughness2.y, gloss.y );
+				gloss.z = lerp( $wardRoughness3.x, $wardRoughness3.y, gloss.z );
+			#endif
+
+			#if $staticDecalCount > 0
+				#if $hasDecal1Gloss || $hasDecal2Gloss || $hasDecal3Gloss
+					gloss = lerp( gloss, _pixelCtx.m_staticDecalGloss, _pixelCtx.m_staticDecalDiffuse.a);
+				#endif
+			#endif
+
+			#if $hasAnimatedEmissive && $emissiveAsGoo
+				gloss = lerp( gloss, $emissiveGooGloss.x, _pixelCtx.m_animatedEmissiveMask);
+			#endif
+
+			#if $hasDynamicDecals
+				gloss = lerp( gloss, $dynamicDecalGloss.x, 1.0-( pow( 1.0-_pixelCtx.m_dynamicDecal.a, $dynamicDecalGlossPower.x ) ) );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 128) != 0 ) {
+					gloss = $(indirectLighting/glossMetalOverrides).x;	// Override gloss
+				}
+			#endif
+
+			return gloss;
+		}
+
+		float AQ_FetchGloss( const arkPixelContext_t _pixelCtx ) {
+			float gloss = $wardRoughness.y;	// Default is max value
+
+			#if $hasGlossMap
+				float Layer0_Gloss = $glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				gloss = Layer0_Gloss;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_glossReuseLayer )
+						float Layer1_Gloss = $Layer1_glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[1] ).x;
+						gloss = lerp( gloss, Layer1_Gloss, _pixelCtx.m_masks[1] );
+					#endif
+				#endif
+
+				gloss = lerp( $wardRoughness.x, $wardRoughness.y, gloss );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 128) != 0 ) {
+					gloss = $(indirectLighting/glossMetalOverrides).x;	// Override gloss
+				}
+			#endif
+
+			return gloss;
+		}
+
+		float LQ_FetchGloss( const arkPixelContext_t _pixelCtx ) {
+			float gloss = $wardRoughness.y;	// Default is max value
+
+			#if $hasGlossMap
+				gloss = $glossMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				gloss = lerp( $wardRoughness.x, $wardRoughness.y, gloss );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 128) != 0 ) {
+					gloss = $(indirectLighting/glossMetalOverrides).x;	// Override gloss
+				}
+			#endif
+
+			return gloss;
+		}
+
+		// =======================================================================
+		//  __  __ ___ _____ _   _    _    ___ ___
+		// |  \/  | __|_   _/_\ | |  | |  |_ _/ __|
+		// | |\/| | _|  | |/ _ \| |__| |__ | | (__
+		// |_|  |_|___| |_/_/ \_\____|____|___\___|
+		//
+		// =======================================================================
+		float HQ_FetchMetallic( const arkPixelContext_t _pixelCtx ) {
+			// ======================================================
+			// ==== Sample metallic map ====
+			float metallic = $metallicMinMax.y;	// Default is max value
+
+			#if $hasMetallicMap
+				float Layer0_metallic = $metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				metallic = Layer0_metallic;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_metallicReuseLayer )
+						float Layer1_metallic = $Layer1_metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[1] ).x;
+						metallic = lerp( metallic, Layer1_metallic, _pixelCtx.m_masks[1] );
+					#endif
+
+					#if( $extraLayer > 1 )
+						#if( $Layer2_metallicReuseLayer == 2 )
+							float Layer2_metallic = Layer1_metallic;
+						#elif( $Layer2_metallicReuseLayer == 1 )
+							float Layer2_metallic = Layer0_metallic;
+						#else
+							float Layer2_metallic = $Layer2_metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[2] );
+						#endif
+						metallic = lerp( metallic, Layer2_metallic, _pixelCtx.m_masks[2] );
+					#endif
+				#endif
+
+				metallic = lerp( $metallicMinMax.x, $metallicMinMax.y, metallic );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 256) != 0 ) {
+					metallic = $(indirectLighting/glossMetalOverrides).y;	// Override metal
+				}
+			#endif
+
+			return metallic;
+		}
+
+		float AQ_FetchMetallic( const arkPixelContext_t _pixelCtx ) {
+			// ======================================================
+			// ==== Sample metallic map ====
+			float metallic = $metallicMinMax.y;	// Default is max value
+
+			#if $hasMetallicMap
+				float Layer0_metallic = $metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				metallic = Layer0_metallic;
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_metallicReuseLayer )
+						float Layer1_metallic = $Layer1_metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[1] ).x;
+						metallic = lerp( metallic, Layer1_metallic, _pixelCtx.m_masks[1] );
+					#endif
+				#endif
+
+				metallic = lerp( $metallicMinMax.x, $metallicMinMax.y, metallic );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 256) != 0 ) {
+					metallic = $(indirectLighting/glossMetalOverrides).y;	// Override metal
+				}
+			#endif
+
+			return metallic;
+		}
+
+		float LQ_FetchMetallic( const arkPixelContext_t _pixelCtx ) {
+			// ======================================================
+			// ==== Sample metallic map ====
+			float metallic = $metallicMinMax.y;	// Default is max value
+
+			#if $hasMetallicMap
+				metallic = $metallicMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).x;
+				metallic = lerp( $metallicMinMax.x, $metallicMinMax.y, metallic );
+			#endif
+
+			// ===== DEBUG =====
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 256) != 0 ) {
+					metallic = $(indirectLighting/glossMetalOverrides).y;	// Override metal
+				}
+			#endif
+
+			return metallic;
+		}
+
+		// =======================================================================
+		//  ___ _  _ ___ ___ _  _
+		// / __| || | __| __| \| |
+		// \__ \ __ | _|| _|| .` |
+		// |___/_||_|___|___|_|\_|
+		//
+		// =======================================================================
+		float LQ_FetchSheen( const arkPixelContext_t _pixelCtx ) {
+			float sheen = $sheen;
+
+			#if $hasSheenMap
+				sheen = $sheenMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x * 2.0 - 1.0;
+			#endif
+
+			return sheen;
+		}
+
+		// =======================================================================
+		//  ___ ___ ___ ___ _   _ _      _   ___
+		// / __| _ \ __/ __| | | | |    /_\ | _ \
+		// \__ \  _/ _| (__| |_| | |__ / _ \|   /
+		// |___/_| |___\___|\___/|____/_/ \_\_|_\
+		//
+		// =======================================================================
+		void HQ_FetchMetallicSpecularFresnelAndIOR( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			float3 specularTint = 1.0;
+			#if $hasSpecularMap
+				float3 Layer0_specularTint = $specularMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).xyz;
+				specularTint = Layer0_specularTint;
+
+				#if( $extraLayer > 0 )
+					#if( !$Layer1_specularReuseLayer )
+						float3 Layer1_specularTint = $Layer1_specularMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[1] ).xyz;
+						specularTint = lerp( specularTint, Layer1_specularTint, _pixelCtx.m_masks[1] );
+					#endif
+
+					#if( $extraLayer > 1 )
+						#if( $Layer2_specularReuseLayer == 2 )
+							float4 Layer2_specularTint = Layer1_specularTint;
+						#elif( $Layer2_specularReuseLayer == 1 )
+							float4 Layer2_specularTint = Layer0_specularTint;
+						#else
+							float4 Layer2_specularTint = $Layer2_specularMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[2] ).xyz;
+						#endif
+						specularTint = lerp( specularTint, Layer2_specularTint, _pixelCtx.m_masks[2] );
+					#endif
+				#endif
+
+				// Special function! Call it but don't change it!
+				#if !$isShadow && !$isZPrePass
+					_surf.metallic = HQ_FetchMetallic( _pixelCtx );
+					NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, _surf.diffuseAlbedo, specularTint, _surf.IOR, _surf.fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz, false );
+				#endif
+			#else
+
+				// Special function! Call it but don't change it!
+				#if !$isShadow && !$isZPrePass
+					_surf.metallic = HQ_FetchMetallic( _pixelCtx );
+					NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, _surf.diffuseAlbedo, specularTint, _surf.IOR, _surf.fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz );
+				#endif
+			#endif
+		}
+
+		void AQ_FetchMetallicSpecularFresnelAndIOR( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			float3 specularTint = 1.0;
+			#if $hasSpecularMap
+				float3 Layer0_specularTint = $specularMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).xyz;
+				specularTint = Layer0_specularTint;
+				// Special function! Call it but don't change it!
+				#if !$isShadow && !$isZPrePass
+					_surf.metallic = AQ_FetchMetallic( _pixelCtx );
+					NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, _surf.diffuseAlbedo, specularTint, _surf.IOR, _surf.fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz, false );
+				#endif
+			#else
+				// Special function! Call it but don't change it!
+				#if !$isShadow && !$isZPrePass
+					_surf.metallic = AQ_FetchMetallic( _pixelCtx );
+					NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, _surf.diffuseAlbedo, specularTint, _surf.IOR, _surf.fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz );
+				#endif
+			#endif
+		}
+
+		void LQ_FetchMetallicSpecularFresnelAndIOR( const arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			float3 specularTint = 1.0;
+			// Special function! Call it but don't change it!
+			#if !$isShadow && !$isZPrePass
+				_surf.metallic = LQ_FetchMetallic( _pixelCtx );
+				NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, _surf.diffuseAlbedo, specularTint, _surf.IOR, _surf.fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz );
+			#endif
+		}
+
+		// =======================================================================
+		//  ___ __  __ ___ ___ ___ _____   _____
+		// | __|  \/  |_ _/ __/ __|_ _\ \ / / __|
+		// | _|| |\/| || |\__ \__ \| | \ V /| _|
+		// |___|_|  |_|___|___/___/___| \_/ |___|
+		//
+		// =======================================================================
+		float3 HQ_FetchEmissive( in arkPixelContext_t _pixelCtx ) {
+			#if $hasAnimatedEmissive && !$emissiveAsGoo
+				float2 noise1UV = $(emissiveNoise1ScalePan).xy * _pixelCtx.m_layerTexCoords[0].xy + $localtime.xx * $(emissiveNoise1ScalePan).zw;
+				float noise1Value = $emissiveNoise1Map.Sample( $anisotropicSampler, noise1UV ).x;
+
+				float2 noise2UV = $(emissiveNoise2ScalePan).xy * _pixelCtx.m_layerTexCoords[0].xy + $localtime.xx * $(emissiveNoise2ScalePan).zw;
+				float noise2Value = $emissiveNoise2Map.Sample( $anisotropicSampler, noise2UV ).x;
+
+				float noise = noise1Value * noise2Value;
+
+				float3 emissive = $emissiveLookup.Sample( $anisotropicSampler, float2(noise, 0.5) ).xyz;
+				emissive *= _pixelCtx.m_animatedEmissiveMask;
+			#else
+				#if $hasEmissiveMap
+					float3	emissive = $emissiveMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0].xy ).xyz;
+				#else
+					float3	emissive = $emissiveColorConstant;
+				#endif
+
+				#if $hasEmissiveMaskMap
+					float maskValue = $emissiveMaskMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0].xy ).x;
+					maskValue = smoothstep( maskValue+$emissiveClipParms.y, maskValue-$emissiveClipParms.y, $emissiveClipParms.x);
+					emissive *= maskValue;
+				#endif
+			#endif
+
+			return $emissiveIntensity * emissive;
+		}
+
+		float3 AQ_FetchEmissive( in arkPixelContext_t _pixelCtx ) {
+			#if $hasEmissiveMap
+				float3	emissive = $emissiveMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0].xy ).xyz;
+			#else
+				float3	emissive = $emissiveColorConstant;
+			#endif
+
+			#if $hasEmissiveMaskMap
+				float maskValue = $emissiveMaskMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0].xy ).x;
+				maskValue = smoothstep( maskValue+$emissiveClipParms.y, maskValue-$emissiveClipParms.y, $emissiveClipParms.x);
+				emissive *= maskValue;
+			#endif
+
+			return $emissiveIntensity * emissive;
+		}
+
+		float3 LQ_FetchEmissive( in arkPixelContext_t _pixelCtx ) {
+			return $emissiveIntensity * $emissiveColorConstant;
+		}
+
+		// =======================================================================
+		//  _____ ___    _   _  _ ___ _   _   _  ___ ___ _  _  _____   __
+		// |_   _| _ \  /_\ | \| / __| | | | | |/ __| __| \| |/ __\ \ / /
+		//   | | |   / / _ \| .` \__ \ |_| |_| | (__| _|| .` | (__ \ V /
+		//   |_| |_|_\/_/ \_\_|\_|___/____\___/ \___|___|_|\_|\___| |_|
+		//
+		// =======================================================================
+		float HQ_FetchTranslucency( in arkPixelContext_t _pixelCtx ) {
+			#if $(translucency/enable)
+				#if $translucencyUseVertexColor
+					float	translucency = _pixelCtx.m_vertexColor.w;	// Use vertex color alpha to control translucency
+				#else
+					float	translucency = $translucencyMap.Sample( $anisotropicSampler, _pixelCtx.m_layerTexCoords[0] ).x;	// Use a texture to control translucency
+				#endif
+			#else
+				float	translucency = 0.0;
+			#endif
+			return translucency;
+		}
+
+		float AQ_FetchTranslucency( in arkPixelContext_t _pixelCtx ) {
+			#if $(translucency/enable)
+				#if $translucencyUseVertexColor
+					float	translucency = _pixelCtx.m_vertexColor.w;	// Use vertex color alpha to control translucency
+				#else
+					float	translucency = $translucencyMap.Sample( $trilinearSampler, _pixelCtx.m_layerTexCoords[0] ).x;	// Use a texture to control translucency
+				#endif
+			#else
+				float	translucency = 0.0;
+			#endif
+			return translucency;
+		}
+
+		float LQ_FetchTranslucency( in arkPixelContext_t _pixelCtx ) {
+			#if $(translucency/enable) && $translucencyUseVertexColor
+				return _pixelCtx.m_vertexColor.w;	// Use vertex color alpha to control translucency
+			#endif
+			return 0.0;
+		}
+
+		// =======================================================================
+		//  ___ _  _ ___ ___ ___ ___ ___ _____   _    ___ ___ _  _ _____ ___ _  _  ___
+		// |_ _| \| |   \_ _| _ \ __/ __|_   _| | |  |_ _/ __| || |_   _|_ _| \| |/ __|
+		//  | || .` | |) | ||   / _| (__  | |   | |__ | | (_ | __ | | |  | || .` | (_ |
+		// |___|_|\_|___/___|_|_\___\___| |_|   |____|___\___|_||_| |_| |___|_|\_|\___|
+		//
+		// =======================================================================
+		void FetchIndirectLightingData( const arkPixelContext_t _pixelContext, inout SurfaceContext _surf ) {
+
+			#if !$buildingEnvironmentProbe
+
+				// Copy the 4 packed irradiance values
+				_surf.Irradiance[0] = _pixelContext.m_irradiance[0];
+				_surf.Irradiance[1] = _pixelContext.m_irradiance[1];
+				_surf.Irradiance[2] = _pixelContext.m_irradiance[2];
+				_surf.Irradiance[3] = _pixelContext.m_irradiance[3];
+
+				// Decode the IBL probe indices
+				_surf.IBLCubeMapIndex = _pixelContext.m_IBLCubeMapIndex;
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					_surf.barycentric = _pixelContext.m_barycentric;
+				#endif
+
+				_surf.IBLLuminanceFactor = _pixelContext.m_IBLLuminanceFactor;
+
+			#else // #if $buildingEnvironmentProbe
+				_surf.Irradiance[0] = 0.0;
+				_surf.Irradiance[1] = 0.0;
+				_surf.Irradiance[2] = 0.0;
+				_surf.Irradiance[3] = 0.0;
+				_surf.IBLCubeMapIndex = 0;
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					_surf.barycentric = 0.0;
+				#endif
+				_surf.IBLLuminanceFactor = 1.0;
+			#endif
+		}
+
+		// =======================================================================
+		//   ___ ___  __  __ ___ _   _ _____ ___   _    ___ ___ _  _ _____ ___ _  _  ___
+		//  / __/ _ \|  \/  | _ \ | | |_   _| __| | |  |_ _/ __| || |_   _|_ _| \| |/ __|
+		// | (_| (_) | |\/| |  _/ |_| | | | | _|  | |__ | | (_ | __ | | |  | || .` | (_ |
+		//  \___\___/|_|  |_|_|  \___/  |_| |___| |____|___\___|_||_| |_| |___|_|\_|\___|
+		//
+		// =======================================================================
+		void HQ_ComputeLightingParams( inout arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+
+			_surf.emissive			= HQ_FetchEmissive( _pixelCtx );
+			_surf.translucency		= HQ_FetchTranslucency( _pixelCtx );
+			_surf.pixelIndex		= uint2( _pixelCtx.m_ssPosition.xy );
+			float2 ndcPos			= screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, _pixelCtx.m_ssPosition.z, 1.0 ) );
+			_surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+			_surf.wsPosition		= _pixelCtx.m_wsPosition;
+			_surf.wsView			= _pixelCtx.m_wsView;
+			_surf.distance			= _pixelCtx.m_distance;
+			#if $twoSidedLighting
+			_surf.frontFaceFactor	= _pixelCtx.m_frontFaceFactor;
+			#endif
+			_surf.wsNormal			= _pixelCtx.m_wsNormal;
+			_surf.wsTangent			= _pixelCtx.m_wsTangent;
+			_surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			_surf.wsVertexNormal	= _pixelCtx.m_wsVertexNormal;
+			_surf.wsVertexTangent	= _pixelCtx.m_wsVertexTangent;
+			_surf.wsVertexBiTangent	= _pixelCtx.m_wsVertexBiTangent;
+			_surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.xyz;
+			_surf.roughness			= 1.0 - HQ_FetchGloss( _pixelCtx );
+
+			#if $(fuzz/enable) && $(fuzz/hasMask)
+				_surf.fuzzMask = $(fuzz/mask).Sample( $bilinearSampler, _pixelCtx.m_layerTexCoords[0].xy ).r;
+			#endif
+
+			float sheen = LQ_FetchSheen( _pixelCtx );
+			_surf.sheen				= sheen;
+			_surf.sheenImportance	= $sheenImportance.x;
+
+			_surf.anisotropy		= $wardRoughness.z;
+			_surf.anisotropyAngle	= PI * $wardRoughness.w;
+
+			// ======================================================
+			HQ_ComputeAO( _pixelCtx, _surf );
+			FetchIndirectLightingData( _pixelCtx, _surf );
+		}
+
+		void AQ_ComputeLightingParams( inout arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+
+			_surf.emissive			= AQ_FetchEmissive( _pixelCtx );
+			_surf.translucency		= AQ_FetchTranslucency( _pixelCtx );
+			_surf.pixelIndex		= uint2( _pixelCtx.m_ssPosition.xy );
+			float2 ndcPos			= screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, _pixelCtx.m_ssPosition.z, 1.0 ) );
+			_surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+			_surf.wsPosition		= _pixelCtx.m_wsPosition;
+			_surf.wsView			= _pixelCtx.m_wsView;
+			_surf.distance			= _pixelCtx.m_distance;
+			_surf.wsNormal			= _pixelCtx.m_wsNormal;
+			_surf.wsTangent			= _pixelCtx.m_wsTangent;
+			_surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			_surf.wsVertexNormal	= _pixelCtx.m_wsVertexNormal;
+			_surf.wsVertexTangent	= _pixelCtx.m_wsVertexTangent;
+			_surf.wsVertexBiTangent	= _pixelCtx.m_wsVertexBiTangent;
+			_surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.xyz;
+			_surf.roughness			= 1.0 - AQ_FetchGloss( _pixelCtx );
+
+			float sheen = LQ_FetchSheen( _pixelCtx );
+			_surf.sheen				= sheen;
+			_surf.sheenImportance	= $sheenImportance.x;
+
+			_surf.anisotropy		= $wardRoughness.z;
+			_surf.anisotropyAngle	= PI * $wardRoughness.w;
+
+			// ======================================================
+			AQ_ComputeAO( _pixelCtx, _surf );
+			FetchIndirectLightingData( _pixelCtx, _surf );
+		}
+
+		void LQ_ComputeLightingParams( inout arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+
+			_surf.emissive			= LQ_FetchEmissive( _pixelCtx );
+			_surf.translucency		= LQ_FetchTranslucency( _pixelCtx );
+			_surf.pixelIndex		= uint2( _pixelCtx.m_ssPosition.xy );
+			float2 ndcPos			= screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, _pixelCtx.m_ssPosition.z, 1.0 ) );
+			_surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+			_surf.wsPosition		= _pixelCtx.m_wsPosition;
+			_surf.wsView			= _pixelCtx.m_wsView;
+			_surf.distance			= _pixelCtx.m_distance;
+			_surf.wsNormal			= _pixelCtx.m_wsNormal;
+			_surf.wsTangent			= _pixelCtx.m_wsTangent;
+			_surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			_surf.wsVertexNormal	= _pixelCtx.m_wsVertexNormal;
+			_surf.wsVertexTangent	= _pixelCtx.m_wsVertexTangent;
+			_surf.wsVertexBiTangent	= _pixelCtx.m_wsVertexBiTangent;
+			_surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.xyz;
+			_surf.roughness			= 1.0 - LQ_FetchGloss( _pixelCtx );
+
+			float sheen = LQ_FetchSheen( _pixelCtx );
+			_surf.sheen				= sheen;
+			_surf.sheenImportance	= $sheenImportance.x;
+
+			_surf.anisotropy		= $wardRoughness.z;
+			_surf.anisotropyAngle	= PI * $wardRoughness.w;
+
+			// ======================================================
+			LQ_ComputeAO( _pixelCtx, _surf );
+
+			#if !$buildingEnvironmentProbe
+
+				_surf.IBLCubeMapIndex = _pixelCtx.m_IBLCubeMapIndex;
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					_surf.barycentric = _pixelCtx.m_barycentric;
+				#endif
+
+			#else // #if $buildingEnvironmentProbe
+				_surf.IBLCubeMapIndex = 0;
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					_surf.barycentric = 0.0;
+				#endif
+				_surf.IBLLuminanceFactor = 1.0;
+			#endif
+		}
+
+		void LQ_ParticleScatter_ComputeLightingParams( inout arkPixelContext_t _pixelCtx, inout SurfaceContext _surf ) {
+			// ======================================================
+			// Compute diffuse albedo and IOR for specular reflection based on glossiness and metallic parameters
+			_surf = (SurfaceContext) 0;
+			_surf.pixelIndex		= uint2( _pixelCtx.m_ssPosition.xy );
+			float2 ndcPos			= screenPosToNdc( _pixelCtx.m_ssPosition.xy );
+			float4 wsPos			= mul( $inverseViewProjectionMatrix, float4( ndcPos.x, ndcPos.y, _pixelCtx.m_ssPosition.z, 1.0 ) );
+			_surf.wsPositionHacked	= wsPos.xyz/wsPos.w;
+			_surf.wsPosition		= _pixelCtx.m_wsPosition;
+			_surf.wsView			= _pixelCtx.m_wsView;
+			_surf.distance			= _pixelCtx.m_distance;
+			_surf.wsNormal			= _pixelCtx.m_wsNormal;
+			_surf.wsTangent			= _pixelCtx.m_wsTangent;
+			_surf.wsBiTangent		= _pixelCtx.m_wsBiTangent;
+			_surf.wsVertexNormal	= _pixelCtx.m_wsVertexNormal;
+			_surf.wsVertexTangent	= _pixelCtx.m_wsVertexTangent;
+			_surf.wsVertexBiTangent	= _pixelCtx.m_wsVertexBiTangent;
+			_surf.diffuseAlbedo		= _pixelCtx.m_diffuseAlbedo.xyz;
+		}
+
+		// =======================================================================
+		//    ___ _      _   ___ ___
+		//   / __| |    /_\ / __/ __|
+		//  | (_ | |__ / _ \\__ \__ \
+		//   \___|____/_/ \_\___/___/
+		//
+		// =======================================================================
+		float ComputeGlassDistortion(float3 _wsView, float3 _wsNormal, float3 _wsVtxNormal, float _zClip, bool _isFrontFace ) {
+			if( _isFrontFace ) {
+				const float IOR = $(Alpha/RefractionIOR).x;
+				float3 wsRefracted = refract( -_wsView, _wsNormal, IOR );
+				float3 vsRefracted = mul( (float3x3)$viewMatrix, wsRefracted );
+
+				float angle = safeAcos( dot( vsRefracted, float3( 0.0, 0.0, -1.0 ) ) );
+				float strength = $(Alpha/BlurSize).x * lerp( 0.5, 1.0, (1.0 - _zClip) );
+				#if $hasBumpMap
+					strength *= smoothstep( 0.0, dot(_wsNormal,_wsVtxNormal), $(Alpha/NormalMask) );
+				#endif
+
+				return CompressGlassDistortion( angle, strength );
+			} else {
+				return 0.0;
+			}
+		}
+
+		void ComputeGlassTransmittance( SurfaceContext surf, inout arkPixelContext_t pixelCtx, inout ComputeLightingResult result ) {
+			#if $isAlpha
+				const float3 _wsView = pixelCtx.m_wsView;
+				const float3 _wsNormal = pixelCtx.m_wsNormal;
+				const float	VdotN = saturate( dot( _wsView, _wsNormal ) );
+
+				float3	FresnelSpecular = FresnelAccurate( surf.IOR, VdotN, surf.fresnelStrength );
+				float3	Transmitance = pixelCtx.m_frontFaceFactor >= 0.0 ? FresnelSpecular : 1.0 - FresnelSpecular;
+
+				const float IOR = $(Alpha/RefractionIOR).x;
+				float3 wsRefracted = refract( -_wsView, _wsNormal, IOR );
+				float3 wsReflected = reflect( -_wsView, _wsNormal );
+				float3 vsRefracted = mul( (float3x3)$viewMatrix, wsRefracted );
+				float angle = safeAcos( dot( vsRefracted, float3( 0.0, 0.0, -1.0 ) ) );
+				float diffrac = dot(wsRefracted, wsReflected);
+				angle -= diffrac * PI;
+
+				float refractionExit = smoothstep( 0, TWOPI, angle );
+				refractionExit *= saturate( dot( Transmitance, (1.0/3.0) ) );
+				refractionExit = saturate( $(Alpha/Transmittance) * refractionExit );
+
+				const float BC7epsilon = 0.01569; //BC7 compression is not accurate and can add some noise on alpha low value
+				result.accumSpecular *= pixelCtx.m_diffuseAlbedo.a > BC7epsilon ? 1.0 / pixelCtx.m_diffuseAlbedo.a : 1.0;
+				#if $useParticleColorInstancing
+					result.accumSpecular *= pixelCtx.m_vertexColor.a;
+				#endif
+
+				result.accumDiffuse *= refractionExit;
+				result.accumAmbient *= refractionExit;
+				result.Finalize();
+			#endif
+		}
+
+		// bmayaux (2015-11-26)
+		// =======================================================================
+		//   ___  ___ ___ _   _  ___
+		//  |   \| __| _ ) | | |/ __|
+		//  | |) | _|| _ \ |_| | (_ |
+		//  |___/|___|___/\___/ \___|
+		//
+		// =======================================================================
+		// This routine is responsible for drawing debug properties:
+		//	• Indirect lighting only
+		//	• Gloss only
+		//	• Metallic only
+		//	• Specific parts of the lighting results:
+		//		> Ambient
+		//		> Diffuse
+		//		> Specular
+		//		> Emissive
+		//		> Scattering
+		//	• A fake wireframe mode that uses barycentric coordinates (so it's only available in "perVertex" indirect lighting mode)
+		//	• Other temporary debug data
+		//
+		void DebugDrawOverride( inout float3 _sv_target, in arkPixelContext_t _pixelCtx, in SurfaceContext _surf, in ComputeLightingResult _result ) {
+			#if defined( PC ) && !$buildingEnvironmentProbe && !defined( RETAIL )
+			if ( $alwaysOne ) {
+
+				bool	makeLDR = false;
+
+				// bmayaux (2014-11-09) Lighting debug modes for idStudio
+				if ( ($(indirectLighting/globalParms1).z & 1) != 0 ) {
+					// Only show indirect lighting
+					#if $twoSidedLighting
+						// Retrieve the original TBN vectors used by the vertex shader (BEFORE being reversed in the pixel context)
+						float3	wsOriginalVertexTangent = _surf.frontFaceFactor * _surf.wsVertexTangent;
+						float3	wsOriginalVertexBiTangent = _surf.frontFaceFactor * _surf.wsVertexBiTangent;
+						float3	wsOriginalVertexNormal = _surf.frontFaceFactor * _surf.wsVertexNormal;
+					#else
+						float3	wsOriginalVertexTangent = _surf.wsVertexTangent;
+						float3	wsOriginalVertexBiTangent = _surf.wsVertexBiTangent;
+						float3	wsOriginalVertexNormal = _surf.wsVertexNormal;
+					#endif
+
+					float3	Fdr = lerp( 1.0, DiffuseFresnelReflectance_Ward( $DEBUG_FdrFactor.z * _surf.IOR, _surf.roughness ), $DEBUG_FdrFactor.x );
+					_sv_target = INVPI * pow( saturate( $DEBUG_ILFactor.y + $DEBUG_ILFactor.z * _surf.diffuseAlbedo ), $DEBUG_ILFactor.w ) * Fdr * UnPackSHPrincipalDirections( _surf.wsNormal, wsOriginalVertexTangent, wsOriginalVertexBiTangent, wsOriginalVertexNormal, _surf.Irradiance, _surf.AO.x );
+				} else if ( ($(indirectLighting/globalParms1).z & 32) != 0 ) {
+					// Only show gloss
+					_sv_target = 1.0 - _surf.roughness;
+					makeLDR = true;
+				} else if ( ($(indirectLighting/globalParms1).z & 64) != 0 ) {
+					// Only show metallic
+					_sv_target = _surf.metallic;
+					makeLDR = true;
+				}
+
+				uint	lightingDebugFlags = ($(indirectLighting/globalParms1).z >> 9) & 0x1F;
+				if ( lightingDebugFlags != 0 ) {
+					_sv_target = 0.0;
+					if ( lightingDebugFlags & 1 )	_sv_target += _result.accumAmbient;
+					if ( lightingDebugFlags & 2 )	_sv_target += _result.accumDiffuse;
+					if ( lightingDebugFlags & 4 )	_sv_target += _result.accumSpecular;
+					if ( lightingDebugFlags & 8 )	_sv_target += _result.accumEmissive;
+					if ( lightingDebugFlags & 16 )	_sv_target += _result.accumScattering.xyz;
+				}
+
+// Directly show weights
+// if ( $alwaysOne && ($(indirectLighting/globalParms1).x != ~0U || $(indirectLighting/globalParms1).y != ~0U || ($(indirectLighting/globalParms1).z & 16) != 0) ) {
+// 	_sv_target = _surf.Irradiance[0];
+// }
+
+// Show Diffuse Fresnel Reflectance debug modes
+if ( $DEBUG_FdrFactor.w > 0.5 ) {
+	if ( $DEBUG_FdrFactor.w < 2.0 )
+		// W = 1	Pre-Computed table
+		_sv_target = lerp( 1.0, $DEBUG_FdrFactor.y * DiffuseFresnelReflectance_Ward( $DEBUG_FdrFactor.z * _surf.IOR, _surf.roughness ), $DEBUG_FdrFactor.x );
+// 	else if ( $DEBUG_FdrFactor.w < 3.0 )
+// 		// W = 2	Analytic
+// 		_sv_target = $DEBUG_FdrFactor.y * (1.0 - saturate( Fdr_Analytic_Inf1( 1.0 / ($DEBUG_FdrFactor.z * _surf.IOR) ) ));
+// //		_sv_target = lerp( $DEBUG_FdrFactor.y, 1.0-Fdr_Analytic_Sup1( _surf.IOR ), $DEBUG_FdrFactor.x );
+// 	else if ( $DEBUG_FdrFactor.w < 4.0 )
+// 		// W = 3	IOR
+// 		_sv_target = $DEBUG_FdrFactor.z * _surf.IOR;
+// 	else if ( $DEBUG_FdrFactor.w < 5.0 ) {
+// 		// Z = 6  specularTint
+// 		float	metallic = _surf.metallic * _surf.metallic;		// Artists prefer that...
+// 		float	gloss = 1.0 - _surf.roughness;
+// 		float3	specularTint = lerp( $specularTintDielectric.xyz, _pixelCtx.m_diffuseAlbedo.xyz, metallic );
+// 		// 3rd draft - try to re-range gloss to avoid white veil on low gloss value
+// 		float glossMin = smoothstep(0.0 , 1.07, gloss);
+// 		float glossMax = smoothstep(0.05, 1.0 , gloss);
+// 		float Gloss = lerp(glossMin, glossMax, gloss);
+// 		specularTint *= LinearStep( 0.0, 0.05, gloss + metallic );
+// 		_sv_target = $DEBUG_FdrFactor.y * specularTint;
+// 	} else if ( $DEBUG_FdrFactor.w < 6.0 ) {
+// 		// Z = 7  IOR from specularTint (as should be computed by notouchy)
+// 		float	metallic = _surf.metallic * _surf.metallic;		// Artists prefer that...
+// 		float	gloss = 1.0 - _surf.roughness;
+// 		float3	specularTint = lerp( $specularTintDielectric.xyz, _pixelCtx.m_diffuseAlbedo.xyz, metallic );
+// 		// 3rd draft - try to re-range gloss to avoid white veil on low gloss value
+// 		float glossMin = smoothstep(0.0 , 1.07, gloss);
+// 		float glossMax = smoothstep(0.05, 1.0 , gloss);
+// 		float Gloss = lerp(glossMin, glossMax, gloss);
+// 		specularTint *= LinearStep( 0.0, 0.05, gloss + metallic );
+// 		_sv_target = $DEBUG_FdrFactor.z * Fresnel_IORFromF0( specularTint );
+// 	} else {
+// 		// Z = 6  Call to notouchy itself
+// 		float3	specularTint = 0.0;
+// 		float3	pipoAlbedo = _pixelCtx.m_diffuseAlbedo.xyz;
+// 		float3	IOR = 1.0;
+// 		float	fresnelStrength;
+// NOTOUCHY_MapGlossAndMetalToLightingPipelineValue_NOTOUCHY( 1.0-_surf.roughness, _surf.metallic, pipoAlbedo, specularTint, IOR, fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz );
+// //CodeDebile( 1.0-_surf.roughness, _surf.metallic, pipoAlbedo, specularTint, IOR, fresnelStrength, $specularTintDielectric.xyz, $diffuseAlbedoMetallic.xyz, false );
+// 		_sv_target = $DEBUG_FdrFactor.z * IOR;
+//	}
+}
+
+
+				if ( makeLDR ) {
+					// Unexpose so after exposition it's in [0,1]
+					$(PostFX/Luminance/autoExposure_t)      Adaptation = ReadAutoExposureParameters();
+					_sv_target /= Adaptation.EngineLuminanceFactor;
+				}
+
+				// FAKE WIREFRAME
+				#if $useMultiInstancing || $(tool/usePerVertexSH)
+					if ( $(indirectLighting/globalParms1).w != 0 ) {
+						// Fake wireframe using barycentric coordinates
+						// Choupi code from http://codeflow.org/entries/2012/aug/02/easy-wireframe-display-with-barycentric-coordinates/#constant-width-and-anti-aliasing
+						float3	d = 1e-3 + fwidth( _pixelCtx.m_barycentric );
+						float3	a3 = smoothstep( 0.0, d, _pixelCtx.m_barycentric );
+						float	isOnEdge = 1.0 - min( min( a3.x, a3.y ), a3.z );
+						float3	wireframeColor = $(indirectLighting/globalParms1).w - 1;
+						if ( $(indirectLighting/globalParms1).w > 2.5 )
+						{	// Nice mode with black faces and colored wires
+							isOnEdge = 1-isOnEdge;
+							wireframeColor = 0;
+						}
+						_sv_target = lerp( _sv_target, wireframeColor, isOnEdge );
+					}
+				#endif
+
+			}	// if ( $alwaysOne )
+			#endif	// defined( PC ) && !$buildingEnvironmentProbe
+		}
+	}
+}

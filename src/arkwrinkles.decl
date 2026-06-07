@@ -1,0 +1,48 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+	
+		void ApplyWrinkleNormalMap( Texture2D _wrinkleNormalMap, float2 _uv, float _lodBias, float _wrinkle, inout float3 _tsNormal )
+		{
+			float2 wrinkleTSNormal = _wrinkleNormalMap.SampleBias( $trilinearSampler, _uv, _lodBias ).xy;
+			_tsNormal.xy += wrinkleTSNormal * _wrinkle * 2.0f; //NOTE ftournade: I don't understand why I had to multiply by 2
+			_tsNormal.z = sqrt( max( 0.0f, 1.0f - dot( _tsNormal.xy, _tsNormal.xy ) ) );
+		}
+
+		float GetWrinkleValue( float2 _uv )
+		{
+			float2 uv1 = float2( _uv.x, _uv.y * 0.5f + 0.5f );
+			float2 uv2 = float2( _uv.x, _uv.y * 0.5f );
+			
+			float4 wrinkleMaskSample1 = $(Wrinkles/Mask).SampleLevel( $pointSampler, uv1, 0.0f );
+			float4 wrinkleMaskSample2 = $(Wrinkles/Mask).SampleLevel( $pointSampler, uv2, 0.0f );
+			
+			float wrinkle = $(Wrinkles/Channels)[ (unsigned int)(wrinkleMaskSample1.r * 255.0f) ] * wrinkleMaskSample1.g
+			              + $(Wrinkles/Channels)[ (unsigned int)(wrinkleMaskSample1.b * 255.0f) ] * wrinkleMaskSample1.a
+			              + $(Wrinkles/Channels)[ (unsigned int)(wrinkleMaskSample2.r * 255.0f) ] * wrinkleMaskSample2.g
+			              + $(Wrinkles/Channels)[ (unsigned int)(wrinkleMaskSample2.b * 255.0f) ] * wrinkleMaskSample2.a;
+
+			return wrinkle;
+		}
+		
+		void ApplyWrinkles( float _wrinkle, float2 _uv, float _lodBias, inout float3 _tsNormal )
+		{					
+			if( _wrinkle > 0.0f )
+			{
+				ApplyWrinkleNormalMap( $(Wrinkles/NormalMap1), _uv, _lodBias, _wrinkle, _tsNormal );
+			}
+			else
+			{
+				ApplyWrinkleNormalMap( $(Wrinkles/NormalMap2), _uv, _lodBias, -_wrinkle, _tsNormal );
+			}
+		}
+		
+		float4 DebugWrinkles( float2 _uv )
+		{
+			float wrinkle = GetWrinkleValue( _uv ) * 0.5f + 0.5f;
+	
+			return float4(wrinkle,wrinkle,wrinkle,1);
+		}
+	}
+}

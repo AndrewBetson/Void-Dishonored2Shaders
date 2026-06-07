@@ -1,0 +1,206 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+		stageSort	sortCoverage
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+		#include <PostFX/Luminance/common>
+		#include <BRDF_ward>			// BRDF model must be included before lighting!
+		#include <lighting>
+		#include <arkDefaultHelpers>
+		#include <materialEffects>
+		#include <fogHelpers>
+		#if $useParallaxMapping
+			#include <parallaxSelfShadow>
+		#endif
+		#include <particles_instancing>
+
+		#if DURANGO
+			#if $alphaTest
+				#define __XBOX_FORCE_PS_ZORDER_RE_Z 1
+			#endif
+		#endif
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+
+		#if ( $alphaTest || ( !$isShadow && !$isZPrePass && !$isOutline ) )
+			@texcoords = vout._texcoords;
+		#endif
+
+		#if !$(tool/unlit) && !$isShadow && !$isZPrePass && !$isMasking && !$isOutline
+			@wsPosition = vout._worldPosition;
+		#endif
+
+		#if !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit)
+			@wsTangent = vout.m_wsTangent.xyz;
+			@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+			@wsNormal = vout.m_wsNormal;
+		#elif $isZPrePass
+			#if !$isZPrePassAlpha && !$isAlpha
+				//The motion vector generation for motion blur & temporalAA is done here
+				VertexOutContext previousFrameVout = TransformVertex( victx, true );
+				@psPosition = vout._projPosition;
+				@psPreviousPosition = previousFrameVout._projPosition;
+			#endif
+
+			#if $isAlpha && !$isZPrePassAlpha && $(Alpha/EnableRefraction)
+				#if $hasBumpMap
+					@texcoords = vout._texcoords;
+					@wsTangent = vout.m_wsTangent.xyz;
+					@IBLLuminanceFactor = sign( vout.m_wsTangent.w ); // Pack bitangent sign with illuminance factor to minimize VS export
+				#endif
+				@wsNormal = vout.m_wsNormal;
+				@wsPosition = vout._worldPosition;
+			#endif
+		#endif
+
+		WRITE_INDIRECT_LIGHTING_OUTPUT	// bmayaux (2014-07-17) Per-vertex SH interpolation + IBL cube map index + barycentric coordinates
+
+		#if !$isShadow && !$isZPrePass && !$isOutline && !$isCloth
+			#if $useParticleColorInstancing
+				@legacy_color = GetParticleColor( victx, $vertex_color );
+			#elif $isMasking
+				#if $VtxColorMultiply || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) )
+					@legacy_color = $vertex_color;
+				#endif
+			#elif ( $VtxColorMultiply || (!$(tool/unlit) && $(translucency/enable) && $translucencyUseVertexColor) || ( ($use_Layer0_ColorConstant && $Layer0_MaskMode != 1) || ($extraLayer == 1 && $Layer1_MaskMode != 1) || ($extraLayer == 2 && ( $Layer1_MaskMode != 1 || $Layer2_MaskMode != 1 )) ) )
+				@legacy_color = $vertex_color;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_attribs {
+		#ifdef ORBIS
+			#if $alphaTest
+				[RE_Z]
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, !$isShadow && !$isZPrePass && !$isMasking && !$isOutline && !$(tool/unlit) && !$buildingEnvironmentProbe );
+		arkMtrEffectContext_t effectCtx;
+		effectCtx.InitMaterialEffect( pixelCtx );
+
+		// =======================================================================
+		// Z-PrePass / Shadow
+		#if $isShadow || $isZPrePass
+			ClipZorShadowPass( pixelCtx );
+			#if $isZPrePass && !$isZPrePassAlpha
+				#if !$isAlpha 
+					//Motion vector
+					float2 psMotionVector = $psPosition.xy / $psPosition.w - $psPreviousPosition.xy / $psPreviousPosition.w;
+					psMotionVector -= $jitterRelativeToPreviousFrame;
+					psMotionVector *= 0.5f;
+					psMotionVector.y *= -1.0f;
+					@sv_target = float4( psMotionVector, 1.0f, 0.0f );
+				#elif $isAlpha && $(Alpha/EnableRefraction)
+					//Refraction
+					HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+					@sv_target = float4( 0.0, ComputeGlassDistortion( pixelCtx.m_wsView, pixelCtx.m_wsNormal, pixelCtx.m_wsVertexNormal, $sv_position.z, pixelCtx.m_frontFaceFactor >= 0.0 ), 0.0, 0.0 );
+				#endif
+			#endif
+			return;
+		#elif $isOutline
+			#if $outlineable
+				@sv_target = pixelCtx.OutlineSeed();
+			#endif
+		#elif $isMasking
+			HQ_FetchMasks( pixelCtx );
+			HQ_FetchDiffuseAlbedo( pixelCtx );
+			@sv_target = pixelCtx.m_diffuseAlbedo.w * $(rendering/masking/bendTimeFactor).x;
+		#elif $(tool/unlit)
+			HQ_FetchMasks( pixelCtx );
+			HQ_FetchDiffuseAlbedo( pixelCtx );
+
+			#if $isAlpha && !$isMainPassAlpha
+				writePixel( pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target = pixelCtx.m_diffuseAlbedo;
+			#endif
+
+			////for now this debug draw cause problems, this should be done in a postprocess
+			//if ( $(tool/unlit/shadowAtlasResDebug) ) { // WARN: this is a runtime parm and not an option ! so keep this in tool-only path to not impact game performances !
+			//	ComputeLightingResult	Result;
+			//	Result.Clear();
+			//
+			//
+			//	SurfaceContext	surf;
+			//	surf = ComputeLightingParams( pixelCtx );
+			//
+			//	LightLoopContext	loopContext = CreateLightLoopContext( surf.wsPosition, float3( 1.f, 1.f, 1.f), surf.pixelIndex );
+			//	while ( loopContext.FetchNextLightData( surf ) ) {
+			//		if ( loopContext.m_castsShadow ) {
+			//			@sv_target.rgb *= loopContext.m_color;
+			//		}
+			//
+			//		if ( loopContext.m_lightsCount > 32 ) {
+			//			break;
+			//		}
+			//	}
+			//}
+
+
+		// =======================================================================
+		// Standard Pass
+		#else
+
+			SurfaceContext	surf;
+			surf.Clear();
+			ComputeLightingResult	result;
+			result.Clear();
+
+			// High quality
+			HQ_DoParallaxMapping( pixelCtx );
+			HQ_FetchMasks( pixelCtx );
+			HQ_FetchDiffuseAlbedo( pixelCtx );
+			HQ_FetchAndComputeNormalAndTBN( pixelCtx );
+			HQ_ComputeLightingParams( pixelCtx, surf );
+			effectCtx.ApplyMaterialEffect( pixelCtx, surf );
+			HQ_FetchMetallicSpecularFresnelAndIOR( pixelCtx, surf );
+
+			result = IntegrateLighting( surf, HIGH_QUALITY );
+
+			// Compute Glass transmittance
+			ComputeGlassTransmittance( surf, pixelCtx, result );
+
+			// Compute fog
+			result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
+
+
+			#if $isAlpha && !$isMainPassAlpha
+				writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
+				@sv_target.w = pixelCtx.m_diffuseAlbedo.a;
+			#endif
+
+			// ========= Special Post-Processing & Replacement of output for Indirect Lighting probes rendering =========
+			#if defined( PC ) && !defined( RETAIL )
+
+				// Debug draw
+				DebugDrawOverride( @sv_target.xyz, pixelCtx, surf, result );
+
+				// Write MRT info for probe rendering
+				#inlinefile <includes/resultOverrideIL.inc>
+				WRITE_IL_MRT( pixelCtx, surf, result )
+
+			#endif //defined( PC )
+
+		#endif
+	}
+}

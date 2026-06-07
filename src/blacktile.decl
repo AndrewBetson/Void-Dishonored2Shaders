@@ -1,0 +1,23 @@
+{
+	newstyle
+	
+    parms {
+		stageSort            sortCoverage
+	}
+	
+	state {
+		depthWrite	0
+ 		depthfunc	ALWAYS
+		depthEnable	0
+ 		cull		NONE
+	}
+
+	hlsl_vp_main {
+		float4 position = float4( $vertex_position.xyz * $vertexXYZScale.xyz + $vertexXYZBias.xyz ,1);
+		@sv_position = position;
+	}
+
+	hlsl_fp_main {
+		@sv_target = float4(0,0,0,1);
+	}
+}

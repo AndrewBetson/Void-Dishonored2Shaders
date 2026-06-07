@@ -1,0 +1,48 @@
+{
+	newstyle
+	
+	hlsl_prefix {
+
+		#include <PostFX/Debug/DrawDigits>
+
+//		static const float2	DEBUG_ENV_PARM_TOP_LEFT = float2( 0.01, 0.01 );
+		static const float2	DEBUG_ENV_PARM_TOP_LEFT = float2( 0.01, 0.5+0.01 );	// Position of the top-left corner in UV space
+		static const float2	DEBUG_ENV_PARM_SIZE = float2( 0.2, 0.02 );			// Size in UV space
+		static const float	DEBUG_ENV_PARM_TEXT_RATIO = 0.15;					// Make the text use 15% of the entire draw area
+
+		// Displays the value of an env parameter as a slider
+		//
+		void	DEBUG_EnvParm( float2 _UV, inout float3 _Color ) {
+			float2	TextSize = DEBUG_ENV_PARM_TEXT_RATIO * DEBUG_ENV_PARM_SIZE.x * float2( 1.0, 0.5 );
+			float2	TextTopLeft = DEBUG_ENV_PARM_TOP_LEFT + float2( DEBUG_ENV_PARM_SIZE.x - TextSize.x, 0.5 * (DEBUG_ENV_PARM_SIZE.y - TextSize.y) );
+			float2	TextBottomRight = TextTopLeft + TextSize;
+
+			if ( _UV.x < DEBUG_ENV_PARM_TOP_LEFT.x || _UV.y < DEBUG_ENV_PARM_TOP_LEFT.y || _UV.x > (DEBUG_ENV_PARM_TOP_LEFT.x+DEBUG_ENV_PARM_SIZE.x) || _UV.y > (DEBUG_ENV_PARM_TOP_LEFT.y+DEBUG_ENV_PARM_SIZE.y) )
+				return;	// Out of drawing area
+
+			float4	SliderColor = float4( 0.2, 0.2, 0.2, 0.5 );
+			if ( _UV.x > TextTopLeft.x ) {
+				// Draw the number as text
+				float2	Pos_pixels = $positionToViewTexture.zw * _UV;
+				float2	TexTopLeft_pixels = $positionToViewTexture.zw * TextTopLeft;
+				SliderColor.xyz = lerp( SliderColor.xyz, float3( 1.0, 1.0, 1.0 ), drawNumber( $(PostFX/Debug/envParmValue).x, int2( Pos_pixels - TexTopLeft_pixels ) ) );
+			}
+			else
+			{	// Draw the slider itself
+				float2	SliderBottomRight = DEBUG_ENV_PARM_TOP_LEFT + float2( (1.0-DEBUG_ENV_PARM_TEXT_RATIO) * DEBUG_ENV_PARM_SIZE.x, DEBUG_ENV_PARM_SIZE.y );
+
+				_UV = (_UV - DEBUG_ENV_PARM_TOP_LEFT) / (SliderBottomRight - DEBUG_ENV_PARM_TOP_LEFT);
+
+				float	CurrentValue = lerp( $(PostFX/Debug/envParmValue).z, $(PostFX/Debug/envParmValue).w, _UV.x );
+				float	IsBelowValue = step( CurrentValue, $(PostFX/Debug/envParmValue).x );
+				SliderColor.xyz = lerp( 0.1, 1.0, IsBelowValue );
+
+				// Show default value
+				float	DefaultValueU = ($(PostFX/Debug/envParmValue).y - $(PostFX/Debug/envParmValue).z) / ($(PostFX/Debug/envParmValue).w - $(PostFX/Debug/envParmValue).z);
+				SliderColor.xyz = lerp( SliderColor.xyz, float3( 1, 0, 0 ), step( abs( _UV.x - DefaultValueU ), 0.002 ) );
+			}
+
+			_Color = lerp( _Color, SliderColor.xyz, SliderColor.w );
+		}
+	}
+}

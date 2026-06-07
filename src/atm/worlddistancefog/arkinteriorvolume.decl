@@ -1,0 +1,37 @@
+{
+	newstyle
+
+	options {
+	}
+	parms {
+	}
+
+	hlsl_prefix {
+		#include <vertex>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+
+		@sv_position = vout._projPosition;
+	}
+
+	hlsl_fp_main {
+		const float zfar = $globalViewInfos.w;
+
+		float2	UV = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy );
+		float	Zproj = $(atm/distanceFog/TexDepth).SampleLevel( $linearClamp, UV, 0.0 ).x;
+		float Zscene = ComputeLinearZ( Zproj );
+		float volumeZ = ComputeLinearZ( $sv_position.z );
+		
+		float minVolumeZ = clamp(volumeZ, 0, Zscene);
+		float maxVolumeZ = min(Zscene, volumeZ);
+		
+		// GetFrontFacingFactor gives : front face --> 1.0 back face -->
+		@sv_target = $sv_isFrontFace ? -minVolumeZ : maxVolumeZ;
+	}
+}

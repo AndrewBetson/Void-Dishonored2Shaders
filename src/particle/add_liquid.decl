@@ -1,0 +1,148 @@
+{
+	newstyle
+	options {
+		noshadow	1
+		isParticle	1
+	}
+
+	parms {
+		stageSort sortTrans
+	}
+
+	state {
+		blend SRC_ALPHA ONE
+	}
+
+	hlsl_prefix {
+		#include <particles>
+		#include <particles_instancing>
+	}
+
+	hlsl_vp_main {
+		#inlinefile <includes/arkVertex.inc>
+
+		VertexInContext victx;
+		INIT_VERTEXIN(victx)
+		VertexOutContext vout = TransformVertex( victx );
+		@sv_position = vout._projPosition;
+		@wsPosition = vout._worldPosition;
+
+		const float eyeDist = vout._projPosition.w;
+
+		// Convert back from 16 bit vertex elements.
+		@texcoords.xyz = GetParticleTextureCoordinates( victx, $vertex_texcoord4 ).xyz;
+		@texcoords.w = Fog(eyeDist);
+
+		#if ( ( !$isShadow && !$isZPrePass && !$isMasking ) || $(fx/opt/fade_threshold) )
+			@legacy_color = GetParticleColor( victx, $vertex_color );
+		#endif
+
+		// Soft contact
+		#if ($(fx/opt/use_softcontact) >= SOFT_CONTACT_CUBIC) && (!$isShadow && !$isZPrePass)
+			#if $useDirectInstancing
+				@particleCenterSize = float4( GetTranslation( vout ), GetParticleRadius( victx ) );
+			#else
+				@particleCenterSize = $vertex_texcoord5;
+			#endif
+		#endif
+	}
+
+	hlsl_fp_main {
+
+		#inlinefile <includes/arkPixel.inc>
+		arkPixelContext_t pixelCtx;
+		INIT_PIXELCONTEXT( pixelCtx, 0 );
+
+		float2 uv = 0;
+		float2 uv_offset = 0;
+		float4 color;
+
+		float4 disto1result = 0, disto2result = 0;
+
+		float2 opa;
+		float current_threshold = $liquid_Threshold;
+		float cosinus, sinus;
+
+		// disto 1
+		disto1result.xy = PanAndReadDistUV( $texcoords, $(fx/disto1), $disto1_RotationSpeed.x, $disto1_PanningSpeed, $disto1_Tilling.xy );
+
+		#if  $(fx/opt/uv_disto1_uniform) // if the disto 1 texture is a BC4 we put in .y the .x
+			disto1result.y = disto1result.x;
+		#endif
+
+		// disto 2
+		#if $(fx/opt/uv_disto2)
+			disto2result.xy = PanAndReadDistUV( $texcoords, $(fx/disto2), $disto2_RotationSpeed.x, $disto2_PanningSpeed, $disto2_Tilling.xy );
+
+			#if  $(fx/opt/uv_disto2_uniform) // if the disto 1 texture is a BC4 we put in .y the .x
+				disto2result.y = disto2result.x;
+			#endif
+		#endif
+
+		#if $(fx/opt/uv_Disto2xDisto1)
+			uv_offset = ( ( disto1result.xy * 2 - 1 ) * ( disto2result.xy * 2 -1 ) ) * $distoStrength.xy / 2.0;
+		#else
+		uv_offset = ( ( disto1result.xy * 2 - 1 ) + ( disto2result.xy * 2 -1 ) ) * $distoStrength.xy / 2.0;
+		#endif
+
+		color = 1;
+		color.w = 0;
+
+		#if $(fx/opt/use_diffuse)
+			color.xyz = $(fx/diffuse).Sample( $trilinearSampler, $texcoords.xy * $opacity_Tilling.xy + uv_offset.xy ).xyz;
+		#endif
+
+		#if $(fx/opt/fade_threshold)
+			current_threshold += ( 1 - clamp ( $legacy_color.w, 0, 1) );
+		#endif
+
+		#if	$(fx/opt/no_opacity_map)
+			color.w = ( clamp (   ( pow ( disto1result.x, 1 ) + pow ( disto2result.x, 1) - current_threshold ) * 2 , 0, 1 ) );
+		#else
+			opa.xy = PanAndReadDistUV( $texcoords + uv_offset.xyyy, $(fx/opacity), $opacity_RotationSpeed.x, $opacity_PanningSpeed.xy, $opacity_Tilling.xy );
+			color.w = opa.x * ( clamp (   ( pow ( disto1result.x, 1 ) + pow ( disto2result.x, 1) - current_threshold ) * 2 , 0, 1 ) );
+		#endif
+
+		float clipPlaneDot = dot( $(fx/ClipPlane).xyz, $wsPosition.xyz ) + $(fx/ClipPlane).w;
+		clip( sign( clipPlaneDot ) );
+		color.w *= smoothstep( 0.0, $(fx/ClipPlaneFadeDistance).x, clipPlaneDot );
+
+		#if ($(fx/opt/use_softcontact) != SOFT_CONTACT_NONE) && (!$isShadow && !$isZPrePass)
+			color.w *= SoftContact(pixelCtx, $particleCenterSize);
+		#endif
+
+		// View dependent fade out
+		#if $(fx/opt/view_dependent_fade)
+			color.w *= ViewDependentFade( $sv_position.w );
+		#endif
+		
+		
+		#if $isShadow || $isZPrePass
+			ClipAlpha(color.a);
+			return;
+		#else
+			float4 result;
+
+			// color adjustment
+			#if $(fx/opt/fade_threshold)
+				result = float4 ( color.xyz * $legacy_color.xyz * $color_Adjust.xyz * $color_Adjust.www, color.w);
+			#else
+				result = float4 ( color.xyz * $legacy_color.xyz * $color_Adjust.xyz * $color_Adjust.www, color.w * $legacy_color.w);
+			#endif
+			float3 colorScattering = 0.0;
+			result.rgb  *= ComputeAutoExposure();
+			result.rgb = ComputeFogWithLightScattering(result.rgb, colorScattering, pixelCtx );
+
+			#if $isAlpha && !$isMasking && !$isMainPassAlpha
+				writePixel( result.rgb, color.rgb, color.a, $sv_position, @sv_target, @sv_target1 );
+			#else
+				@sv_target = float4(result.rgb, color.a);
+			#endif
+
+		#endif
+
+		#if $isMasking
+			@sv_target = @sv_target.a * $(rendering/masking/bendTimeFactor).x;
+		#endif
+	}
+}
