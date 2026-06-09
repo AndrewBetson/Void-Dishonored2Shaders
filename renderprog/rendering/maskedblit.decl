@@ -19,7 +19,7 @@
 	}
 	hlsl_fp_main {
 		float mask = $(rendering/Mask).SampleLevel( $bilinearClamp, $texcoord * $(rendering/ResolutionScale), 0.0f ).x;
-		float4 color = $(rendering/BufferIn).SampleLevel( $bilinearClamp, $texcoord * $(rendering/ResolutionScale), 0.0f ).x;
+		float4 color = $(rendering/BufferIn).SampleLevel( $bilinearClamp, $texcoord, 0.0f ).x;
 		@sv_target = color * mask;
 	}
 }

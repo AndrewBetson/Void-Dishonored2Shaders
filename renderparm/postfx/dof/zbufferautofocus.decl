@@ -1,1 +1,1 @@
-{ Texture2D	float	_default }
+{ Texture2D	float2	_default }

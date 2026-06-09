@@ -27,7 +27,9 @@
 		const float2 center = $(PostFX/DOF/center).xy;
 
 		#if $(PostFX/DOF/AUTOFOCUS)
-			float focusDist = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center, 0.0 ).x;
+			const float2 focusParms = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center, 0.0 );
+			const float focusDist = focusParms.x;
+			const float focusFuzz = focusParms.y;
 			farDof += focusDist;
 		#endif
 
@@ -41,7 +43,7 @@
 
 			#if $(PostFX/DOF/AUTOFOCUS)
 				farSharp = (farSharp + focusDist) / farDof;
-				farFuzzy = (farFuzzy + focusDist) / farDof;
+				farFuzzy = (farFuzzy + focusFuzz) / farDof;
 			#endif
 
 			float depthAlpha = $(PostFX/DOF/ZbufferAlpha).SampleLevel( $pointClamp, $texcoord, 0.0 ).x; //zmax
@@ -68,8 +70,8 @@
 			float nearSharp = ($(POSTFX/DOF/NearParams).y);
 
 			#if $(PostFX/DOF/AUTOFOCUS)
-				nearFuzzy = (focusDist + nearFuzzy) / farDof;
-				nearSharp = (focusDist - nearSharp) / farDof;
+				nearFuzzy = ( nearFuzzy + focusDist) / farDof;
+				nearSharp = (-nearSharp + focusFuzz) / farDof;
 			#endif
 
 			float k0 = ( depthMinLinear - nearSharp ) / (nearSharp - nearFuzzy);
@@ -93,7 +95,7 @@
 
 			#if $(PostFX/DOF/AUTOFOCUS)
 				farSharp = (farSharp + focusDist) / farDof;
-				farFuzzy = (farFuzzy + focusDist) / farDof;
+				farFuzzy = (farFuzzy + focusFuzz) / farDof;
 			#endif
 
 			float nearFuzziness = $(PostFX/DOF/NearFuzziness).SampleLevel( $bilinearClamp, $texcoord, 0.0 ).x;

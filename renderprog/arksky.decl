@@ -127,7 +127,11 @@
 				// compute starColor
 				float3 stars = ComputeStars($wsPosition, $skyStarSize.x) + ComputeStars($wsPosition, $skyStarSize.y);
 
-				@sv_target.xyz = RangeCompressColorToR11G11B10( color + stars );
+				float3 result = color + stars;
+				
+				BlackAndWhiteOverlay( result );
+		
+				@sv_target.xyz = RangeCompressColorToR11G11B10( result );
 				@sv_target.a = 1.0;
 
 				// compute clouds density

@@ -285,7 +285,9 @@
 
 				#if $isAlpha
 					writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+					BlackAndWhiteOverlay( @sv_target.xyz );
 				#else
+					BlackAndWhiteOverlay( result.finalizedColor.xyz );
 					@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
 					@sv_target.w = pixelCtx.m_diffuseAlbedo.a;
 				#endif
@@ -301,6 +303,8 @@
 					WRITE_IL_MRT( pixelCtx, surf, result )
 
 				#endif //defined( PC )
+				
+				
 			#endif
 		#endif
 	}

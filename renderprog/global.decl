@@ -112,6 +112,36 @@
 			return rgbe.rgb * ApproxExp2( rgbe.a * 255.0f - 128.0f );
 		}
 
+		// Normal Packing - 16 + 15 + sign bit
+		uint packNormal( float3 value ) {
+			const float2 xy = saturate( value.xy * 0.5 + 0.5 );
+			return ( ( uint( xy.x * 65535.0  ) << 16 ) | ( uint( xy.y * 32767.0 ) << 1 ) | uint( value.z >= 0.0 ? 1 : 0 ) );
+		}
+
+		float3 unpackNormal( uint value ) {
+			float3 n;
+			n.x = float( ( value >> 16 ) & 65535 ) / 65535.0;
+			n.y = float( ( value >> 1 ) & 32767 ) / 32767.0;
+			n.xy = n.xy * 2.0 - 1.0;
+			n.z = sqrt( saturate( 1 - n.x * n.x - n.y * n.y ) );
+			if ( ( value & 1 ) == 0 ) {
+				n.z *= -1.0;
+			}
+			return n;
+		}
+
+		uint pack101010( uint3 value ) {
+			return ( ( value.x & 0x3FF ) << 20 ) | ( ( value.y & 0x3FF ) << 10 ) | ( value.z & 0x3FF );
+		}
+
+		uint pack101010( uint x, uint y, uint z ) {
+			return ( ( x & 0x3FF ) << 20 ) | ( ( y & 0x3FF ) << 10 ) | ( z & 0x3FF );
+		}
+
+		uint3 unpack101010( uint value ) {
+			return uint3( ( value >> 20 ) & 0x3FF, ( value >> 10 ) & 0x3FF,  value & 0x3FF );
+		}
+
 		#if defined(ORBIS)
 			#define COMP_FLOAT16 compressed_16_float
 			#define COMP_UINT16 compressed_16_uint
@@ -203,6 +233,8 @@
 		static float PAGE_SIZE_LOG2 = 7;
 		static float PAYLOAD_SIZE = PAGE_SIZE - 2 * PAGE_BORDER;
 		static float PAYLOAD_SIZE_LOG2 = 6.907;
+		
+		static const float3	BW_LUMINANCE = float3( 0.2126, 0.7152, 0.0722 );
 
 		float GetFrontFacingFactor( bool _isFrontFacing ) {
 			return _isFrontFacing ? 1.0f : -1.0f;
@@ -404,6 +436,18 @@
 					maxLuminanceScalar = Adaptation.EngineLuminanceFactor * $view_white_level.x;
 				//}
 				return inColor.xyz / maxLuminanceScalar;
+			}
+
+		}
+		
+		void BlackAndWhiteOverlay( inout float3 _sv_target ) {
+			if( $blackWhiteModeRuntime ) {
+				float luminance = dot( _sv_target.xyz, BW_LUMINANCE );
+				#if $blackWhiteModeExcluded			
+					_sv_target =  luminance * $blackWhiteModeColor;
+				#else
+					_sv_target = float3( luminance, luminance, luminance );
+				#endif
 			}
 		}
 

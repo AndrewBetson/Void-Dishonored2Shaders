@@ -37,7 +37,9 @@
 
 		// bmayaux (2016-07-04) Avoid infinites by clamping to max 16 bits float value: 65503
 		finalColor = clamp( finalColor, 0.0, 65000.0 );
-
+		
+		BlackAndWhiteOverlay( finalColor.xyz );
+		
 		@sv_target.xyz = RangeCompressColorToR11G11B10( finalColor );
 		@sv_target.w = alphaOpacity * hairOpacity;
 	}

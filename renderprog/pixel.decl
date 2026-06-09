@@ -27,6 +27,7 @@
 			float3	m_wsTangent;			// world space tangent modified by parallax mapping or normal mapping (keep it normalized !)
 			float3	m_wsBiTangent;			// world space bi-tangent modified by parallax mapping or normal mapping (keep it normalized !)
 			float3	m_wsNormal;				// world space normal modified by parallax mapping or normal mapping (keep it normalized !)
+			float	m_invertedModel;		// model matrix determiant is negative, tangent space have to be inverted for normal mapping
 			float4	m_texCoords;			// texture coordinates
 			float2	m_maskTexCoords[3];		// texture coordinates scaled/biased for layer masks
 			float2	m_layerTexCoords[3];	// texture coordinates scaled/biased for layers
@@ -34,7 +35,7 @@
 			float3	m_irradiance[4];		// bmayaux (2015-02-11) Irradiance along 4 principal directions
 			float	m_IBLLuminanceFactor;
 			#if $useMultiInstancing || $(tool/usePerVertexSH)
-				uint3	m_IBLCubeMapIndex;	// 3 IBL indices coming from the the 3 vertices of the triangle (to interpolate with barycentric coordinates)
+				uint	m_IBLCubeMapIndex;	// 3 IBL indices coming from the the 3 vertices of the triangle (to interpolate with barycentric coordinates)
 				float3	m_barycentric;		// Barycentric coordinates used to interpolate the IBL cube maps
 			#else
 				uint	m_IBLCubeMapIndex;	// A single IBL cube map index for dynamic primitives

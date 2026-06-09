@@ -190,7 +190,8 @@
 		float	MinAdaptableLuminance_Bucket = Luminance2HistogramBucketIndex( $(env/autoexp/adapt_min_luminance) );
 		float	MaxAdaptableLuminance_Bucket = Luminance2HistogramBucketIndex( $(env/autoexp/adapt_max_luminance) );
 
-		float	TargetTailBucketPosition = clamp( MaxIntegralTailBucketPosition, MinAdaptableLuminance_Bucket, MaxAdaptableLuminance_Bucket - MonitorBucketsCount );
+		float	minTailClampValue = min( MinAdaptableLuminance_Bucket, MaxAdaptableLuminance_Bucket - MonitorBucketsCount - 1 ); // D3D & PS4 have different behavior in clamp() when max bound is < to min bound... we have to prevent this to keep consistency accross platforms.
+		float	TargetTailBucketPosition = clamp( MaxIntegralTailBucketPosition, minTailClampValue, MaxAdaptableLuminance_Bucket - MonitorBucketsCount );
 
 
 		// =====================================================================================

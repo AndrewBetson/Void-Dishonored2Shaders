@@ -57,7 +57,7 @@
 		{
 			//Sharpen with extrapolation
 			const float sharpen = $(PostFX/DOF/distortionParams).z;
-		
+
 		#if 0 //ftournade version (unsharp masking)
 			float3 lowPass = dontFetch ? 0.0 : $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, texCoords, 0.0).rgb;
 			float3 highPass = texColor - lowPass;
@@ -65,10 +65,13 @@
 			texColor = max( texColor, 0.0f );
 		#else //ltartinville version
 			float3 texColorDiv2 = dontFetch ? 0.0 : $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, texCoords, 0.0).rgb;
-			float3 edge = step(texColorDiv2, texColor) - step($(atm/worldFog/ScatteringColor), texColor);
-			texColor = lerp( texColorDiv2, texColor, 1.0 + sharpen * edge );
+			float3 expandedTexColor = RangeExpandColorFromR11G11B10( texColor );
+			float3 edge = saturate( step(texColorDiv2, texColor) - ( 0.75 * step( $(atm/worldFog/ScatteringColor), expandedTexColor ) ) );
+			const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance
+			float gEdge = dot(RGB_TO_GREYSCALE,edge);			
+			texColor = lerp( texColorDiv2, texColor, 1.0 + sharpen * gEdge );			
 		#endif
-		
+
 			/*
 			// Funny Toon shading
 			const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance

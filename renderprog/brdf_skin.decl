@@ -136,7 +136,7 @@
 					float	LdotH = dot( Light, Half );
 
 					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
-					float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+					float	cloudShadow = _Light.m_isDirectionalLight ? GetFastCloudShadowing( _Surface.wsPositionHacked ) : 1.0;
 					float3	Irradiance_shadowed = _Light.m_shadow * cloudShadow * Irradiance;
 
 					// =================================================================

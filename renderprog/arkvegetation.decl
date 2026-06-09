@@ -240,11 +240,13 @@
 
 			// compute fog
 			result.finalizedColor.xyz = ComputeFogWithLightScattering( result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
-
+						
 			// write final pixel, manage OIT blend weight for alpha
 			#if $isAlpha && !$isMainPassAlpha
 				writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
+				BlackAndWhiteOverlay( @sv_target.xyz );
 			#else
+				BlackAndWhiteOverlay( result.finalizedColor.xyz );
 				@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
 				@sv_target.w = pixelCtx.m_diffuseAlbedo.a;
 			#endif
@@ -258,7 +260,6 @@
 				#inlinefile <includes/resultOverrideIL.inc>
 				WRITE_IL_MRT( pixelCtx, surf, result )
 			#endif
-
 		#endif	// #if $isShadow || $isZPrePass
 	}
 }

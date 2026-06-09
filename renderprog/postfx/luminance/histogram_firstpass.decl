@@ -28,6 +28,14 @@
 		uint	Width = Dimensions.x;
 		uint	Height = Dimensions.y;
 
+		#ifdef ORBIS
+		float W, H;
+		$(PostFX/Luminance/texDownsampledHDR).GetDimensions( W, H );
+		Width = (uint) W;
+		Height = (uint) H;
+		#endif
+
+
 		// Clear the histogram
 		[unroll]
 		for ( uint i=0; i < PassesCount; i++ ) {
@@ -49,8 +57,10 @@
 
 			float	Luminance = $(PostFX/Luminance/texDownsampledHDR)[PixelIndex].w;		// Remember we're reading from the previously downsampled HDR buffer where alpha contains the luminance
 
+			
+			// NO !! $(PostFX/Luminance/texDownsampledHDR) have already been reranged to 16 16 16 during first downsampling pass
 			// range expand luminance from r11g11b10 to linear
-			Luminance = RangeExpandColorFromR11G11B10( Luminance );
+			//Luminance = RangeExpandColorFromR11G11B10( Luminance );
 			Luminance *= ARKANE_TO_WORLD_LUMINANCE;	// ARKANE TO WORLD (?? units => cd/m²)
 
 #if 1

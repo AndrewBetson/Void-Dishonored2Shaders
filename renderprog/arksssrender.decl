@@ -86,9 +86,12 @@
 			HQ_FetchMasks( pixelCtx );
 			HQ_FetchDiffuseAlbedo( pixelCtx );
 			@sv_target = pixelCtx.m_diffuseAlbedo;
+			
+			BlackAndWhiteOverlay( @sv_target.xyz );
 		#elif $isOutline
 			#if $outlineable
 				@sv_target = pixelCtx.OutlineSeed();
+				BlackAndWhiteOverlay( @sv_target.xyz );
 			#endif
 
 		// =======================================================================
@@ -196,7 +199,11 @@
 			result = IntegrateLighting( surf, HIGH_QUALITY );
 
 			#if !$isMainPassAlpha
-				@sv_target.xyz = RangeCompressColorToR11G11B10( result.accumSpecular + result.accumEmissive );
+			
+				float3 finalCol = result.accumSpecular + result.accumEmissive;
+				BlackAndWhiteOverlay( finalCol );
+				
+				@sv_target.xyz = RangeCompressColorToR11G11B10( finalCol );
 				@sv_target.w = 1.0f;
 
 				#if defined( PC ) && !defined( RETAIL )
@@ -214,13 +221,16 @@
 					result1.rgb *= fresnelLUT;
 				#endif
 
+				BlackAndWhiteOverlay( result1.xyz );
 				@sv_target1.xyz = RangeCompressColorToR11G11B10( result1.xyz );		
 				@sv_target1.w = result1.w;
 
 			#else
+				BlackAndWhiteOverlay( result.finalizedColor.xyz );
 				@sv_target.rgb = RangeCompressColorToR11G11B10( result.finalizedColor );
 				@sv_target.a = 1.0;
 			#endif
+			
 
 		#endif
 	}

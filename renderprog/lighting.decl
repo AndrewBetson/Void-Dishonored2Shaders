@@ -100,7 +100,7 @@
 
 			// =================================================================
 			// Add light scattering (only for alpha fragment)
-			Result.accumScattering = INTEGRATE_SCATTER( _Surface, _quality );
+			Result.accumScattering = 0.0;//INTEGRATE_SCATTER( _Surface, _quality );
 			
 			// =================================================================
 			// parallel light

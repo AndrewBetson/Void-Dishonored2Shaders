@@ -109,6 +109,9 @@
 											foamFFT, foamTex, foamDepth,
 											waveAmplitudeMask, unused_IBLInfo );
 							
+							
+			
+			BlackAndWhiteOverlay( waterResult.xyz );
 			@sv_target.xyz = RangeCompressColorToR11G11B10( waterResult.xyz );
 			@sv_target.w = waterResult.w;
 

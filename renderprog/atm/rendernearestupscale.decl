@@ -1,0 +1,112 @@
+{
+	newstyle
+	state {
+		depthEnable		0
+		depthWrite		0					// No Z write
+ 		depthfunc		ALWAYS				// No Z read
+ 		cull			NONE
+		blendOp			ADD
+		alphaBlendOp	ADD
+		blend			ONE		ONE_MINUS_SRC_ALPHA
+		alphaBlend		ZERO	ONE
+
+	}
+
+	hlsl_prefix {
+		float2	GetDownsampledDepthBufferUV( float2 _UV ) {
+			return _UV * $(downsampling/depthBufferUVFactor).xy;
+		}
+
+		void UpdateNearestSample( inout float MinDist, inout float2 NearestUV, float Z, float2 UV, float ZFull ) {
+			float Dist = abs(Z - ZFull);
+			if (Dist < MinDist)	{
+				MinDist = Dist;
+				NearestUV = UV;
+			}
+		}
+
+		float4 FetchLowResDepths(float2 _uv) {
+			float4 Zscene = $(atm/distanceFog/TexDepthHalf).GatherGreen( $bilinearClamp, _uv);
+			//float4 Zscene = $(downsampling/downsampledDepthBuffer).GatherRed( $bilinearClamp, _uv );	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+			//LinearZ
+			return Zscene;
+		}
+
+		float FetchFullResDepth(float2 _uv) {
+			float Zproj = $(atm/distanceFog/TexDepth).SampleLevel( $pointSampler, _uv, 0.0).x;
+			float Zscene = ComputeLinearZ( Zproj );
+			return Zscene;
+		}
+
+	}
+
+	hlsl_vp_main {
+		@sv_position = float4( $vertex_position.xyz, 1.0 );
+	}
+	
+	hlsl_fp_main {
+		//Get Dimension of half-resolution depth-buffer
+		uint widthDiv2, heightDiv2;
+		$(atm/distanceFog/TexDepthHalf).GetDimensions(widthDiv2,heightDiv2);
+		float2 halfResTexelSize = 1.f/float2(widthDiv2,heightDiv2);
+
+		//Get Dimension of full-resolution depth-buffer
+		uint width, height;
+		$(atm/distanceFog/TexDepth).GetDimensions(width,height);
+
+		#if 0	// bmayaux (2016-05-11) Uniformization of downsampled depth buffer fetch
+			float2 fullResUV = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+			float2 LoResUV = GetDownsampledDepthBufferUV( fullResUV );
+		#else
+			//Compute full-resolution UV
+			float2 fullResUV = screenPosToTexcoord( $sv_position.xy, $positionToViewTexture, $resolutionScale.xy);
+
+			// This corrects for cases where the hi-res texture doesn't correspond to 100% of the low-res
+			// texture (e.g. 1023x1023 vs 512x512)
+			//Compute half-resolution UV
+			float reductionFactor = float(heightDiv2) / float(height);
+			float2 scale = halfResTexelSize * reductionFactor * float2(width,height);
+			float2 LoResUV = fullResUV * scale;
+		#endif
+
+		float minDist = $globalViewInfos.w; //zFar
+		float ZFull = FetchFullResDepth( fullResUV );
+		float4 ZLo = FetchLowResDepths(LoResUV);
+
+		float2 UV00 = LoResUV - 0.5 * halfResTexelSize;
+		float2 nearestUV = UV00;
+		float Z00 = ZLo.w;
+		UpdateNearestSample(minDist, nearestUV, Z00, UV00, ZFull);
+
+		float2 UV10 = float2(UV00.x+halfResTexelSize.x, UV00.y);
+		float Z10 = ZLo.z;
+		UpdateNearestSample(minDist, nearestUV, Z10, UV10, ZFull);
+
+		float2 UV01 = float2(UV00.x, UV00.y+halfResTexelSize.y);
+		float Z01 = ZLo.x;
+		UpdateNearestSample(minDist, nearestUV, Z01, UV01, ZFull);
+
+		float2 UV11 = UV00 + halfResTexelSize;
+		float Z11 = ZLo.y;
+		UpdateNearestSample(minDist, nearestUV, Z11, UV11, ZFull);
+
+		const float g_DepthThreshold  = $(atm/distanceFog/ratio).x; // default value 0.0002
+		float4 color;
+
+		[branch]
+		if (abs(Z00 - ZFull) < g_DepthThreshold &&
+			abs(Z10 - ZFull) < g_DepthThreshold &&
+			abs(Z01 - ZFull) < g_DepthThreshold &&
+			abs(Z11 - ZFull) < g_DepthThreshold) {
+			color = $(atm/distanceFog/TexSourceImage).SampleLevel( $bilinearClamp, LoResUV, 0.0);
+		}
+		else {
+			color = $(atm/distanceFog/TexSourceImage).SampleLevel( $pointSampler, nearestUV, 0.0);
+		}
+
+		BlackAndWhiteOverlay( color.xyz );
+		
+		@sv_target.xyz = RangeCompressColorToR11G11B10( color.xyz );
+		@sv_target.w = saturate(color.w);
+	}
+}

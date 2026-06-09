@@ -38,8 +38,7 @@
 	}
 
 	hlsl_fp_main {
-
-		uint halfRes = 2;
+		uint halfRes = $(atm/worldFog/resolutionScale);
 		uint maxLights = 32;
 		uint2 _pixelAddr = uint2( $sv_position.xy * halfRes );
 		uint nNumLightsInThisTile = 0;
@@ -57,7 +56,6 @@
 			float4 ndcPos = float4( texCoords.xy, depth, 1.0 );
 			float4 wsPos = mul( $inverseViewProjectionMatrix, ndcPos );
 			wsPos.xyz /= wsPos.w;
-			
 			if($alwaysOne) {
 				wsPosition = wsPos.xyz;
 			}
@@ -117,6 +115,9 @@
 		float density = saturate(accumPoint.a + accumHalfPoint.a + accumSpot.a);
 
 		accumScattering.rgb *= accumScattering.a; 
+		
+		BlackAndWhiteOverlay( accumScattering.rgb );
+		
 		@sv_target = float4( accumScattering.rgb, density );
 	}
 }

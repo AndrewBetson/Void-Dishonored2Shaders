@@ -93,5 +93,8 @@
 		sampleColor /= (float)NB_SAMPLES;
 
 		@sv_target = sampleColor;
+		
+		
+		BlackAndWhiteOverlay( @sv_target.xyz );
 	}
 }

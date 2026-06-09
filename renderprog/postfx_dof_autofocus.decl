@@ -9,31 +9,76 @@
 		cull none
 	}
 
+	options {
+		NUMTHREADX 8
+		NUMTHREADY 2
+		NUMTHREADZ 1
+	}
+
 	hlsl_prefix {
 		#include <dof>
+		groupshared float gs_Samples[NUMTHREADX*NUMTHREADY];
 	}
 
 	hlsl_cp_main {
 		const float2 center = $(PostFX/DOF/center).xy;
-		float focusCurrent = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, center*$resolutionScale.xy, 0.0 ).x;
 
 		// Extend Focus
-		const uint nbSteps = 8;
-		const float anglestep = TWOPI / nbSteps;
-		const float speed = $(PostFX/DOF/Autofocus/speed);
-		const float radius = $(PostFX/DOF/Autofocus/radius);
+		const uint nbSteps = NUMTHREADX;
+		const float anglestep = TWOPI / NUMTHREADX;
+		const float radius = $(PostFX/DOF/Autofocus/radius) + $(PostFX/DOF/Autofocus/radius) * 0.5 * $sv_groupThreadID.y;
 
-		[unroll]
-		for( uint idx=0; idx < nbSteps; ++idx ) {
-			const float angle = (idx * anglestep);
-			float2 offset = rot2d( float2(radius,0.0), angle );
-			float2 texcoords = (center + $(PostFX/DOF/targetSize).xy * offset) * $resolutionScale.xy;
-			float  focus = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, texcoords, 0.0 ).x;
-			focusCurrent = min( focusCurrent, focus );
+		uint threadIndex = $sv_groupThreadID.y * NUMTHREADX + $sv_groupThreadID.x;
+		const float angle = ($sv_groupThreadID.x * anglestep);
+		float2 offset = rot2d( float2(radius,0.0), angle );
+		float2 texcoords = (center + $(PostFX/DOF/targetSize).xy * offset) * $resolutionScale.xy;
+		float  focus = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, texcoords, 0.0 ).x;
+		gs_Samples[threadIndex] = focus;
+
+		// We wait until all samples from the group are available
+		GroupMemoryBarrierWithGroupSync();
+
+		if( threadIndex == 0 ) {
+			const float zfar = $globalViewInfos.w;
+			float focusCurrent = $(PostFX/DOF/ZbufferDownsampled).SampleLevel( $bilinearClamp, center*$resolutionScale.xy, 0.0 ).x;
+			float2 focusAvg = zfar;
+			uint idx;
+
+			for( idx=0; idx < nbSteps; ++idx ) {
+				focusAvg.x = min( focusAvg.x, gs_Samples[idx] );
+			}
+			for( idx=0; idx < nbSteps; ++idx ) {
+				focusAvg.y = min( focusAvg.y, gs_Samples[NUMTHREADX + idx] );
+			}
+			focusCurrent = min( focusCurrent, (focusAvg.x + focusAvg.y) * 0.5 );
+
+			// Auto-focus movement
+			float2 focusParms = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center*$resolutionScale.xy, 0.0 );
+
+			float focusTarget = sign( focusParms.x - focusCurrent) >= 0.0 ? focusCurrent : focusParms.x;
+			float speedFocal = focusTarget > 0.0 ? $(PostFX/DOF/Autofocus/speed).x : $(PostFX/DOF/Autofocus/speed).y;
+			float speedFuzzy = focusTarget > 0.0 ? $(PostFX/DOF/Autofocus/speed).y : $(PostFX/DOF/Autofocus/speed).x;
+
+			// Sharpness
+			const float sharpStartDist = $(PostFX/DOF/Autofocus/speed).z; // in meter
+			const float sharpEndDist = $(PostFX/DOF/Autofocus/speed).w; // in meter
+			float sharpness = zfar * smoothstep( sharpStartDist, sharpEndDist, focusTarget );
+
+			// Focus Plane
+			float frameTime = ($localTime.y * 30.0);
+			float focusLast = min( zfar, focusParms.x + sharpness );
+			float focusNew  = lerp(focusLast, focusCurrent, saturate(speedFocal * frameTime));
+
+			// Focus Fuzzy
+			float fuzzyCurrent = min( zfar, focusTarget + sharpness );
+			float fuzzyLast = focusParms.y;
+			float fuzzyNew  = lerp(fuzzyLast, fuzzyCurrent, saturate(speedFuzzy * frameTime));
+
+			if( focusNew <= fuzzyNew ) {
+				@(PostFX/DOF/ZbufferAutofocusOut)[uint2(0,0)] = float2( focusNew, fuzzyNew );
+			} else {
+				@(PostFX/DOF/ZbufferAutofocusOut)[uint2(0,0)] = float2( fuzzyNew, focusNew );
+			}
 		}
-
-		float focusLast = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, center*$resolutionScale.xy, 0.0 ).x;
-		float val = lerp(focusLast,focusCurrent,speed);
-		@(PostFX/DOF/ZbufferAutofocusOut)[uint2($sv_groupThreadID.xy)] = val;
 	}
 }

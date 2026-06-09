@@ -131,7 +131,14 @@
 					#else
 						// On consoles, these are free!
 						iblInfo.barycentrics = GetBarycentricCoords();
-						iblInfo.IBLCubeMapIndex = $instance_IBLProbeIndex;
+						// BEWARE : $instance_IBLProbeIndex is tricky in this context, it is an uint !!
+						// the flat keyword in declaration makes it 1 component in VS and 3 in PS
+						// holding correctly the 3 probe indices from the 3 vertices
+						// BUT for unknown reason accessing it directly with a swizzle like this :
+						// $instance_IBLProbeIndex.yzx DOES NOT COMPILE !
+						// so keep on using a temporary uint3 before swizzling
+						uint3 iblCubeMapIndexTemp = $instance_IBLProbeIndex;
+						iblInfo.IBLCubeMapIndex = iblCubeMapIndexTemp.yzx;
 					#endif
 				#else
 					// Retrieves a single cube map index for the entire object
@@ -173,6 +180,9 @@
 										foam, foam, foam, waveAmplitudeMask,
 										iblInfo	);
 										
+										
+		BlackAndWhiteOverlay( waterResult.xyz );
+			
 		@sv_target.xyz = RangeCompressColorToR11G11B10( waterResult.xyz );
 		@sv_target.w = waterResult.w;
 
@@ -197,6 +207,7 @@
 
 		#endif
 
+		
 	
     #endif
 		

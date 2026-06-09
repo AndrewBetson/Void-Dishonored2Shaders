@@ -107,13 +107,19 @@
 				} else {
 					float3 lensDirtFrom = $(PostFX/Bloom/lensDirt_From).SampleLevel( $linearClamp, UV+$(subpixelOffset).xy, 0.0 ).xyz;
 					float3 lensDirtTo = $(PostFX/Bloom/lensDirt_To).SampleLevel( $linearClamp, UV+$(subpixelOffset).xy, 0.0 ).xyz;
-					lensDirt = lerp( lensDirtFrom, lensDirtTo, $(PostFX/Bloom/lensDirt_BlendWeight).x );
+					lensDirt = lerp( lensDirtFrom, lensDirtTo, $(PostFX/Bloom/lensDirt_BlendWeight).x );					
 				}
+				#if $blackWhiteMode
+					BlackAndWhiteOverlay( lensDirt );
+				#endif
 				
 				//Bloom
 				float3 bloom = 0.0;
 				if ( $(env/bloom/veil_strength) > 0.0 )	{ // This line to prevent adding it entirely, allows to remove the black square that occur when blurring NaNs & infinites!
 					bloom =	$(env/bloom/veil_strength) * RangeExpandColorFromR11G11B10( $(PostFX/Bloom/texBloom).SampleLevel( $linearClamp, scaledUV, 0.0 ).xyz );
+					#if $blackWhiteMode
+						BlackAndWhiteOverlay( bloom );
+					#endif
 					color += $(PostFX/Bloom/lensDirt_strength) * lensDirt * bloom + bloom;
 				}
 				 
@@ -122,6 +128,11 @@
 				scaledUV = saturate( scaledUV - ($positionToViewTexture.zw*(1.0/$resolutionScale.xy)) );
 				float3 lensflares = RangeExpandColorFromR11G11B10( $(PostFX/LensFlares/texLensFlares).SampleLevel( $linearClamp, scaledUV, 0.0 ).xyz );
 				lensflares = lensflares * (0.2 + 0.8 * lensDirt);	
+				
+				#if $blackWhiteMode
+					BlackAndWhiteOverlay( lensflares );
+				#endif
+
 				color += lensflares;				
 			}
 		}
@@ -145,7 +156,9 @@
 		// Color grading
 		#if $(PostFX/AutoExposure/enable)
 			// Apply the color cube
-			color = $(toneMapping/finalColorCube).SampleLevel( $linearClamp, ((color * (COLOR_CUBE_SIZE-1.0) + 0.5) * (1.0 / COLOR_CUBE_SIZE)), 0.0 ).xyz;
+			#if $blackWhiteMode	== 0
+				color = $(toneMapping/finalColorCube).SampleLevel( $linearClamp, ((color * (COLOR_CUBE_SIZE-1.0) + 0.5) * (1.0 / COLOR_CUBE_SIZE)), 0.0 ).xyz;
+			#endif
 		#endif
 
 
@@ -173,7 +186,10 @@
 		float gamma = $(env/tonemapping/gamma_brightness).x;
 		float brightness = $(env/tonemapping/gamma_brightness).y;
 		color = pow( saturate(color * brightness), gamma );
+
+
 		
+
 		// ===========================================================
 		// DEBUG
 		#if $(PostFX/ToneMapping/debug)

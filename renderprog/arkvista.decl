@@ -284,6 +284,7 @@
 			// bmayaux (2016-07-25) Avoid infinites by clamping to max 16 bits float value: 65503 (actually, clamp to even less!)
 			float3	finalColor = min( 32768.0, accumDiffuse + accumSpecular + accumAmbient + accumEmissive );
 
+			BlackAndWhiteOverlay( finalColor );
 			@sv_target = float4( RangeCompressColorToR11G11B10( finalColor ), 1.0 );
 
 
@@ -306,6 +307,7 @@
 					#endif	// $buildingEnvironmentProbe
 				}
 			#endif
+			
 		#endif
 	}
 }

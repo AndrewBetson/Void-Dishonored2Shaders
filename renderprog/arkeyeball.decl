@@ -242,6 +242,8 @@
 			// Compute fog
 			result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
 
+			BlackAndWhiteOverlay( result.finalizedColor.xyz );
+			
 			@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
 			@sv_target.w = albedo.w;
 

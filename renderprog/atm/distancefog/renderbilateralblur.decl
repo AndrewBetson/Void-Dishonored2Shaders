@@ -11,6 +11,25 @@
 	hlsl_prefix {
 		#include <helper>
 
+		float2 getTexel( float2 texCoords )
+		{
+			//improved texture interpolation
+			//http://www.iquilezles.org/www/articles/texture/texture.htm
+
+			uint width, height;
+			$(atm/distanceFog/TexSourceImage).GetDimensions(width,height);
+			float2 dim = float2( width, height );
+			texCoords = (texCoords*dim) + 0.5;
+
+			float2 i = floor(texCoords);
+			float2 f = texCoords - i;
+			f = f*f*f*(f*(f*6.0-15.0)+10.0);
+			texCoords = i + f;
+
+			texCoords = (texCoords - 0.5)/dim;
+			return texCoords;
+		}
+
 		float4 FetchColor(float2 texCoords)
 		{
 			float4 color = $(atm/distanceFog/TexSourceImage).SampleLevel( $bilinearClamp, texCoords, 0.0 ).rgba;

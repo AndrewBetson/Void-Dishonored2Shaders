@@ -312,6 +312,8 @@
 				@sv_target = pixelCtx.m_diffuseAlbedo;
 			#endif
 
+			BlackAndWhiteOverlay( @sv_target.xyz );
+
 		// =======================================================================
 		// Standard Pass
 		#else
@@ -381,11 +383,15 @@
 				
 				result = IntegrateLighting( surf, HIGH_QUALITY );
 
+				
+				
 				#if $isAlpha && !$isMainPassAlpha
 					ComputeGlassTransmittance( surf, pixelCtx, result );
 					result.finalizedColor.xyz = ComputeFogWithLightScattering(result.finalizedColor.rgb, result.accumScattering.rgb, pixelCtx );
 					writePixel( result.finalizedColor, pixelCtx.m_diffuseAlbedo.rgb, pixelCtx.m_diffuseAlbedo.a, $sv_position, @sv_target, @sv_target1 );
-				#else
+					BlackAndWhiteOverlay( @sv_target.xyz );
+				#else				
+					BlackAndWhiteOverlay( result.finalizedColor.xyz );
 					@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
 					@sv_target.w = saturate(pixelCtx.m_diffuseAlbedo.a);
 				#endif
@@ -398,8 +404,10 @@
 					// Write MRT info for probe rendering
 					#inlinefile <includes/resultOverrideIL.inc>
 					WRITE_IL_MRT( pixelCtx, surf, result )
-				#endif //defined( PC )
-
+				#endif //defined( PC )	
+				
+				
+			
 			#endif
 		#endif
 	}

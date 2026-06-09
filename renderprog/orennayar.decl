@@ -28,9 +28,9 @@
 				float cos_angle_ln = dot( l, n );
 				float cos_alpha = min( cos_angle_vn, cos_angle_ln );				// Here we reverse the min/max since acos() is a monotonically decreasing function
 				float cos_beta  = max( cos_angle_vn, cos_angle_ln );
-				float sin_alpha = sqrt( saturate( 1.0 - cos_alpha*cos_alpha ) );	// Saturate to avoid NaN if ever cos_alpha > 1 (it happens with floating-point precision)
-				float sin_beta = sqrt( saturate( 1.0 - cos_beta*cos_beta ) );
-				float C = sin_alpha * sin_beta / (1e-6 + cos_beta);
+				float sin_alpha = saturate( 1.0 - cos_alpha * cos_alpha );	// Saturate to avoid NaN if ever cos_alpha > 1 (it happens with floating-point precision)
+				float sin_beta = saturate( 1.0 - cos_beta * cos_beta );
+				float C = sqrt( sin_alpha * sin_beta ) / ( 1e-6 + cos_beta );
 			#else
 				float angle_vn = safeAcos( dot( v, n ) );
 				float angle_ln = safeAcos( dot( l, n ) );

@@ -144,5 +144,8 @@
 		#if $isMasking
 			@sv_target = @sv_target.a * $(rendering/masking/bendTimeFactor).x;
 		#endif
+		
+		
+		BlackAndWhiteOverlay( @sv_target.xyz );
 	}
 }

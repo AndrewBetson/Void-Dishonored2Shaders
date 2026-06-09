@@ -47,10 +47,11 @@
 		}
 		
 		float4 Poisson( float2 uv, float3 normal, float2 radius, int index ) {
+
 			float2 offset = radius * Kernel[index];
-			offset = Rotate2d( offset, normal.x ) * $resolutionScale.xy;
-			
-			return $(rendering/portal).SampleLevel( $linearClamp, uv + offset, 0.0 );
+			offset = Rotate2d( offset, normal.x );
+
+			return $(rendering/portal).SampleLevel( $linearClamp, (uv/$resolutionScale.xy + offset)*$(rendering/portalResolutionScale).xy, 0.0 );
 		}
 	}
 

@@ -273,7 +273,11 @@
 						@sv_target = float4(finalColor, diffuseAlbedo.a);
 					#endif
 				#endif
-			#endif
+			#endif			
+
+		        BlackAndWhiteOverlay( @sv_target.xyz );
+			
 		#endif
+		
 	}
 }

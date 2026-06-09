@@ -132,7 +132,7 @@
 						float	enableShadow = saturate( 1e5 * shadowMapZ );					// 0 if caster is exactly on Znear (pancaking), 1 otherwise
 						float	isBehindCaster = saturate( 1e4 * (shadowCoordZ - shadowMapZ) );	// 1 if receiver is in front of caster, 0 otherwise
 						float	shadow = enableShadow * exp( -$(vegetation/transmittanceParms).w * isBehindCaster * distance( _Surface.wsPosition, wsCasterPos ) );
-						float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+						float	cloudShadow = _Light.m_isDirectionalLight ? GetFastCloudShadowing( _Surface.wsPositionHacked ) : 1.0;
 						Irradiance_shadowed = shadow * cloudShadow * Irradiance;
 					}
 

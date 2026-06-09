@@ -92,8 +92,9 @@
 				#endif
 				
 				#if $isShadow
-					float mask = (1.0 / 17.0) * (1.0 + B8( uint2( pixelCtx.m_ssPosition.xy + 0.5 + $jitterVectors.xy ) ) / 64.0 );
-					clip( alpha - mask );
+					float mask = (1.0 / 17.0) * ( 1.0 + B8( uint2( pixelCtx.m_ssPosition.xy ) ) / 64.0 );
+					float alphaMask = smoothstep( 0.0, 3.0, alpha );
+					clip( alphaMask - mask );
 				#else
 					//hair are rendered 2 times in the depth buffer
 					//1) standard depth buffer with alpha-test = 0.9 for help sorting
@@ -165,15 +166,6 @@
 				if ( $alwaysOne && ($(indirectLighting/globalParms1).z & 2) != 0 ) {
 					albedo.xyz = 0.5;	// Replace by a 50% reflector
 				}
-			#endif
-
-			// =================================================================
-			// Irradiance shadowed and blurred
-			// =================================================================
-			#if !$isMainPassAlpha
-				float3 scatteredIrradiance = $hairScatteredIrradiance[(uint2)$sv_position.xy].rgb;
-			#else
-				float3 scatteredIrradiance = 0;
 			#endif
 
 			// =================================================================
@@ -290,8 +282,6 @@
 			surf.userData.secondarySpecularPower	= $secondarySpecularPower.x;
 			surf.userData.secondarySpecularIntensity= $secondarySpecularIntensity.x;
 			surf.userData.secondarySpecularShift	= $secondarySpecularShift.x;
-			// lighting diffuse blurred and transmittance
-			surf.userData.ScatteredIrradiance		= scatteredIrradiance;
 
 			#if $(fuzz/enable) && $(fuzz/hasMask)
 			surf.fuzzMask = fuzzMask;
@@ -313,7 +303,9 @@
 
 			#if $isAlpha && !$isMainPassAlpha
 				writePixel( result.finalizedColor, albedo.rgb, albedo.a, $sv_position, @sv_target, @sv_target1 );
+				BlackAndWhiteOverlay( @sv_target.xyz );
 			#else
+				BlackAndWhiteOverlay(result.finalizedColor.xyz );
 				@sv_target.xyz = RangeCompressColorToR11G11B10( result.finalizedColor );
 				@sv_target.a = step($hairAlphaTestOpaque,albedo.a) ? 1.0 : albedo.a;
 			#endif

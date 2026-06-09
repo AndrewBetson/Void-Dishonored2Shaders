@@ -529,7 +529,7 @@
 				#endif
 
 				// Compute final world space tangent space
-				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + _pixelCtx.m_invertedModel * tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
 				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
 				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
 
@@ -564,7 +564,7 @@
 				float3	tsNormal = UnpackBC5NormalMap( rawTsNormal );
 
 				// Compute final world space tangent space
-				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + _pixelCtx.m_invertedModel * tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
 				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
 				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
 				return tsNormal;
@@ -578,7 +578,7 @@
 				float3	tsNormal = UnpackBC5NormalMap( rawTsNormal );
 
 				// Compute final world space tangent space
-				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
+				_pixelCtx.m_wsNormal = normalize( tsNormal.x * _pixelCtx.m_wsVertexTangent + _pixelCtx.m_invertedModel * tsNormal.y * _pixelCtx.m_wsVertexBiTangent + tsNormal.z * _pixelCtx.m_wsVertexNormal );
 				_pixelCtx.m_wsTangent = normalize( cross( _pixelCtx.m_wsVertexBiTangent, _pixelCtx.m_wsNormal ) );
 				_pixelCtx.m_wsBiTangent = cross( _pixelCtx.m_wsNormal, _pixelCtx.m_wsTangent );
 				return tsNormal;
@@ -1358,7 +1358,8 @@
 				result.Finalize();
 			#endif
 		}
-
+		
+		
 		// bmayaux (2015-11-26)
 		// =======================================================================
 		//   ___  ___ ___ _   _  ___
@@ -1500,6 +1501,9 @@ if ( $DEBUG_FdrFactor.w > 0.5 ) {
 
 			}	// if ( $alwaysOne )
 			#endif	// defined( PC ) && !$buildingEnvironmentProbe
+			
+				
+			
 		}
 	}
 }

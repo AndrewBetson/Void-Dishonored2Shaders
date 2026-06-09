@@ -46,9 +46,9 @@
 
 			const float3 centerColor = 0.0;
 			float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
-			
+
 			float2 cocRadius = GetCOCRadius(centerDepth.g);
-			if( cocRadius.x >  (1.0/255.0) ) 
+			if( cocRadius.x >  (1.0/255.0) )
 			{
 				result = Dof_Alpha( coords_low, $(PostFX/DOF/targetSize).zw, centerColor, centerDepth, useBlur, blurSize );
 			}
@@ -63,7 +63,7 @@
 			const float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
 
 			float2 cocRadius = GetCOCRadius(centerDepth.r);
-			if( cocRadius.x >  (1.0/255.0) ) 
+			if( cocRadius.x >  (1.0/255.0) )
 			{
 				result = Dof_Near( coords_low, $(PostFX/DOF/targetSize).xy, centerColor, centerDepth.r );
 			}
@@ -77,9 +77,9 @@
 			float3 centerColor = $(PostFX/DOF/diffuseMap).SampleLevel($bilinearClamp, coords_high, 0.0).rgb;
 			centerColor.xyz = centerColor.xyz;
 			const float2 centerDepth = $(PostFX/DOF/dofDataMap).SampleLevel($bilinearClamp, coords_high, 0.0).rg;
-			
+
 			float2 cocRadius = GetCOCRadius(centerDepth.g);
-			if( cocRadius.x >  (1.0/255.0) ) 
+			if( cocRadius.x >  (1.0/255.0) )
 			{
 				result = Dof_Far( coords_high, coords_low, $(PostFX/DOF/targetSize), centerColor, centerDepth.g );
 			}
@@ -96,7 +96,7 @@
 		#endif
 
 		@sv_target = result;
-		
+
 		#if $(PostFX/DOF/DOF_TYPE) == 0 || $(PostFX/DOF/DOF_TYPE) == 1 //ALPHA || NEAR
 			@sv_target1 = result.wwww;
 		#endif

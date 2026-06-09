@@ -46,7 +46,6 @@
 			float		secondarySpecularPower;
 			float		secondarySpecularIntensity;
 			float		secondarySpecularShift;
-			float3		ScatteredIrradiance;
 			float3		transmittance;
 
 			void	Clear() {
@@ -61,7 +60,6 @@
 				secondarySpecularPower = 0.0;
 				secondarySpecularIntensity = 0.0;
 				secondarySpecularShift = 0.0;
-				ScatteredIrradiance = float3(0,0,0);
 				transmittance = float3(1,1,1);
 			}
 		};
@@ -142,54 +140,45 @@
 				#endif
 
 				if ( _Light.m_attenuation > 0.0 && (isTranslucent || _Light.m_shadow > 0.0) ) {
-					float3	View = _Surface.wsView;
-					float3	Light = _Light.m_wsToLight;
-					float3	Normal = _Surface.wsNormal;
-					float3	Half_unorm = View + Light;
-					float3	Half = normalize( Half_unorm );
-
-					float	LdotN = saturate( dot( Light, Normal ) );
-					float	VdotN = saturate( dot( View, Normal ) );
-					float	LdotH = dot( Light, Half );
-
-					float3	Irradiance = _Light.m_attenuation * _Light.m_color;
+					const float3	View	= _Surface.wsView;
+					const float3	Light	= _Light.m_wsToLight;
+					const float3	Normal	= _Surface.wsNormal;
+					const float3	Half	= normalize( View + Light );
+					const float		LdotN	= saturate( dot( Light, Normal ) );
+					const float		VdotN	= saturate( dot( View, Normal ) );
+					const float		LdotH	= dot( Light, Half );
 
 					// =================================================================
 					// ARKANE: bmayaux (2013-10-07) Now accounting for Fresnel reflectance so we can never have diffuse + specular > 1
-					float3	FresnelSpecular;
-					float3	FresnelDiffuse;
-					float3  diffuseTerm;
-					float3	Irradiance_shadowed;
 
-						FresnelSpecular = FresnelDisney( LdotN, VdotN, LdotH, float3(0,0,0), 0.0 );
+					// ====== Diffuse lighting ======
+					float sheen = _Surface.roughness * pow( FresnelSchlick(VdotN), _Surface.sheenImportance );
+					float3	diffuseColor = lerp( _Surface.diffuseAlbedo, m_sheenColor, sheen );
+					float3	diffuseTerm = $hairLuminanceHack * diffuseColor * ComputeDiffuseTerm( _Surface, _Light );	// BRDF * (L.N)
 
-						// ====== Fresnel Diffuse with sheen ======
-						FresnelDiffuse = FresnelSpecular * INVPI * lerp( _Surface.diffuseAlbedo, m_sheenColor, _Surface.roughness * pow( FresnelSchlick(VdotN), _Surface.sheenImportance ) );
-						FresnelDiffuse *= 1.0 -  FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength ); // Diffuse Fresnel is always left with what has not been specularly reflected...
+					// Diffuse lighting
+					float3 Irradiance = _Light.m_attenuation * _Light.m_color;
+					float3 Irradiance_shadowed = _Light.m_shadow * Irradiance;
 
-						// ====== Diffuse lighting ======
-						#if !$isMainPassAlpha
-						Irradiance_shadowed =  _Light.m_attenuation *_Light.m_shadow * Irradiance;
-						diffuseTerm = ComputeDiffuseTerm( _Surface, _Light );
-						#else // single pass version for underwater
-							Irradiance_shadowed = _Light.m_attenuation * _Light.m_shadow * Irradiance;
-							diffuseTerm = ComputeDiffuseTerm( _Surface, _Light );
-						#endif
-
-					// =================================================================
-					// Should be moved in a real BRDF for hair!
-					float lightLuminance = dot( _Light.m_color, LUMINANCE );
-					float maskLuminance = dot( _Surface.userData.specularMask, LUMINANCE );
-					float Luminance_Irradiance_Shadowed = _Light.m_attenuation * _Light.m_shadow * lightLuminance;
-					//_Surface.sheen *= lightLuminance;
+					// Fresnel with sheen
+					float3 FresnelSpecular;
+					FresnelSpecular = FresnelDisney( LdotN, VdotN, LdotH, m_sheenColor, _Surface.sheenImportance );
 
 					#if $useFresnelLUT
 						_Result.accumDiffuse += _Surface.userData.fresnelLUT * Irradiance_shadowed * diffuseTerm;
 					#else
+						float3 FresnelDiffuse = FresnelSpecular;
+						FresnelDiffuse *= 1.0 -  FresnelAccurate( _Surface.IOR, VdotN, _Surface.fresnelStrength ); // Diffuse Fresnel is always left with what has not been specularly reflected...
 						_Result.accumDiffuse += FresnelDiffuse * Irradiance_shadowed * diffuseTerm;
 					#endif
 
 					// ====== Specular lighting ======
+
+					// Should be moved in a real BRDF for hair!
+					float lightLuminance = dot( _Light.m_color, LUMINANCE );
+					float maskLuminance = dot( _Surface.userData.specularMask, LUMINANCE );
+					float Luminance_Irradiance_Shadowed = _Light.m_attenuation * _Light.m_shadow * lightLuminance;
+
 					// Primary specular
 					float3 wsTangent = ShiftTangent( m_Kajiya.wsTangent, _Surface.wsNormal, _Surface.userData.specularNoiseShift + _Surface.userData.primarySpecularShift );
 					float primarySpecularTerm = SpecularTerm( wsTangent, Light, View, _Surface.userData.primarySpecularPower );
@@ -238,7 +227,7 @@
 							float	shadowCoordZ, shadowMapZ; float3	shadowWSPos;
 							GetShadowMapZandPos( _Surface.wsPosition, _Light.m_shadowInfo.mWorldToShadowMat, _Light.m_shadowInfo.mShadowToWorldMat, SHADOW_SLICE_INDEX(_Light.m_shadowInfo.mInfo), _Light.m_isDirectionalLight, shadowCoordZ, shadowMapZ, shadowWSPos );
 							float	depth = LinearStep( $translucencyCoef.z, 0.0, abs(shadowCoordZ -  shadowMapZ) );
-							float	cloudShadow = GetFastCloudShadowing( _Surface.wsPositionHacked );
+							float	cloudShadow = _Light.m_isDirectionalLight ? GetFastCloudShadowing( _Surface.wsPositionHacked ) : 1.0;
 							_Result.accumEmissive += INVPI * Rho_t * _Surface.userData.transmittance * Irradiance * Translucency * depth * cloudShadow;
 						}
 						#endif

@@ -184,18 +184,19 @@
 			// glossy specular lobe in the direction of the reflection
 			#if $useMultiInstancing || $(tool/usePerVertexSH)
 				float	LuminanceFactor;
-				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
-				_Surface.IBLCubeMapIndex = max( uint3( 0, 0, 0 ), _Surface.IBLCubeMapIndex );
-				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+				uint3 surfaceIBLCubeMapIndex = unpack101010( _Surface.IBLCubeMapIndex );
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, surfaceIBLCubeMapIndex.x, LuminanceFactor );
+				surfaceIBLCubeMapIndex = max( uint3( 0, 0, 0 ), surfaceIBLCubeMapIndex );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, surfaceIBLCubeMapIndex.x );
 					
-				if ( _Surface.IBLCubeMapIndex.y != _Surface.IBLCubeMapIndex.x || _Surface.IBLCubeMapIndex.z != _Surface.IBLCubeMapIndex.x ) {
+				if ( surfaceIBLCubeMapIndex.y != surfaceIBLCubeMapIndex.x || surfaceIBLCubeMapIndex.z != surfaceIBLCubeMapIndex.x ) {
 					Radiance_specular *= _Surface.barycentric.x;
 						
-					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.y, LuminanceFactor );
-					Radiance_specular += _Surface.barycentric.y * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.y );
+					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, surfaceIBLCubeMapIndex.y, LuminanceFactor );
+					Radiance_specular += _Surface.barycentric.y * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, surfaceIBLCubeMapIndex.y );
 
-					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.z, LuminanceFactor );
-					Radiance_specular += _Surface.barycentric.z * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.z );
+					wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, surfaceIBLCubeMapIndex.z, LuminanceFactor );
+					Radiance_specular += _Surface.barycentric.z * LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, surfaceIBLCubeMapIndex.z );
 				}
 			#else
 				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
@@ -262,9 +263,10 @@
 			// glossy specular lobe in the direction of the reflection
 			#if 1 // Use virtual planes to compute the intersection of the reflected view and determine parallax-corrected sampling directions
 				float	LuminanceFactor;
-				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
-				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
-				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+				uint3 surfaceIBLCubeMapIndex = unpack101010( _Surface.IBLCubeMapIndex );
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, surfaceIBLCubeMapIndex.x, LuminanceFactor );
+				surfaceIBLCubeMapIndex.x = max( 0, surfaceIBLCubeMapIndex.x );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, surfaceIBLCubeMapIndex.x );
 			#else // Use light direction only, no parallax correction
 				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
 				float3	Radiance_specular = SampleCubeMap( wsLight, MipLevel, _Surface.IBLCubeMapIndex.x );
@@ -318,9 +320,10 @@
 			// glossy specular lobe in the direction of the reflection
 			#if 1 // Use virtual planes to compute the intersection of the reflected view and determine parallax-corrected sampling directions
 				float	LuminanceFactor;
-				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, _Surface.IBLCubeMapIndex.x, LuminanceFactor );
-				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
-				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, _Surface.IBLCubeMapIndex.x );
+				uint3 surfaceIBLCubeMapIndex = unpack101010( _Surface.IBLCubeMapIndex );
+				float3	wsReflectedDirection = ComputeVirtualHitDirection( _Surface.wsPosition, wsLight, surfaceIBLCubeMapIndex.x, LuminanceFactor );
+				surfaceIBLCubeMapIndex.x = max( 0, surfaceIBLCubeMapIndex.x );
+				float3	Radiance_specular = LuminanceFactor * SampleCubeMap( wsReflectedDirection, MipLevel, surfaceIBLCubeMapIndex.x );
 			#else // Use light direction only, no parallax correction
 				_Surface.IBLCubeMapIndex.x = max( 0, _Surface.IBLCubeMapIndex.x );
 				float3	Radiance_specular = SampleCubeMap( wsLight, MipLevel, _Surface.IBLCubeMapIndex.x );

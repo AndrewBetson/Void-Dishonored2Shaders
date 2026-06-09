@@ -11,6 +11,7 @@
 
 	hlsl_prefix {
 		#include <vertex>
+		#include <colorimetry>
 
 		float3 distort( Texture2D tex, float2 texcoord, float2 direction, float3 distortion ) {
 			float r = tex.SampleLevel( $bilinearClamp, ( texcoord + direction * distortion.r ) * $resolutionScale, 0.0).r;
@@ -51,6 +52,11 @@
 		float weight = length(0.5 - frac(texcoord + haloVec)) / sqrt(0.5);
 		weight = pow(1.0 - weight, 10.0) * $(PostFX/LensFlares/HaloWeight);
 		result += distort( $(PostFX/LensFlares/texLensThreshold), frac(texcoord + haloVec), ghostNorm, distortion ) * weight;
+		
+		#if $blackWhiteMode		
+			float	luminance = dot(  result.xyz, LUMINANCE );
+			result.xyz = float3( luminance, luminance, luminance );
+		#endif
 
 		@sv_target = float4( result, 1.0 );
 	}

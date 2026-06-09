@@ -6,7 +6,7 @@
 	}
 
 	state {
-		blend		ONE ZERO
+		blend		SRC_ALPHA ONE_MINUS_SRC_ALPHA
 		depthWrite	0
 		depthEnable	0
 		depthfunc	ALWAYS
@@ -23,33 +23,41 @@
 	}
 
 	hlsl_fp_main {
-		float3 colorOut     = 0.0;
+		float4 colorOut = 0.0;
 
 		#if $(PostFX/DOF/USE_VIGNETTING)
 			colorOut = vignette($texcoord, $(PostFX/DOF/center).xy, $(PostFX/DOF/vignParams));
 		#else
 			//Unpack register
-			float nearFuzzy = $(PostFX/DOF/Debug/aPlanes).x;	//in meter
-			float nearSharp = $(PostFX/DOF/Debug/aPlanes).y;	//in meter
-			float farSharp  = $(PostFX/DOF/Debug/aPlanes).z;	//in meter
-			float farFuzzy  = $(PostFX/DOF/Debug/aPlanes).w;	//in meter
-			float focal     = $(PostFX/DOF/Debug/aFocal).x;		//in meter
+			float nearFuzzy = $(PostFX/DOF/Debug/aPlanes).x;	//in meter with auto-focus, in range[0-1] in fixed focal plane
+			float nearSharp = $(PostFX/DOF/Debug/aPlanes).y;	//in meter with auto-focus, in range[0-1] in fixed focal plane
+			float farSharp  = $(PostFX/DOF/Debug/aPlanes).z;	//in meter with auto-focus, in range[0-1] in fixed focal plane
+			float farFuzzy  = $(PostFX/DOF/Debug/aPlanes).w;	//in meter with auto-focus, in range[0-1] in fixed focal plane
+			float focal     = $(PostFX/DOF/Debug/aFocal).x;		//in meter with auto-focus, in range[0-1] in fixed focal plane
 			float farDof	= ($(POSTFX/DOF/CommonParams).x);
+			const float lineSize = 0.005;
+			const float maxDist  = 1.0 - 2.0 * lineSize;
 
 			#if $(PostFX/DOF/AUTOFOCUS)
-				focal = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, $(PostFX/DOF/center).xy, 0.0 ).x;
-				farDof += focal;
-				nearFuzzy = (nearFuzzy + focal) / farDof;
-				nearSharp = (nearSharp + focal) / farDof;
-				farSharp = (farSharp + focal) / farDof;
-				farFuzzy = (farFuzzy + focal) / farDof;
+				const float2 focusParms = $(PostFX/DOF/ZbufferAutofocus).SampleLevel( $pointClamp, $(PostFX/DOF/center).xy, 0.0 );
+				const float focusDist = focusParms.x;
+				const float focusFuzz = focusParms.y;
+				farDof += focusDist;
+				focal = focusDist/farDof;
+				nearFuzzy = min( maxDist, ( nearFuzzy + focusDist) / farDof);
+				nearSharp = min( maxDist, (-nearSharp + focusFuzz) / farDof);
+				farSharp  = min( maxDist, ( farSharp  + focusDist) / farDof);
+				farFuzzy  = min( maxDist, ( farFuzzy  + focusFuzz) / farDof);
+			#else
+				farDof    = max( 0,  farDof );
 			#endif
 
 			//Fetch FrameBuffer
 			const float3 RGB_TO_GREYSCALE = float3(0.2989f, 0.5870f, 0.1140f);	//linear luminance
 			const float3 RGB_TO_LUMINANCE = float3(0.2126f, 0.7152f, 0.0722f);	//perceptual luminance
+			uint2 resolution;
+			$(PostFX/DOF/Debug/sDiffuseMap).GetDimensions( resolution.x, resolution.y );
 			float3 color = $(PostFX/DOF/Debug/sDiffuseMap).SampleLevel($bilinearClamp, $texcoord, 0.0).rgb;
-			float  colorGrey = dot(color.rgb, RGB_TO_GREYSCALE);
 			float  colorLum = dot(color.rgb, RGB_TO_LUMINANCE);
 
 			//Fetch DepthBuffer
@@ -57,39 +65,34 @@
 			float depthLinear = LinearStep(0, farDof, depth);
 
 			//Fetch Dof Fuzziness
-			float2 dofMaskRaw = $(PostFX/DOF/Debug/sDofMask).SampleLevel($bilinearClamp, $texcoord, 0.0).rg;
+			float2 dofMaskRaw  = $(PostFX/DOF/Debug/sDofMask).SampleLevel($bilinearClamp, $texcoord, 0.0).rg;
 			float  dofMaskNear = dofMaskRaw.r;
-			float  dofMaskFar = dofMaskRaw.g;
+			float  dofMaskFar  = dofMaskRaw.g;
 
 			//Set Debug Color
-			const float3 colorSharp   = float3(0,1,0);
-			const float3 colorInFocus = float3(1,0,0);
+			const float4 colorBlue  = float4(0,0,1,1);
+			const float4 colorGreen = float4(0,1,0,1);
+			const float4 colorRed   = float4(1,0,0,1);
+			const float4 alpha      = float4(1,1,1,0.125);
 
 			//Draw focus lines
-			float  lineSize = 0.005;
-			float3 nearLine  = Smootheststep(lineSize, 0, abs(depthLinear - nearSharp)) * colorSharp;
-			float3 nearFuzzyLine  = Smootheststep(lineSize, 0, abs(depthLinear - nearFuzzy)) * colorSharp;
-			float3 focusLine = Smootheststep(lineSize, 0, abs(depthLinear - focal    )) * colorInFocus;
-			float3 farLine   = Smootheststep(lineSize, 0, abs(depthLinear - farSharp )) * colorSharp;
-			float3 farFuzzyLine   = Smootheststep(lineSize, 0, abs( depthLinear - farFuzzy )) * colorSharp;
-
+			float4 lineFocusFarFuzzy  = smoothstep(lineSize, 0, abs(depthLinear - farFuzzy )) * colorBlue;
+			float4 lineFocusFarSharp  = smoothstep(lineSize, 0, abs(depthLinear - farSharp )) * colorGreen;
+			float4 lineFocus          = smoothstep(lineSize, 0, abs(depthLinear - focal    )) * colorRed;
+			float4 lineFocusNearSharp = smoothstep(lineSize, 0, abs(depthLinear - nearSharp)) * colorGreen;
+			float4 lineFocusNearFuzzy = smoothstep(lineSize, 0, abs(depthLinear - nearFuzzy)) * colorBlue;
+			float4 lines              = lineFocusFarFuzzy + lineFocusFarSharp + lineFocus + lineFocusNearSharp + lineFocusNearFuzzy;
 			//Draw focus area
-			float3 colorFocusSharp = lerp(lerp(colorInFocus,color,0.9), color, colorGrey);
-			float3 areaSharp = (depthLinear > nearSharp) * (depthLinear < farSharp) *colorFocusSharp;
-			float3 colorFocusFuzzy = lerp(lerp(colorSharp,color,0.9), color, colorGrey);
-			float3 areaFuzzy = (depthLinear > nearFuzzy) * (depthLinear < farFuzzy) *colorFocusFuzzy;
-			float3 areaBox = areaSharp + areaFuzzy + nearLine + nearFuzzyLine + focusLine + farLine + farFuzzyLine;
-
-			//Draw Dof strength
-			float strengthNearFar = saturate(max(dofMaskNear,dofMaskFar));
-			float3 areaBlur =  color * strengthNearFar;
+			float4 areaNearFuzzy      = (depthLinear > nearFuzzy) * (depthLinear < nearSharp) * lerp( colorGreen, colorBlue, smoothstep(nearSharp, nearFuzzy, depthLinear ) ) * alpha;
+			float4 areaInFocus        = (depthLinear > nearSharp) * (depthLinear < farSharp)  * float4(colorLum.xxx, 0.75);
+			float4 areaFarFuzzy       = (depthLinear > farSharp)  * (depthLinear < farFuzzy)  * lerp( colorGreen, colorBlue, smoothstep(farSharp, farFuzzy, depthLinear ) ) * alpha;
+			float4 areas              = areaNearFuzzy + areaInFocus + areaFarFuzzy;
 
 			//Combine
-			colorOut = areaBlur + areaBox;
-			//colorOut = saturate( abs(depthLinear - focal) ) ;
+			colorOut = lines + areas;
 
 		#endif
 
-	@sv_target = float4(colorOut,1.0);
+		@sv_target = colorOut;
 	}
 }

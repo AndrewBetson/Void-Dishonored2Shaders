@@ -31,7 +31,15 @@
 
 	hlsl_fp_main {
 		float4 output = 0;
-		#if $(Downscale/TYPE) == 5 //AVG_CLEAR A=0
+		#if $(Downscale/TYPE) == 6 //AVG_RGB A=0 with range clamping
+			output.rgb  = $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.xy , 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord.zw , 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.xy, 0.0).rgb;
+			output.rgb += $(Downscale/BufferIn).SampleLevel( $bilinearClamp, $legacy_texcoord1.zw, 0.0).rgb;
+//			output = clamp( output * 0.25, 0, $(env/tonemapping/white_level) ); // Matth version : introduces main menu rendering issues
+			output = clamp( output * 0.25, 0, $(env/autoexp/adapt_max_luminance) ); // Previous version
+			output.a = 0.0;
+		#elif $(Downscale/TYPE) == 5 //AVG_CLEAR A=0
 			float3 downscaleColor = RangeCompressColorToR11G11B10( $(Downscale/Color).rgb );
 			float threshold = 0.0;
 

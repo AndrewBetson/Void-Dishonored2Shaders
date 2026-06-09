@@ -64,7 +64,7 @@
 
 			// IBL & Indirect Lighting using Spherical Harmonics
 			#if $useMultiInstancing || $(tool/usePerVertexSH)
-				uint3		IBLCubeMapIndex;		// Index of the IBL cube map to use
+				uint		IBLCubeMapIndex;		// Index of the IBL cube map to use
 				float3		barycentric;			// barycentric coordinates
 			#else			
 				uint		IBLCubeMapIndex;		// Index of the IBL cube map to use
@@ -125,7 +125,7 @@
 				#endif
 
 				#if $useMultiInstancing || $(tool/usePerVertexSH)
-					IBLCubeMapIndex = uint3(0,0,0);
+					IBLCubeMapIndex = 0;
 					barycentric = float3(0,0,0);
 				#else			
 					IBLCubeMapIndex = 0;

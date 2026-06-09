@@ -254,6 +254,9 @@
 				#else
 					@sv_target = float4(finalColor.rgb, color.a);
 				#endif
+				
+				
+				BlackAndWhiteOverlay( @sv_target.xyz );
 			#endif
 		#endif
 	}

@@ -293,9 +293,12 @@
 
 					#if $isAlpha && !$isMainPassAlpha
 						writePixel( finalColor.rgb, color.rgb, color.a, $sv_position, @sv_target, @sv_target1 );
+						BlackAndWhiteOverlay( @sv_target.xyz );
 					#else
+						BlackAndWhiteOverlay( finalColor.rgb );
 						@sv_target = float4( RangeCompressColorToR11G11B10( finalColor.rgb ), color.a);
 					#endif
+					
 				#endif
 			#endif
 		#endif
